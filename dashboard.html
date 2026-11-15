@@ -629,9 +629,12 @@ function renderModels(){
   items.sort((a,b)=> rank(a)-rank(b) || a.id.localeCompare(b.id));
   const visCount=(CATALOG.items||[]).filter(m=>!m.hidden).length;
   const proLocked=(CATALOG.items||[]).filter(m=>m.pro_locked).length;
+  // 显示数必须排除 PRO 锁定（客户端拉不到）——旧写法 visCount-proLocked 会把
+  // 已隐藏的 PRO 模型也减一遍，模型页出现「显示 -2」
+  const shown=(CATALOG.items||[]).filter(m=>!m.hidden && !m.pro_locked).length;
   // 计数口径与 /v1/models 实际可见一致：PRO 锁定的模型客户端拉不到，单列
   document.getElementById('model-count').textContent=(proLocked>0
-    ?`显示 ${visCount-proLocked} / PRO 锁定 ${proLocked} / 隐藏 `
+    ?`显示 ${shown} / PRO 锁定 ${proLocked} / 隐藏 `
     :`显示 ${visCount} / 隐藏 `)+`${(CATALOG.hidden||[]).length} · 共 ${CATALOG.total}`;
   document.getElementById('model-batchbar').classList.toggle('hidden', MSEL.size===0);
   document.getElementById('msel-count').textContent=MSEL.size;
