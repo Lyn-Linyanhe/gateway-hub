@@ -811,6 +811,10 @@ def normalize_wb(a):
     c = a.get("credits") or {}
     ck = c.get("checkin") or {}
     tier = a.get("tier") or {}
+    # 国际版「今天打过没有」以引擎的 lastDailyChat 为准。日期比较必须放在服务端：
+    # 浏览器时区与引擎不一致时，前端自己比会一直显示「待打卡」。
+    last_dc = str(a.get("lastDailyChat") or "")
+    today = time.strftime("%Y-%m-%d")
     return {
         "uid": a.get("uid"),
         "name": a.get("nickname") or (a.get("uid") or "")[:8],
@@ -824,6 +828,7 @@ def normalize_wb(a):
         # canDailyChat 是静态标记（realm==intl 恒 true），「今天打过没有」的
         # 真实闸门是 lastDailyChat 的日期（引擎 can_daily_chat() 的判定口径）
         "last_daily_chat": a.get("lastDailyChat"),
+        "daily_chatted_today": bool(last_dc.startswith(today)),
         "realm": a.get("realm"),
         "streak": ck.get("streak_days"),
     }
@@ -1071,6 +1076,31 @@ def platform_status(up):
                 row["concurrency_limit"] = limit
                 row["inflight"] = (int(snap.get(row.get("uid")) or 0)
                                    if limit is not None else None)
+            # 国际版待打卡账号：把今天最近一次 daily_chat 的失败原因带上，
+            # 看板才能区分「还没到点」和「打了但被上游拒绝」——后者只显示
+            # 一个「待打卡」会让人以为是显示 bug。
+            pending = [r for r in out["accounts"]
+                       if r.get("realm") == "intl" and r.get("enabled")
+                       and not r.get("daily_chatted_today")]
+            if pending:
+                try:
+                    hist = engine_request(
+                        up, "GET", "/activity/history?range=today&task=daily_chat&limit=100")
+                    rows = hist.get("rows") if isinstance(hist, dict) else []
+                except Exception:
+                    rows = []
+                latest = {}
+                for hr in rows:  # 引擎按最新在前返回
+                    if not isinstance(hr, dict):
+                        continue
+                    uid = str(hr.get("uid") or "")
+                    if uid and uid not in latest:
+                        latest[uid] = hr
+                for row in out["accounts"]:
+                    hit = latest.get(str(row.get("uid") or ""))
+                    if hit and not hit.get("ok"):
+                        row["daily_chat_error"] = str(hit.get("message") or "")[:240]
+                        row["daily_chat_error_at"] = hit.get("ts")
         elif name == "qwenwork":
             try:
                 st = engine_request(up, "GET", "/admin/settings", auth="none")
@@ -1239,6 +1269,7 @@ def estimate_snapshot(force=False):
             item["usage_error"] = f"{type(exc).__name__}: {exc}"
             raw = []
         ats, credit, tokens, priced = [], 0.0, 0.0, 0.0
+        by_model = {}
         for r in raw:
             at = _estimate_at(r)
             if not at or at < now - 86400:
@@ -1246,6 +1277,9 @@ def estimate_snapshot(force=False):
             ats.append(at)
             tok = _num(r.get("total_tokens") or r.get("total") or 0)
             tokens += tok
+            mname = str(r.get("resolved_model") or r.get("model") or "?")
+            ms = by_model.setdefault(mname, {"tokens": 0.0, "credit": 0.0})
+            ms["tokens"] += tok
             raw_credit = r.get("credit") if r.get("credit") is not None else r.get("cost")
             try:
                 cr = None if raw_credit is None else float(raw_credit)
@@ -1253,12 +1287,14 @@ def estimate_snapshot(force=False):
                 cr = None
             if cr is not None:
                 credit += cr
+                ms["credit"] += cr
             elif name == "qwenwork":
                 model = str(r.get("resolved_model") or r.get("model") or "")
                 ent = auto.get(f"qwenwork/{model}")
                 rate = (float(ent.get("factor") or 0) * 1000) if ent else qw_fallback
                 if rate:
                     credit += tok / 1000.0 * rate
+                    ms["credit"] += tok / 1000.0 * rate
                     priced += tok
         span_h = (max(ats) - min(ats)) / 3600.0 if len(ats) >= 2 else 0.0
         burn = (credit / span_h * 24) if (span_h >= 2 and len(ats) >= 10) else None
@@ -1267,6 +1303,17 @@ def estimate_snapshot(force=False):
         eff = days
         if pool_all and (eff is None or pool_days < eff):
             eff = pool_days
+        models = []
+        for mname, ms in by_model.items():
+            if ms["tokens"] < 1000 or ms["credit"] <= 0:
+                continue
+            rate_k = ms["credit"] / ms["tokens"] * 1000
+            est_tok = (balance / rate_k * 1000) if (balance > 0 and rate_k > 0) else None
+            models.append({"model": mname, "tokens": int(ms["tokens"]),
+                           "rate_per_ktok": round(rate_k, 6),
+                           "est_tokens": int(est_tok) if est_tok else None})
+        models.sort(key=lambda x: -x["tokens"])
+        item["models"] = models[:6]
         item.update({
             "rows": len(ats),
             "sample_hours": round(span_h, 1),
@@ -1312,6 +1359,27 @@ def _checkin_tally(result):
     if not rows:
         return None
     return sum(1 for row in rows if row.get("ok")), len(rows)
+
+
+def _rows_failure(result):
+    """引擎管理动作的 results 行里有失败时，返回第一条原因；否则 None。
+
+    /api/engine 以前只看 HTTP 成败，账号级失败（如每日活跃网页通道 401）
+    也会回 ok=True，前端便显示「成功」而账号仍停在待打卡。
+    """
+    if not isinstance(result, dict):
+        return None
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return None
+    bad = [r for r in rows if isinstance(r, dict) and r.get("ok") is False]
+    if not bad:
+        return None
+    for row in bad:
+        msg = str(row.get("msg") or row.get("error") or "")
+        if msg:
+            return msg
+    return "部分操作未成功"
 
 
 def tail_log(lines=120):
@@ -1720,8 +1788,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_status(self):
         platforms = [platform_status(up) for up in CONFIG["upstreams"]]
-        checked = sum(1 for p in platforms for a in p["accounts"] if a["checked_in"])
-        checkable = sum(1 for p in platforms for a in p["accounts"] if a["can_checkin"] and a["checked_in"] is not None)
+        # 「今日签到」KPI 把国际版活跃打卡也算进来：它没有签到动作，但同样
+        # 是每天一次的收益；只统计 can_checkin 会让国际号永远不出现在分母里。
+        checked = sum(1 for p in platforms for a in p["accounts"]
+                      if a["checked_in"] or a.get("daily_chatted_today"))
+        checkable = sum(1 for p in platforms for a in p["accounts"]
+                        if (a["can_checkin"] and a["checked_in"] is not None)
+                        or (a.get("realm") == "intl" and a.get("can_daily_chat")))
         # 即将过期积分聚合：跨平台不加总余额，但过期时间线是统一的时间轴，可排序
         expiring_all = []
         for p in platforms:
@@ -1797,18 +1870,52 @@ class Handler(BaseHTTPRequestHandler):
                 intl_part = {"error": f"{type(exc).__name__}: {exc}"}
         if intl_part is not None:
             result = {"cn_checkin": result, "intl_daily_chat": intl_part}
-        # 顶层 ok 必须反映账号级成败：全部失败时不能回「签到成功」
+        # 顶层 ok 必须反映账号级成败：部分账号失败也不能回「签到成功」，
+        # 否则页面一边弹成功、一边把失败账号显示成「待打卡」，看起来就是
+        # 签到显示有问题。ok 只在全部账号都成功时为 true。
         tally = _checkin_tally(result)
         nested_error = isinstance(result, dict) and any(
             isinstance(v, dict) and v.get("error") for v in result.values())
         failed = isinstance(result, dict) and (bool(result.get("error")) or nested_error)
-        ok = (tally[0] > 0) if tally else not failed
+        if tally:
+            ok_n, total = tally
+            ok = ok_n == total and not failed
+            partial = 0 < ok_n < total
+        else:
+            ok_n = total = None
+            ok = not failed
+            partial = False
         log(f"checkin[{name}] -> {json.dumps(result, ensure_ascii=False)[:200]}")
         payload = {"ok": ok, "platform": name, "result": result}
         if tally:
             payload["checked"], payload["total"] = tally
+        if partial:
+            payload["partial"] = True
         if not ok:
-            payload["error"] = "签到失败：所有账号均未成功"
+            # 取第一条账号级 / 步骤级失败原因：前端与一键全自动只看 error 字段
+            reason = ""
+            if isinstance(result, dict):
+                for value in result.values():
+                    if not isinstance(value, dict):
+                        continue
+                    if value.get("error"):
+                        reason = str(value["error"])
+                        break
+                    for row in value.get("results") or []:
+                        if isinstance(row, dict) and not row.get("ok"):
+                            reason = str(row.get("msg") or row.get("error") or "")
+                            break
+                    if reason:
+                        break
+            suffix = f"：{reason[:120]}" if reason else ""
+            if tally and ok_n and ok_n < total:
+                payload["error"] = f"部分账号未成功（{ok_n}/{total}）{suffix}"
+            elif tally and ok_n == total:
+                payload["error"] = f"签到步骤失败{suffix}"
+            elif tally:
+                payload["error"] = f"签到失败：所有账号均未成功{suffix}"
+            else:
+                payload["error"] = f"签到失败{suffix}"
         self._send_json(200, payload)
 
     # ---- 任务中心（成长任务 / 猫猫旅行 / 福利领取，代理到各引擎） ----
@@ -1948,7 +2055,14 @@ class Handler(BaseHTTPRequestHandler):
             auth = "none" if name == "qwenwork" else "panel"
             result = engine_request(up, method, "/" + path, payload, auth=auth, timeout=timeout)
             log(f"engine[{name}] {method} /{path} -> {json.dumps(result, ensure_ascii=False)[:150]}")
-            self._send_json(200, {"ok": True, "platform": name, "path": path, "result": result})
+            # 账号级失败要反映到顶层 ok：否则「每日活跃打卡」明明 0/2 成功，
+            # 前端仍显示绿色「成功」，与账号页的「待打卡」自相矛盾。
+            failure = _rows_failure(result)
+            if failure:
+                self._send_json(200, {"ok": False, "platform": name, "path": path,
+                                      "result": result, "error": failure[:240]})
+            else:
+                self._send_json(200, {"ok": True, "platform": name, "path": path, "result": result})
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:300]
             self._send_json(502, {"ok": False, "platform": name, "path": path,
