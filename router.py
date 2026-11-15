@@ -1144,6 +1144,147 @@ def platform_status(up):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 额度可用量预估：按最近 24h 实扣外推可用天数（不是 token 数）
+# ---------------------------------------------------------------------------
+_estimate_lock = threading.Lock()
+_estimate_cache = {"ts": 0.0, "data": None}
+ESTIMATE_TTL = 120.0
+
+
+def _estimate_rows(up):
+    """各平台最近的用量行（每引擎最多 1000 条；wb 双区合并）。
+
+    用量页的 limit 上限是 500，按当前重度使用只覆盖几小时，外推一天的
+    波动太大；这里直接取引擎允许的最大值（wb 单区 1000 条 ≈ 26h）。
+    """
+    name = up["name"]
+    limit = 1000
+    if name == "qwenwork":
+        data = engine_request(up, "GET", f"/admin/logs?limit={limit}", auth="none")
+        return data if isinstance(data, list) else (data.get("items") or data.get("logs") or [])
+    if name == "workbuddy":
+        rows = []
+        for realm in ("cn", "intl"):
+            d = engine_request(up, "GET", f"/usage/recent?realm={realm}&limit={limit}")
+            rows.extend((d.get("rows") if isinstance(d, dict) else d) or [])
+        return rows
+    d = engine_request(up, "GET", f"/usage/recent?limit={limit}")
+    return (d.get("rows") if isinstance(d, dict) else d) or []
+
+
+def _estimate_at(row):
+    for key in ("at", "ts", "time", "created_at"):
+        try:
+            v = float(row.get(key))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            return v
+    return 0.0
+
+
+def estimate_snapshot(force=False):
+    """{platforms:[{balance,burn_day,days,effective_days,pool_days,reset_days,...}]}
+
+    口径：
+    - 余额只算启用账号（停用账号不参与调度）；
+    - 消耗速度 = 最近 24h 实扣 ÷ 样本覆盖时长 × 24（样本 <2h 或 <10 条不估）；
+    - wb/qoder 实扣来自用量行的 credit；千问没有 credit，用 token×实测单价；
+    - 若某平台 ≥80% 余额在同一日期到期（qoder 整池），可用天数取到期时间；
+    - 千问「按月重置」不是作废，只提示重置日，不压缩天数。
+    """
+    now = time.time()
+    with _estimate_lock:
+        hit = _estimate_cache["data"]
+        if hit and not force and now - _estimate_cache["ts"] < ESTIMATE_TTL:
+            return hit
+    auto = CONFIG.get("auto_multipliers") or {}
+    qw_credit = sum(float(v.get("credit") or 0) for k, v in auto.items() if k.startswith("qwenwork/"))
+    qw_tokens = sum(float(v.get("tokens") or 0) for k, v in auto.items() if k.startswith("qwenwork/"))
+    qw_fallback = (qw_credit / qw_tokens * 1000) if qw_tokens > 0 else None
+    out = []
+    for up in CONFIG["upstreams"]:
+        name = up["name"]
+        st = platform_status(up)
+        accounts = st.get("accounts") or []
+        balance, enabled = 0.0, 0
+        for a in accounts:
+            if a.get("enabled") and a.get("remain") is not None:
+                balance += float(a["remain"])
+                enabled += 1
+        item = {"name": name, "balance": round(balance, 2), "enabled": enabled,
+                "health": bool(st.get("health")), "error": st.get("error") or ""}
+        exp_remain, soon_remain, pool_days, reset_days = 0.0, 0.0, None, None
+        for x in (st.get("expiring") or []):
+            try:
+                d = float(x["days_left"]) if x.get("days_left") is not None else None
+            except (TypeError, ValueError):
+                d = None
+            if "重置" in str(x.get("name") or ""):
+                if d is not None:
+                    reset_days = d if reset_days is None else min(reset_days, d)
+            else:
+                exp_remain += float(x.get("remain") or 0)
+                if d is not None:
+                    pool_days = d if pool_days is None else min(pool_days, d)
+                    if d <= 14:
+                        soon_remain += float(x.get("remain") or 0)
+        item.update({"exp_remain": round(exp_remain, 2),
+                     "soon_remain": round(soon_remain, 2),
+                     "pool_days": pool_days, "reset_days": reset_days})
+        try:
+            raw = _estimate_rows(up)
+        except Exception as exc:
+            item["usage_error"] = f"{type(exc).__name__}: {exc}"
+            raw = []
+        ats, credit, tokens, priced = [], 0.0, 0.0, 0.0
+        for r in raw:
+            at = _estimate_at(r)
+            if not at or at < now - 86400:
+                continue
+            ats.append(at)
+            tok = _num(r.get("total_tokens") or r.get("total") or 0)
+            tokens += tok
+            raw_credit = r.get("credit") if r.get("credit") is not None else r.get("cost")
+            try:
+                cr = None if raw_credit is None else float(raw_credit)
+            except (TypeError, ValueError):
+                cr = None
+            if cr is not None:
+                credit += cr
+            elif name == "qwenwork":
+                model = str(r.get("resolved_model") or r.get("model") or "")
+                ent = auto.get(f"qwenwork/{model}")
+                rate = (float(ent.get("factor") or 0) * 1000) if ent else qw_fallback
+                if rate:
+                    credit += tok / 1000.0 * rate
+                    priced += tok
+        span_h = (max(ats) - min(ats)) / 3600.0 if len(ats) >= 2 else 0.0
+        burn = (credit / span_h * 24) if (span_h >= 2 and len(ats) >= 10) else None
+        days = (balance / burn) if (burn and balance > 0) else None
+        pool_all = bool(pool_days is not None and balance > 0 and exp_remain >= balance * 0.8)
+        eff = days
+        if pool_all and (eff is None or pool_days < eff):
+            eff = pool_days
+        item.update({
+            "rows": len(ats),
+            "sample_hours": round(span_h, 1),
+            "credit": round(credit, 2),
+            "coverage": round(priced / tokens, 3) if (name == "qwenwork" and tokens > 0) else None,
+            "burn_day": round(burn, 2) if burn else None,
+            "days": round(days, 1) if days is not None else None,
+            "pool_all": pool_all,
+            "effective_days": round(eff, 1) if eff is not None else None,
+        })
+        out.append(item)
+    data = {"ok": True, "generated_at": int(now), "window_hours": 24, "platforms": out}
+    with _estimate_lock:
+        _estimate_cache["ts"] = now
+        _estimate_cache["data"] = data
+    return data
+
+
 CHECKIN_PATHS = {
     "workbuddy": ("/accounts/checkin", "panel"),
     "qoder": ("/accounts/checkin", "panel"),
@@ -1354,6 +1495,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_status()
         if path == "/api/usage":
             return self._api_usage()
+        if path == "/api/estimate":
+            return self._api_estimate()
         if path == "/api/login/poll":
             return self._api_login_poll()
         if path.startswith("/api/tasks/"):
@@ -1913,6 +2056,12 @@ class Handler(BaseHTTPRequestHandler):
             "speed": speed,
             "outcome": outcome,
         }
+
+    def _api_estimate(self):
+        try:
+            self._send_json(200, estimate_snapshot(force="force=1" in self.path))
+        except Exception as exc:
+            self._send_json(502, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     def _api_usage(self):
         try:

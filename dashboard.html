@@ -172,13 +172,12 @@ td.num,th.num{text-align:right}
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
-      <h3>额度可用量预估 <span class="sub">余额 ÷ 近期有效单价（按最近 500 条请求实扣；千问办公为余额差实测）。缓存命中率、思考档位、输入长度都会改变实际可用量</span></h3>
+      <h3>额度可用量预估 <span class="sub">按最近 24 小时消耗外推</span></h3>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr>
-          <th>平台</th><th class="num">余额（启用账号）</th><th class="num">近期单价</th><th class="num">预计可用 TOKEN</th>
-        </tr></thead><tbody id="overview-estimate"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody></table>
+          <th>平台</th><th class="num">余额</th><th class="num">预计可用</th>
+        </tr></thead><tbody id="overview-estimate"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody></table>
       </div>
-      <div class="sub" id="overview-estimate-note" style="margin-top:8px"></div>
     </div>
     <div class="card" style="margin-bottom:16px">
       <h3>即将过期的积分 <span class="sub">按到期时间排序；qwenwork 上游不暴露过期时间，以官方客户端为准</span></h3>
@@ -1184,96 +1183,32 @@ function renderUsageConversion(rows){
    单价 = Σ(模型实扣积分) ÷ Σ(token)；千问办公用量行没有积分，用
    「余额差 ÷ token」的实测单价（config.auto_multipliers）。混合单价按
    近期 token 量加权，避免用量少的模型把均值带偏。 */
-let EST_CACHE={ts:0, rows:null, auto:{}};
+let EST_CACHE={ts:0,data:null};
 async function loadEstimate(force){
-  if(!force && EST_CACHE.rows && Date.now()-EST_CACHE.ts < 300000){ renderEstimate(); return; }
+  if(!force && EST_CACHE.data && Date.now()-EST_CACHE.ts < 300000){ renderEstimate(); return; }
   try{
-    const [d,cat]=await Promise.all([
-      api('/api/usage?limit=500'),
-      api('/api/catalog').catch(()=>null),
-    ]);
-    EST_CACHE={ts:Date.now(), rows:(d&&d.rows)||[], auto:buildRateMaps(cat).autoRate};
+    const d=await api('/api/estimate'+(force?'?force=1':''));
+    EST_CACHE={ts:Date.now(),data:d};
     renderEstimate();
   }catch(e){ /* 静默：总览其他块照常 */ }
 }
 function renderEstimate(){
   const tb=document.getElementById('overview-estimate');
-  const note=document.getElementById('overview-estimate-note');
   if(!tb) return;
-  const rows=EST_CACHE.rows||[];
-  // 1) 每个平台/模型的 token 量与实扣积分
-  const per={};
-  for(const r of rows){
-    const p=r.platform||'?', m=r.model||'?';
-    const e=(per[p]=per[p]||{tok:0, credit:0, hasCredit:false, models:{}});
-    e.tok+=Number(r.total)||0;
-    const mx=e.models[m]=e.models[m]||{tok:0, credit:0, hasCredit:false};
-    mx.tok+=Number(r.total)||0;
-    const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
-    if(cr!==null){ mx.credit+=cr; mx.hasCredit=true; e.credit+=cr; e.hasCredit=true; }
-  }
-  // 2) 余额：只算启用账号（停用账号不参与调度，不能当可用额度）
-  const bal={};
-  for(const p of ((LAST_STATUS&&LAST_STATUS.platforms)||[])){
-    let sum=0, any=false;
-    for(const a of (p.accounts||[])){
-      if(!a.enabled||a.remain==null) continue;
-      sum+=Number(a.remain)||0; any=true;
-    }
-    bal[p.name]=any?sum:null;
-  }
-  const order=['workbuddy','qoder','qwenwork'].filter(p=>bal[p]!=null || per[p]);
-  if(!order.length){
-    tb.innerHTML='<tr><td colspan="4" class="empty">暂无余额与用量数据</td></tr>';
-    if(note) note.textContent='';
+  const d=EST_CACHE.data;
+  if(!d||!Array.isArray(d.platforms)){
+    tb.innerHTML='<tr><td colspan="3" class="empty">预估加载中…</td></tr>';
     return;
   }
-  let html='', total=0, parts=[];
-  for(const p of order){
-    const e=per[p]||{tok:0,credit:0,hasCredit:false,models:{}};
-    const balance=bal[p];
-    // 每个模型的有效单价：实扣优先，其次千问余额差实测
-    const priced=[];
-    for(const [m,v] of Object.entries(e.models)){
-      let rateK=null;
-      if(v.hasCredit && v.tok>0) rateK=v.credit/v.tok*1000;
-      else{
-        const a=EST_CACHE.auto[p+'/'+m];
-        if(a && a.rateK>0) rateK=a.rateK;
-      }
-      if(rateK>0) priced.push({model:m, tok:v.tok, rateK});
-    }
-    // 千问办公：近期没用过但有实测单价的模型，只参与「无用量时」的兜底均价
-    const fallback=[];
-    for(const [id,a] of Object.entries(EST_CACHE.auto)){
-      const i=id.indexOf('/'); if(i<0) continue;
-      if(id.slice(0,i)!==p) continue;
-      if(!priced.some(x=>x.model===id.slice(i+1))) fallback.push(a.rateK);
-    }
-    let rateK=null;
-    const wt=priced.filter(x=>x.tok>0);
-    if(wt.length){
-      const tt=wt.reduce((s,x)=>s+x.tok,0);
-      rateK=wt.reduce((s,x)=>s+x.tok*x.rateK,0)/tt;
-    } else if(priced.length){
-      rateK=priced.reduce((s,x)=>s+x.rateK,0)/priced.length;
-    } else if(fallback.length){
-      rateK=fallback.reduce((s,x)=>s+x,0)/fallback.length;
-    }
-    const est=(balance!=null && rateK>0)?balance/rateK*1000:null;
-    if(est){ total+=est; parts.push((PLATFORM_LABEL[p]||p)+' '+fmtTok(est)); }
-    html+=`<tr>
-      <td><span class="pill indigo">${esc(PLATFORM_LABEL[p]||p)}</span></td>
-      <td class="num">${balance!=null?fmt(balance)+' 分':'—'}</td>
-      <td class="num">${rateK>0?rateK.toFixed(4)+' <span class="sub-cell">分/千tok</span>':'<span class="sub-cell">无实测单价</span>'}</td>
-      <td class="num" style="font-weight:700;color:var(--accent)">${est?fmtTok(est):'—'}</td></tr>`;
-  }
-  tb.innerHTML=html;
-  if(note){
-    note.textContent=(total>0)
-      ? ('合计约 '+fmtTok(total)+' tok（'+parts.join(' + ')+'）。各平台积分口径不同不能相加，只合计 token 量级；缓存命中率越高，同样余额能跑出的 token 越多。')
-      : '余额或实测单价还没准备好：先跑几次请求，让上游记录用量后自动刷新。';
-  }
+  const dayText=v=>v==null?'—':(v<1?'不足 1 天':(v<10?('约 '+v.toFixed(1)+' 天'):('约 '+Math.round(v)+' 天')));
+  tb.innerHTML=d.platforms.map(p=>{
+    const eff=p.effective_days;
+    const color=eff==null?'inherit':(eff<7?'var(--red)':(eff<14?'var(--orange)':'var(--green)'));
+    return `<tr>
+      <td><span class="pill indigo">${esc(PLATFORM_LABEL[p.name]||p.name)}</span></td>
+      <td class="num">${p.balance!=null?fmt(p.balance)+' 分':'—'}</td>
+      <td class="num"><b style="color:${color}">${dayText(eff)}</b></td></tr>`;
+  }).join('')||'<tr><td colspan="3" class="empty">暂无数据</td></tr>';
 }
 document.getElementById('btn-usage-refresh').onclick=loadUsage;
 document.getElementById('usage-filter').onchange=()=>{UPAGE=1;renderUsage();};
