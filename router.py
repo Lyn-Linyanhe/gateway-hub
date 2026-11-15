@@ -1147,7 +1147,8 @@ def platform_status(up):
 CHECKIN_PATHS = {
     "workbuddy": ("/accounts/checkin", "panel"),
     "qoder": ("/accounts/checkin", "panel"),
-    "qwenwork": ("/admin/accounts/checkin-all", "none"),
+    # qwenwork 没有签到动作：每日积分由上游自动发放（见 _api_checkin 特判）。
+    # 不放进这里，避免把「令牌保活」当签到去调用（那条路 100% 超时/失败）。
 }
 
 
@@ -1605,9 +1606,15 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up:
             return self._deny(404, f"未知平台 `{name}`")
+        if name == "qwenwork":
+            # 千问办公没有签到：每日积分由上游自动发放。端点保留但直接回
+            # 「跳过」，客户端/审计不会误判失败，也不用等一次注定超时的保活。
+            return self._send_json(200, {"ok": True, "platform": name,
+                                         "result": {"skipped": True,
+                                                    "msg": "千问办公每日积分由上游自动发放，无需签到"}})
         spec = CHECKIN_PATHS.get(name)
         if not spec:
-            return self._deny(400, f"平台 `{name}` 没有可代执行的签到（千问办公积分由上游自动发放）")
+            return self._deny(400, f"平台 `{name}` 没有可代执行的签到")
         path, kind = spec
         try:
             result = engine_request(up, "POST", path, {}, auth=kind)

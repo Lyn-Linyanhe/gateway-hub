@@ -102,6 +102,8 @@ td.num,th.num{text-align:right}
 .bar>i.low{background:var(--orange)}
 .name-cell{font-weight:600}
 .sub-cell{font-size:11px;color:var(--dim2)}
+.auto-group{display:flex;align-items:flex-start;gap:10px;margin-bottom:6px}
+.auto-group-label{font-size:11px;font-weight:600;color:var(--dim2);min-width:52px;padding-top:7px;flex-shrink:0;letter-spacing:.5px}
 
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .toolbar input[type=text]{flex:1;min-width:180px;min-height:34px;border:1px solid var(--line2);border-radius:10px;padding:0 12px;background:var(--panel)}
@@ -310,9 +312,16 @@ td.num,th.num{text-align:right}
     <div class="pagetitle">自动化</div><div class="pagesub">签到、成长任务、每日活跃与凭证保活的手动执行入口；定时调度仍在各引擎内自动运行。</div>
     <div class="card">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <div><h3>每日签到</h3><div class="sub">wb 签到 = 国内版每日签到 + 国际版活跃打卡一次完成，顺带领取可领的兑换码类活动；千问办公每日积分由上游自动发放。</div></div>
+        <div><h3>每日一键</h3><div class="sub">按顺序跑完三平台签到/打卡与全部成长任务；已完成的动作引擎会返回「已完成」，重复点不会重复领。</div></div>
         <span style="flex:1"></span>
-        <button class="btn" id="btn-checkin-all">一键签到（全部平台）</button>
+        <button class="btn sec" id="btn-checkin-all">仅签到（全部平台）</button>
+        <button class="btn" id="btn-daily-all">一键全自动（签到 + 全部任务）</button>
+      </div>
+      <div class="sub" style="margin-top:10px;line-height:1.95">
+        <b>执行逻辑：</b>
+        ① <b>定时调度器</b>在各引擎内每天自动跑（WorkBuddy 巡检含签到/打卡/任务/旅行；Qoder 每日 09:00 / 10:05 / 21:00 签到）——本页按钮是「立即补做」，不改变定时计划，也不会因为手动点过就停掉自动。
+        ② 同一动作执行期间按钮锁定，不会并发重复。
+        ③ <b>一键全自动</b>顺序：WorkBuddy 签到+国际打卡 → 成长任务 → 领奖 → 猫猫旅行 → 连登/夜猫子 → Qoder 签到 → 领全部福利 → 猫猫旅行；千问办公没有签到/任务（每日积分由上游自动发放），不在序列里。单步失败不中断，逐条记入下方「操作结果」。
       </div>
     </div>
     <div class="grid3" id="auto-cards"><div class="empty">加载中…</div></div>
@@ -334,7 +343,7 @@ td.num,th.num{text-align:right}
       <div class="sub" style="margin-top:8px">机制：账号有临期包（剩余>0 且到期在窗口内）时，派发队列按「紧迫度 × 剩余量」放大权重，最临期的优先消耗。Qoder / 千问办公无此调度维度（单池自动消耗）。改窗口立即生效，无需重启。</div>
     </div>
     <div class="card">
-      <h3>操作结果 <span class="sub">保留最近 20 条 · 点「原始返回」展开引擎完整返回</span></h3>
+      <h3>操作结果 <span class="sub">保留最近 40 条 · 点「原始返回」展开引擎完整返回</span></h3>
       <pre id="task-result" class="mono" style="display:none;text-align:left;max-height:300px;overflow:auto;background:var(--panel2);border-radius:10px;padding:12px;margin:8px 0;font-size:12px;white-space:pre-wrap;word-break:break-all"></pre>
       <div id="task-history"><div class="empty">暂无操作记录</div></div>
       <div class="toolbar" style="margin-top:8px">
@@ -480,7 +489,7 @@ function runDone(key){ RUNNING.delete(key); }
 const TASK_HISTORY=[];
 function pushHistory(title, ok, brief, detail){
   TASK_HISTORY.unshift({t:new Date().toLocaleTimeString('zh-CN',{hour12:false}), title, ok, brief, detail});
-  if(TASK_HISTORY.length>20) TASK_HISTORY.pop();
+  if(TASK_HISTORY.length>40) TASK_HISTORY.pop();
   renderHistory();
 }
 function renderHistory(){
@@ -531,6 +540,11 @@ function briefForCheckin(r){
       let seg=`${label}: ${okN}/${rows.length} 成功`;
       if(earned>0) seg+=` · +${earned} 积分`;
       else if(done) seg+=`（${done} 个今日已完成）`;
+      if(okN===0){
+        // 全失败时必须把引擎给的原因带出来，否则只看到「0/2 成功」不知道为啥
+        const err=rows.map(x=>String(x.msg||x.error||x.message||'')).find(Boolean);
+        if(err) seg+=`（${err.slice(0,90)}${err.length>90?'…':''}）`;
+      }
       if(nxt&&!earned) seg+=` · 下次 ${nxt}`;
       parts.push(seg);
     } else if(Array.isArray(v)){
@@ -881,7 +895,9 @@ function renderPlatforms(platforms){
         <span class="sub-cell mono">${esc(p.base_url)}</span>
         <span style="flex:1"></span>
         <span class="sub-cell">${full.length} 账号 · 国内 ${pcn} / 国际 ${pintl}${rf?` · 筛选中 ${accs.length}`:''} · ${allUnknown?'余额以官方客户端为准':fmt(rem)+' 分'}</span>
-        <button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>
+        ${p.name==='qwenwork'
+          ? '<span class="pill gray" title="千问办公每日积分由上游自动发放，没有签到动作">无需签到</span>'
+          : `<button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>`}
       </div>
       ${rows?`<div class="tblwrap"><table><thead><tr><th>账号</th><th>区域</th><th class="num">积分</th><th>余量</th><th>签到</th><th>并发</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
         :`<div class="empty">${p.error?esc(p.error):(rf?'该平台暂无'+REALM_LABEL[rf]+'账号':'该平台暂无账号')}</div>`}
@@ -1297,30 +1313,42 @@ document.getElementById('btn-expiring-save').onclick=async function(){
   }catch(e){toast('失败: '+e.message);}
   this.disabled=false;
 };
-/* 平台卡片的动作清单：所有自动化入口按平台归位（原来散在 4 张卡里） */
+/* 平台卡片的动作清单：按「每日 / 任务 / 维护」分组，悬停 title 有一句说明 */
 const AUTO_BUTTONS={
   workbuddy:[
-    {t:'签到+打卡', k:'checkin/workbuddy', run:b=>doCheckin('workbuddy',b), primary:true},
-    {t:'每日活跃打卡', k:'dailychat/workbuddy', run:b=>dailyChat(b)},
-    {t:'运行成长任务', k:'task/run/workbuddy', run:b=>runTask('run','workbuddy',b)},
-    {t:'领取任务奖励', k:'task/claim/workbuddy', run:b=>runTask('claim','workbuddy',b)},
-    {t:'猫猫旅行', k:'task/travel/workbuddy', run:b=>runTask('travel','workbuddy',b)},
-    {t:'连登奖励', k:'task/streak-bonus/workbuddy', run:b=>runTask('streak-bonus','workbuddy',b)},
-    {t:'夜猫子（23-08）', k:'task/night/workbuddy', run:b=>runTask('night','workbuddy',b)},
-    {t:'Token 全池保活', k:'engine/workbuddy/accounts/refresh', run:b=>runEngine({platform:'workbuddy',path:'accounts/refresh'},b)},
-    {t:'积分刷新', k:'engine/workbuddy/accounts/credits/fetch', run:b=>runEngine({platform:'workbuddy',path:'accounts/credits/fetch'},b)},
-    {t:'立即巡检一轮', k:'engine/workbuddy/scheduler/trigger', run:b=>runEngine({platform:'workbuddy',path:'scheduler/trigger'},b)},
+    {g:'每日', items:[
+      {t:'签到 + 国际打卡', d:'国内版每日签到 + 国际版活跃打卡，一次完成', k:'checkin/workbuddy', run:b=>doCheckin('workbuddy',b), primary:true},
+      {t:'仅国际打卡', d:'只给国际版账号补今天的活跃打卡', k:'dailychat/workbuddy', run:b=>dailyChat(b)},
+    ]},
+    {g:'成长任务', items:[
+      {t:'运行成长任务', d:'引擎开真实会话完成当日成长任务，可能要几分钟', k:'task/run/workbuddy', run:b=>runTask('run','workbuddy',b)},
+      {t:'领取任务奖励', d:'扫描并领取已完成任务的奖励；先「运行成长任务」再领', k:'task/claim/workbuddy', run:b=>runTask('claim','workbuddy',b)},
+      {t:'猫猫旅行', d:'派出/召回猫猫并领取旅行奖励', k:'task/travel/workbuddy', run:b=>runTask('travel','workbuddy',b)},
+      {t:'连登奖励', d:'领取连续登录管家奖励', k:'task/streak-bonus/workbuddy', run:b=>runTask('streak-bonus','workbuddy',b)},
+      {t:'夜猫子', d:'仅 23:00-08:00 计入的夜间任务', k:'task/night/workbuddy', run:b=>runTask('night','workbuddy',b)},
+    ]},
+    {g:'维护', items:[
+      {t:'Token 全池保活', d:'刷新全部账号凭证，避免过期掉线', k:'engine/workbuddy/accounts/refresh', run:b=>runEngine({platform:'workbuddy',path:'accounts/refresh'},b)},
+      {t:'积分刷新', d:'重新拉取各账号积分快照', k:'engine/workbuddy/accounts/credits/fetch', run:b=>runEngine({platform:'workbuddy',path:'accounts/credits/fetch'},b)},
+      {t:'立即巡检一轮', d:'让引擎调度器马上跑一轮；会重复当日已完成的动作，一般不用手动点', k:'engine/workbuddy/scheduler/trigger', run:b=>runEngine({platform:'workbuddy',path:'scheduler/trigger'},b)},
+    ]},
   ],
   qoder:[
-    {t:'签到', k:'checkin/qoder', run:b=>doCheckin('qoder',b), primary:true},
-    {t:'领取全部福利', k:'task/run/qoder', run:b=>runTask('run','qoder',b), primary:true},
-    {t:'猫猫旅行', k:'task/travel/qoder', run:b=>runTask('travel','qoder',b)},
-    {t:'Token 保活', k:'engine/qoder/accounts/refresh', run:b=>runEngine({platform:'qoder',path:'accounts/refresh'},b)},
-    {t:'积分刷新', k:'engine/qoder/accounts/credits', run:b=>runEngine({platform:'qoder',path:'accounts/credits'},b)},
+    {g:'每日', items:[
+      {t:'签到', d:'每日签到领取基础额度（10:00 刷新窗口）', k:'checkin/qoder', run:b=>doCheckin('qoder',b), primary:true},
+      {t:'领取全部福利', d:'每日 Credits + 活动奖励 + Pro 包，一次领完', k:'task/run/qoder', run:b=>runTask('run','qoder',b), primary:true},
+      {t:'猫猫旅行', d:'派出/召回猫猫并领取旅行奖励', k:'task/travel/qoder', run:b=>runTask('travel','qoder',b)},
+    ]},
+    {g:'维护', items:[
+      {t:'Token 保活', d:'刷新账号凭证', k:'engine/qoder/accounts/refresh', run:b=>runEngine({platform:'qoder',path:'accounts/refresh'},b)},
+      {t:'积分刷新', d:'重新拉取积分快照', k:'engine/qoder/accounts/credits', run:b=>runEngine({platform:'qoder',path:'accounts/credits'},b)},
+    ]},
   ],
   qwenwork:[
-    {t:'Token 保活 + 领取', k:'engine/qwenwork/admin/accounts/keepalive-all',
-     run:b=>runEngine({platform:'qwenwork',path:'admin/accounts/keepalive-all',body:{channels:['qwenwork']}},b)},
+    {g:'每日', items:[
+      {t:'保活 + 领取', d:'刷新凭证并触发当日企业积分领取（积分本身由上游自动发放）', k:'engine/qwenwork/admin/accounts/keepalive-all',
+       run:b=>runEngine({platform:'qwenwork',path:'admin/accounts/keepalive-all',body:{channels:['qwenwork']}},b)},
+    ]},
   ],
 };
 function renderAutoCards(){
@@ -1333,22 +1361,27 @@ function renderAutoCards(){
     const punch=accs.filter(a=>a.realm==='intl'&&a.enabled&&!intlPunched(a)).length;
     let foot;
     if(p.name==='qwenwork') foot='每日积分由上游自动发放，无需签到；令牌续期被官方客户端绑定，保活失败属预期（11-29 到期后客户端重登 + 重新导入）。';
-    else if(p.name==='workbuddy') foot=`已签 ${signed}/${accs.length} · 待打卡 ${punch} · 调度器每天自动执行，按钮用于补签。`;
-    else foot=`已签 ${signed}/${accs.length} · 调度器每天自动执行，按钮用于补签。`;
-    const btns=(AUTO_BUTTONS[p.name]||[]).map((b,i)=>
-      `<button class="btn ${b.primary?'':'sec'} mini" data-ap="${esc(p.name)}" data-ai="${i}">${esc(b.t)}</button>`).join('');
+    else if(p.name==='workbuddy') foot=`已签 ${signed}/${accs.length} · 待打卡 ${punch} · 定时调度器每天自动执行，按钮用于立即补做。`;
+    else foot=`已签 ${signed}/${accs.length} · 定时 09:00 / 10:05 / 21:00 自动签到，按钮用于补做。`;
+    const groups=(AUTO_BUTTONS[p.name]||[]).map((g,gi)=>
+      `<div class="auto-group">
+         <div class="auto-group-label">${esc(g.g)}</div>
+         <div class="toolbar" style="gap:6px;margin:0">${g.items.map((b,bi)=>
+           `<button class="btn ${b.primary?'':'sec'} mini" data-ap="${esc(p.name)}" data-ag="${gi}" data-ai="${bi}" title="${esc(b.d||'')}">${esc(b.t)}</button>`).join('')}</div>
+       </div>`).join('');
     return `<div class="realmcard">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span class="realmtag ${p.name==='qoder'?'intl':'cn'}">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
         <span class="pill ${p.health?'green':'red'}">${p.health?'在线':'离线'}</span>
         <span class="sub-cell" style="margin-left:auto">${accs.length} 账号</span>
       </div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 10px">${btns||'<span class="sub-cell">该平台无手动操作</span>'}</div>
+      <div style="margin:10px 0 8px">${groups||'<span class="sub-cell">该平台无手动操作</span>'}</div>
       <div class="sub-cell" style="border-top:1px solid var(--line);padding-top:8px">${esc(foot)}</div>
     </div>`;
   }).join('');
   el.querySelectorAll('[data-ap]').forEach(b=>b.onclick=()=>{
-    const item=(AUTO_BUTTONS[b.dataset.ap]||[])[+b.dataset.ai];
+    const g=(AUTO_BUTTONS[b.dataset.ap]||[])[+b.dataset.ag];
+    const item=g&&g.items[+b.dataset.ai];
     if(item) item.run(b);
   });
 }
@@ -1431,7 +1464,8 @@ document.getElementById('btn-checkin-all').onclick=async function(){
   if(!runOnce('checkin-all')) return;
   let cur='一键签到…';
   await withBtn(this, async()=>{
-    const names=['workbuddy','qoder','qwenwork'];
+    // 千问办公没有签到（每日积分上游自动发放），不放进循环免得每次白等超时
+    const names=['workbuddy','qoder'];
     for(let i=0;i<names.length;i++){
       const n=names[i];
       cur=`(${i+1}/${names.length}) ${PLATFORM_LABEL[n]||n}…`;
@@ -1444,9 +1478,57 @@ document.getElementById('btn-checkin-all').onclick=async function(){
       }catch(e){ pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), false, e.message,''); }
       runDone(key);
     }
-    toast('一键签到完成，详见操作结果');
+    toast('一键签到完成（千问办公无需签到，积分上游自动发放），详见操作结果', 3600);
     loadAuto(); loadStatus();
   }, ()=>cur).finally(()=>runDone('checkin-all'));
+};
+
+/* 一键全自动：签到 → 成长任务 → 领奖 → 旅行 → 连登/夜猫子 → 千问保活。
+   单步失败不中断，每步单独记入操作结果；顺序与「执行逻辑」文案一致。 */
+const DAILY_STEPS=[
+  {label:'WorkBuddy · 签到 + 国际打卡', kind:'checkin', platform:'workbuddy'},
+  {label:'WorkBuddy · 运行成长任务', kind:'task', action:'run', platform:'workbuddy'},
+  {label:'WorkBuddy · 领取任务奖励', kind:'task', action:'claim', platform:'workbuddy'},
+  {label:'WorkBuddy · 猫猫旅行', kind:'task', action:'travel', platform:'workbuddy'},
+  {label:'WorkBuddy · 连登奖励', kind:'task', action:'streak-bonus', platform:'workbuddy'},
+  {label:'WorkBuddy · 夜猫子', kind:'task', action:'night', platform:'workbuddy'},
+  {label:'Qoder · 签到', kind:'checkin', platform:'qoder'},
+  {label:'Qoder · 领取全部福利', kind:'task', action:'run', platform:'qoder'},
+  {label:'Qoder · 猫猫旅行', kind:'task', action:'travel', platform:'qoder'},
+];
+document.getElementById('btn-daily-all').onclick=async function(){
+  if(!runOnce('daily/all')) return;
+  let okN=0, failN=0, skipN=0, cur='准备中…';
+  await withBtn(this, async()=>{
+    for(let i=0;i<DAILY_STEPS.length;i++){
+      const s=DAILY_STEPS[i];
+      cur=`(${i+1}/${DAILY_STEPS.length}) ${s.label}`;
+      // 与单按钮共用同一 RUNNING key：单点中的动作不会被全自动重复执行
+      const key=s.kind==='checkin' ? 'checkin/'+s.platform
+        : (s.kind==='task' ? `task/${s.action}/${s.platform}` : `engine/${s.platform}/${s.path}`);
+      if(RUNNING.has(key)){
+        skipN++;
+        pushHistory(s.label, true, '跳过：该动作正在执行中','');
+        continue;
+      }
+      RUNNING.add(key);
+      try{
+        let r;
+        if(s.kind==='checkin') r=await api('/api/checkin/'+s.platform,{method:'POST'});
+        else if(s.kind==='task') r=await api(`/api/tasks/${s.action}/${s.platform}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        else r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({platform:s.platform,path:s.path,method:'POST',body:s.body||{}})});
+        const ok=!!r.ok;
+        ok?okN++:failN++;
+        pushHistory(s.label, ok, ok?(firstBrief(r.result)||'完成'):(errMsg(r)||'失败'), JSON.stringify(r,null,1));
+      }catch(e){
+        failN++;
+        pushHistory(s.label, false, e.message||'请求失败','');
+      }finally{ runDone(key); }
+    }
+    toast(`一键全自动完成：成功 ${okN} 步${failN?`，失败 ${failN} 步`:''}${skipN?`，跳过 ${skipN} 步`:''}，详见操作结果`, 4200);
+    loadAuto(); loadStatus(); loadTasksStatus();
+  }, ()=>cur).finally(()=>runDone('daily/all'));
 };
 
 /* ── 每日活跃打卡（wb 国际版） ── */
