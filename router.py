@@ -657,11 +657,19 @@ def forward(up, method, path, body, client_headers, stream):
             return resp.status, resp_headers, data
         if stream:
             streaming = True
+            # 关键：上游 SSE 可能是 Connection: close 且**非 chunked**（wb 引擎就是）。
+            # 此时 resp.read(8192) 会阻塞到攒满 8192 字节才返回——等于把首字推迟
+            # 到一整批 token 生成完（实测 ds-flash +200ms、kimi +800ms）。
+            # read1() 只做一次底层读，有多少给多少，首字立刻就能往下传。
+            read1 = getattr(resp, "read1", None)
 
             def relay():
                 try:
                     while True:
-                        chunk = resp.read(8192)
+                        if read1 is not None:
+                            chunk = read1(65536)
+                        else:  # 老 Python：退回小块 read，至少不会等 8KB
+                            chunk = resp.read(1024)
                         if not chunk:
                             break
                         yield chunk
@@ -1337,6 +1345,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def do_POST(self):
+        t0 = time.time()
         path = self.path.split("?")[0]
         if not self._authorized():
             self._drain_body()
@@ -1382,6 +1391,7 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(body.decode("utf-8")) if body else {}
         except (ValueError, RecursionError):
             return self._deny(400, "请求体不是合法 JSON")
+        t_parse = time.time()
         if not isinstance(req, dict):
             return self._deny(400, "请求体必须是 JSON 对象")
 
@@ -1393,6 +1403,7 @@ class Handler(BaseHTTPRequestHandler):
         # 客户端视角的名字回显给客户端；上游拿真实模型名。
         req["model"] = upstream_model
         payload = json.dumps(req, ensure_ascii=False).encode("utf-8")
+        t_payload = time.time()
         stream = bool(req.get("stream"))
         log(f"{path} model={model} -> {up['name']}/{upstream_model} stream={stream}")
 
@@ -1419,12 +1430,15 @@ class Handler(BaseHTTPRequestHandler):
 
             # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
             if stream and not isinstance(result, (bytes, bytearray)):
-                return self._relay_stream(status, headers, result, client_facing, up)
+                return self._relay_stream(status, headers, result, client_facing, up,
+                                          t0=t0, t_head=time.time(), label=model,
+                                          t_parse=t_parse, t_payload=t_payload)
             return self._relay_json(status, headers, result, client_facing)
 
     # ---- 转发实现 ----
 
-    def _relay_stream(self, status, headers, chunks, client_facing, up):
+    def _relay_stream(self, status, headers, chunks, client_facing, up,
+                      t0=None, t_head=None, label="", t_parse=None, t_payload=None):
         self.send_response(status)
         ctype = headers.get("Content-Type", "text/event-stream")
         self.send_header("Content-Type", ctype)
@@ -1437,8 +1451,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         first = True
         buf = b""
+        # 首字计时：只认带 data: 的 SSE 数据块（引擎会先发 ": ping" 注释心跳）
+        first_data_at = None
         try:
             for chunk in chunks:
+                if first_data_at is None and b"data:" in chunk:
+                    first_data_at = time.time()
                 if first and client_facing:
                     # 8192 字节块可能把首个 `data:` 行拦腰截断，直接改写会静默失败。
                     # 缓冲到首个完整 SSE 事件（\n\n 边界）再改写；超过 64KB 放弃改写原样透传。
@@ -1469,6 +1487,16 @@ class Handler(BaseHTTPRequestHandler):
             # Windows 客户端中止常见 ConnectionAbortedError；上游读侧超时/重置也在这里收口
             log(f"连接中断（{up['name']}）: {type(exc).__name__}")
         log(f"stream 完成 -> {client_facing}")
+        if t0:
+            total_ms = int((time.time() - t0) * 1000)
+            head_ms = int((t_head - t0) * 1000) if t_head else -1
+            first_ms = int((first_data_at - t0) * 1000) if first_data_at else -1
+            parse_ms = int((t_parse - t0) * 1000) if t_parse else -1
+            body_ms = int((t_payload - t_parse) * 1000) if (t_payload and t_parse) else -1
+            # 首字拆解：parse=读 body+JSON 解析，body=重新序列化，head=解析+引擎响应头，
+            # first=第一个 data: 块，total=整条流
+            log(f"timing {label} head={head_ms}ms first={first_ms}ms "
+                f"parse={parse_ms}ms body={body_ms}ms total={total_ms}ms")
 
     def _relay_json(self, status, headers, data, client_facing):
         if status >= 400:
