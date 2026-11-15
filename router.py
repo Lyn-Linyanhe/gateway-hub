@@ -430,7 +430,9 @@ def _row_caps(platform, row):
         return int(v) if isinstance(v, (int, float)) and v > 0 else None
 
     caps = {}
-    ctx = num(row.get("context_length"))
+    # Buddy2api/Buddy 系目录用 context_window（qwenwork 上游实测 1,000,000），
+    # 其它引擎用 context_length；两个都读，别再让 qwenwork 的上下文变成未知。
+    ctx = num(row.get("context_length")) or num(row.get("context_window"))
     if ctx:
         caps["ctx"] = ctx
     wins = row.get("context_windows")
