@@ -274,6 +274,13 @@ td.num,th.num{text-align:right}
         </tr></thead><tbody id="usage-conv"><tr><td colspan="9" class="empty">—</td></tr></tbody></table>
       </div>
       <div class="sub" id="usage-conv-note" style="margin-bottom:14px"></div>
+      <div class="sub" style="font-weight:700;margin-bottom:6px">额度可用量预估（按最近实测单价）<span class="sub" style="font-weight:400">　余额 ÷ 实测单价；缓存命中率、思考档位、输入长度都会改变实际值，仅作量级参考</span></div>
+      <div class="tblwrap" style="margin-bottom:6px">
+        <table><thead><tr>
+          <th>平台</th><th>模型 / 口径</th><th class="num">当前余额</th><th class="num">实测单价 分/千tok</th><th class="num">近期 token 占比</th><th class="num">预计可用 TOKEN</th>
+        </tr></thead><tbody id="usage-estimate"><tr><td colspan="6" class="empty">—</td></tr></tbody></table>
+      </div>
+      <div class="sub" id="usage-estimate-note" style="margin-bottom:14px"></div>
       <div class="sub" style="font-weight:700;margin-bottom:6px">按模型汇总（当前筛选范围）</div>
       <div class="tblwrap" style="margin-bottom:14px">
         <table><thead><tr>
@@ -282,11 +289,11 @@ td.num,th.num{text-align:right}
       </div>
       <div class="tblwrap" style="max-height:none">
         <table><thead><tr>
-          <th>时间</th><th>平台</th><th>模型</th><th>推理强度</th><th>账号</th><th>Key</th><th>模式</th><th>结果</th>
+          <th>时间</th><th>平台</th><th>模型</th><th>推理强度</th><th>账号</th><th>模式</th><th>结果</th>
           <th class="num">耗时</th><th class="num">首字</th><th class="num">速度</th>
-          <th class="num">输入</th><th class="num">输出</th><th class="num">思考</th><th class="num">缓存</th>
+          <th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th>
           <th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">估算价格</th>
-        </tr></thead><tbody id="usage-body"><tr><td colspan="18" class="empty">加载中…</td></tr></tbody></table>
+        </tr></thead><tbody id="usage-body"><tr><td colspan="16" class="empty">加载中…</td></tr></tbody></table>
       </div>
     </div>
   </div>
@@ -668,14 +675,26 @@ function renderModels(){
       const specHtml=spec.length?`<div class="sub-cell mono" style="color:var(--dim)">▣ ${spec.join(' · ')}</div>`:'';
       const manual=m.multiplier&&m.multiplier.source==='manual';
       const isAuto=m.multiplier&&m.multiplier.source==='auto';
-      const autoCell=isAuto?`<div class="sub-cell">自动实测 · ${m.multiplier.samples} 窗口 · 累计 ${Number(m.multiplier.credit).toFixed(2)} 分 / ${Number(m.multiplier.tokens).toLocaleString()} tok</div>`:'';
-      const rateCell=(pf2==='qwenwork'&&!m.multiplier)||manual||isAuto
-        ? `<div class="toolbar" style="gap:4px;margin:0">
-             <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc((manual||isAuto)&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:70px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
+      let rateCell;
+      if(isAuto){
+        // 千问办公的自动值是「余额差 ÷ token」的绝对单价（分/token，~0.0000622），
+        // 当倍率显示像乱码。这里给同平台相对倍率（相对最便宜模型 = x1.00），
+        // 绝对单价按分/千tok 放在副行，额度预估用的也是它。
+        const mt=m.multiplier;
+        const rateK=(mt.rate_per_ktok!=null)?Number(mt.rate_per_ktok):(Number(mt.factor||0)*1000);
+        const rel=(mt.rel_factor!=null)?('x'+Number(mt.rel_factor).toFixed(2)):'—';
+        rateCell=`<div style="font-weight:600">${rel} <span class="sub-cell" style="font-weight:400">相对</span></div>
+          <div class="sub-cell">${esc((mt.rel_base||'基准')+' = x1.00')} · 实测 ${rateK.toFixed(4)} 分/千tok</div>
+          <div class="sub-cell">自动实测 · ${mt.samples||0} 窗口 · 累计 ${Number(mt.credit||0).toFixed(2)} 分 / ${Number(mt.tokens||0).toLocaleString()} tok</div>`;
+      } else if(pf2==='qwenwork'&&(!m.multiplier||manual)){
+        rateCell=`<div class="toolbar" style="gap:4px;margin:0">
+             <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc(manual&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:70px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
              <button class="btn mini" data-ratesave="${esc(m.id)}">存</button>
              ${manual?`<button class="btn sec mini" data-rateclear="${esc(m.id)}">清除</button>`:''}
-           </div>${autoCell}${manual?`<div class="sub-cell">手工记录 ${esc(m.multiplier.note||m.multiplier.recorded_at||'')}</div>`:''}`
-        : fmtMult(m.multiplier);
+           </div>${manual?`<div class="sub-cell">手工记录 ${esc(m.multiplier.note||m.multiplier.recorded_at||'')}</div>`:''}`;
+      } else {
+        rateCell=fmtMult(m.multiplier);
+      }
       const star=m.fav?'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="0" title="取消常用" style="color:var(--orange);border:none;background:none;padding:2px 4px">★</button>':'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="1" title="标为常用" style="border:none;background:none;padding:2px 4px">☆</button>';
       return `<tr>
         <td><input type="checkbox" class="msel-box" data-msel="${esc(m.id)}" ${MSEL.has(m.id)?'checked':''}></td>
@@ -797,6 +816,18 @@ function renderPlatforms(platforms){
         :a.checked_in?'<span class="pill green">今日已签</span>'
         :(a.can_checkin?'<span class="pill orange">待签</span>':'<span class="pill gray">—</span>'));
       const st=!a.enabled?'<span class="pill red">停用</span>':'<span class="pill green">启用</span>';
+      // 并发：wb 引擎给逐账号在飞数 + 每账号上限（account_max_concurrent，0=不限）；
+      // qoder 团队闸门（引擎 account_views 附带）；千问办公只有全局 rate_limit 上限。
+      const cq=(()=>{
+        const lim=a.concurrency_limit, inf=a.inflight;
+        if(lim===null||lim===undefined)
+          return (inf===null||inf===undefined)
+            ? '<span class="pill gray" title="该引擎未暴露账号级并发">—</span>'
+            : `<span class="pill indigo" title="当前在飞请求数">在飞 ${inf}</span>`;
+        if(!lim) return '<span class="pill gray" title="未设置账号级并发上限（0 = 不限）">不限</span>';
+        const n=(inf===null||inf===undefined)?'—':inf;
+        return `<span class="pill ${(inf!=null&&inf>=lim)?'orange':'green'}" title="当前在飞 / 每账号并发上限">${n} / ${lim}</span>`;
+      })();
       const creditCell=unknown?'<span class="pill gray">以官方客户端为准</span>'
         :(a.size===null?`<span class="num">${fmt(a.remain)}</span><div class="sub-cell">无固定配额，按上游实扣</div>`
         :`<span class="num">${fmt(a.remain)}</span><div class="sub-cell">/ ${fmt(a.size)}</div>`);
@@ -806,7 +837,7 @@ function renderPlatforms(platforms){
       return `<tr><td class="name-cell">${esc(a.name)}<div class="sub-cell">${esc(a.sub||'')}</div></td>
         <td class="num">${creditCell}</td>
         <td>${barCell}</td>
-        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`:''}</td><td>${st}</td></tr>`;
+        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
     }).join('');
     const rem=p.accounts.reduce((s,a)=>s+(a.remain||0),0);
     const allUnknown=p.accounts.length>0&&p.accounts.every(a=>a.remain===null);
@@ -814,12 +845,13 @@ function renderPlatforms(platforms){
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
         <span class="name-cell" style="font-size:14px">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
         <span class="pill ${p.health?'green':'red'}">${p.health?'在线':'离线'}</span>
+        <span class="pill ${p.inflight?'indigo':'gray'}" title="经网关的当前在飞推理请求（流式算到流写完）；直连引擎的请求不计入">并发 ${p.inflight||0}</span>
         <span class="sub-cell mono">${esc(p.base_url)}</span>
         <span style="flex:1"></span>
         <span class="sub-cell">${p.accounts.length} 账号 · ${allUnknown?'余额以官方客户端为准':fmt(rem)+' 分'}</span>
         <button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>
       </div>
-      ${rows?`<div class="tblwrap"><table><thead><tr><th>账号</th><th class="num">积分</th><th>余量</th><th>签到</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      ${rows?`<div class="tblwrap"><table><thead><tr><th>账号</th><th class="num">积分</th><th>余量</th><th>签到</th><th>并发</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
         :`<div class="empty">${p.error?esc(p.error):'该平台暂无账号'}</div>`}
     </div>`;
   }).join('');
@@ -829,6 +861,7 @@ function renderPlatforms(platforms){
 /* ── 用量 ── */
 let USAGE={rows:[],usd_cny:null}, UPAGE=1;
 let USAGE_RATE={}; // "平台/模型" -> {factor, source}（目录倍率，供换算统计比对）
+let AUTO_RATE={};  // 千问办公自动实测：id -> {rateK:分/千tok, samples, credit, tokens, rel, base, model}
 async function loadUsage(){
   try{
     const [d, cat] = await Promise.all([
@@ -836,13 +869,24 @@ async function loadUsage(){
       api('/api/catalog').catch(()=>null),
     ]);
     USAGE=d; UPAGE=1;
-    USAGE_RATE={};
+    USAGE_RATE={}; AUTO_RATE={};
     if(cat && Array.isArray(cat.items)){
       for(const it of cat.items){
         if(it.multiplier && it.multiplier.factor) USAGE_RATE[it.id]={factor:Number(it.multiplier.factor), source:it.multiplier.source||''};
+        if(it.platform==='qwenwork' && it.multiplier && it.multiplier.source==='auto'){
+          const f=Number(it.multiplier.factor)||0;
+          AUTO_RATE[it.id]={rateK:(it.multiplier.rate_per_ktok!=null?Number(it.multiplier.rate_per_ktok):f*1000),
+            samples:it.multiplier.samples||0, credit:Number(it.multiplier.credit)||0,
+            tokens:Number(it.multiplier.tokens)||0, rel:it.multiplier.rel_factor,
+            base:it.multiplier.rel_base, model:it.model};
+        }
       }
     }
     renderUsage();
+    // 预估要余额：状态还没载入时补拉一次（不阻塞表格渲染）
+    if(!LAST_STATUS){
+      api('/api/status').then(st=>{LAST_STATUS=st; renderUsageEstimate();}).catch(()=>{});
+    }
   }catch(e){ if(e.status!==401) toast('用量加载失败: '+e.message); }
 }
 function usageFiltered(){
@@ -1015,19 +1059,18 @@ function renderUsage(){
       <td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
       <td class="mono">${esc(r.model)}</td>
       <td>${r.reasoning_effort?`<span class="pill purple">${esc(r.reasoning_effort)}</span>`:'<span class="pill gray" title="上游未记录该请求的思考状态">—</span>'}</td>
-      <td>${esc(r.account||'—')}</td><td>${esc(r.key_name||'—')}</td>
+      <td>${esc(r.account||'—')}</td>
       <td>${r.stream===null?'—':(r.stream?'流式':'非流式')}</td>
       <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td>
       <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}</td>
       <td class="num">${r.ttft_ms?(r.ttft_ms/1000).toFixed(2)+' s':'—'}</td>
       <td class="num">${r.speed==null?'—':esc(r.speed)}</td>
       <td class="num">${fmtTok(r.prompt)}</td><td class="num">${fmtTok(r.completion)}</td>
-      <td class="num">${r.reasoning||0}</td>
       <td class="num">${r.cached?cachedPct+'%':'0'}</td>
       <td class="num" style="font-weight:700">${fmtTok(r.total)}</td>
       <td class="num" style="color:${cr?'var(--orange)':'inherit'}">${cr==null?'—':cr.toFixed(2)}</td>
       <td class="num" style="color:var(--dim)">${price}</td></tr>`;
-  }).join('') : '<tr><td colspan="18" class="empty">暂无请求记录</td></tr>';
+  }).join('') : '<tr><td colspan="16" class="empty">暂无请求记录</td></tr>';
   document.getElementById('usage-pageinfo').textContent=`共 ${rows.length} 条 · 第 ${UPAGE}/${pages} 页`;
   fillUsageOptions('usage-model',[...new Set(USAGE.rows.map(r=>r.model||''))].filter(Boolean));
   fillUsageOptions('usage-account',[...new Set(USAGE.rows.map(r=>r.account||''))].filter(Boolean));
@@ -1036,6 +1079,7 @@ function renderUsage(){
   renderUsageCharts(rows);
   renderUsageConversion(rows);
   renderUsagePerModel(rows);
+  renderUsageEstimate();
 }
 /* 换算统计：平台×模型的实扣积分 vs token，对照目录倍率；wb 另有真实成本锚点 */
 function renderUsageConversion(rows){
@@ -1087,6 +1131,98 @@ function renderUsageConversion(rows){
     return `${PLATFORM_LABEL[p]||p}: ${v.n} 次 · ${fmtTok(v.tok)} tok · ${v.credit.toFixed(2)} 分（${rate!==null?rate.toFixed(4):'—'}/千tok）${v.cny?` · 真实 ¥${v.cny.toFixed(2)}`:''}`;
   }).join('　|　');
   note.textContent='平台汇总（当前筛选）→ '+summary;
+}
+/* 额度可用量预估：余额 ÷ 实测单价（分/千tok）
+   - wb/qoder：单价取用量行 credit ÷ token（缓存折扣反映在实扣里）
+   - 千问办公：用量行没有积分，用余额差实测的 auto 单价（分/tok ×1000）
+   比例与结构用全部近期日志（不随表格筛选），余额取 /api/status 的启用账号。 */
+function renderUsageEstimate(){
+  const tb=document.getElementById('usage-estimate');
+  const note=document.getElementById('usage-estimate-note');
+  if(!tb) return;
+  const agg={};
+  for(const r of USAGE.rows){
+    const key=(r.platform||'?')+'/'+(r.model||'?');
+    const e=agg[key]||(agg[key]={platform:r.platform,model:r.model,tok:0,credit:0,hasCredit:false,n:0});
+    e.n++; e.tok+=(r.total||0);
+    const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
+    if(cr!==null){ e.credit+=cr; e.hasCredit=true; }
+  }
+  const bal={};
+  for(const p of ((LAST_STATUS&&LAST_STATUS.platforms)||[])){
+    let sum=0, any=false;
+    for(const a of (p.accounts||[])){
+      if(!a.enabled||a.remain==null) continue;
+      sum+=Number(a.remain)||0; any=true;
+    }
+    bal[p.name]=any?sum:null;
+  }
+  const byPf={};
+  const getPf=p=>byPf[p]||(byPf[p]={models:[],tok:0,credit:0,hasCredit:false});
+  for(const e of Object.values(agg)){
+    const key=e.platform+'/'+e.model;
+    let rateK=null, src='';
+    if(e.hasCredit&&e.tok>0){ rateK=e.credit/e.tok*1000; src='实扣'; }
+    else if(AUTO_RATE[key]){ rateK=AUTO_RATE[key].rateK; src='余额差'; }
+    if(rateK==null||!(rateK>0)) continue;
+    const pf=getPf(e.platform);
+    pf.models.push({model:e.model,tok:e.tok,rateK,src});
+    pf.tok+=e.tok;
+    if(e.hasCredit){ pf.credit+=e.credit; pf.hasCredit=true; }
+  }
+  // 千问办公有实测但近期没用过的模型也列出来（占比 —）
+  for(const [id,m] of Object.entries(AUTO_RATE)){
+    const i=id.indexOf('/'); if(i<0) continue;
+    const p=id.slice(0,i), model=id.slice(i+1);
+    const pf=getPf(p);
+    if(!pf.models.some(x=>x.model===model)) pf.models.push({model,tok:0,rateK:m.rateK,src:'余额差'});
+  }
+  const order=['workbuddy','qoder','qwenwork'].filter(p=>byPf[p]||bal[p]!=null);
+  if(!order.length){
+    tb.innerHTML='<tr><td colspan="6" class="empty">没有可用于估算的实测单价（先跑几次请求）</td></tr>';
+    note.textContent=''; return;
+  }
+  let html='', total=0, parts=[];
+  for(const p of order){
+    const pf=byPf[p]||{models:[],tok:0,credit:0,hasCredit:false};
+    const balance=bal[p];
+    let blended=null;
+    if(pf.hasCredit&&pf.tok>0) blended=pf.credit/pf.tok*1000;
+    else{
+      const withTok=pf.models.filter(m=>m.tok>0);
+      if(withTok.length){
+        const t=withTok.reduce((s,m)=>s+m.tok,0);
+        blended=withTok.reduce((s,m)=>s+m.tok*m.rateK,0)/t;
+      } else if(pf.models.length){
+        blended=pf.models.reduce((s,m)=>s+m.rateK,0)/pf.models.length;
+      }
+    }
+    const est=(balance!=null&&blended>0)?balance/blended*1000:null;
+    if(est){ total+=est; parts.push((PLATFORM_LABEL[p]||p)+' '+fmtTok(est)); }
+    html+=`<tr style="background:var(--panel2)">
+      <td><span class="pill indigo">${esc(PLATFORM_LABEL[p]||p)}</span></td>
+      <td><b>按近期结构加权</b><div class="sub-cell">${pf.models.length} 个模型有实测单价</div></td>
+      <td class="num">${balance!=null?fmt(balance)+' 分':'—'}</td>
+      <td class="num" style="font-weight:600">${blended>0?blended.toFixed(4):'—'}</td>
+      <td class="num">${pf.tok?'100%':'—'}</td>
+      <td class="num" style="font-weight:700;color:var(--accent)">${est?fmtTok(est):'—'}</td></tr>`;
+    const models=pf.models.slice().sort((a,b)=>b.tok-a.tok).slice(0,8);
+    for(const m of models){
+      const share=pf.tok>0?(m.tok/pf.tok*100):null;
+      const e2=(balance!=null)?balance/m.rateK*1000:null;
+      html+=`<tr>
+        <td></td>
+        <td class="mono">${esc(m.model)} <span class="sub-cell">${esc(m.src)}</span></td>
+        <td class="num">${balance!=null?fmt(balance)+' 分':'—'}</td>
+        <td class="num">${m.rateK.toFixed(4)}</td>
+        <td class="num">${share!=null?share.toFixed(1)+'%':'—'}</td>
+        <td class="num">${e2?fmtTok(e2):'—'}</td></tr>`;
+    }
+  }
+  tb.innerHTML=html;
+  note.textContent=(total>0)
+    ? ('合计约 '+fmtTok(total)+' tok（'+parts.join(' + ')+'）· 各平台按自己的余额与实测单价分别折算（积分口径不同不能相加，只加总 token 量级）；模型行的「预计可用」= 假设余额全部花在该模型。')
+    : '余额未加载或没有实测单价，暂时无法估算（状态接口返回后会自动刷新；也可以先跑几次请求让上游记录用量）。';
 }
 document.getElementById('btn-usage-refresh').onclick=loadUsage;
 document.getElementById('usage-filter').onchange=()=>{UPAGE=1;renderUsage();};

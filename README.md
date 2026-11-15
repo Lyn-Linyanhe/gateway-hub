@@ -76,6 +76,7 @@
 | `hide_pro_locked` | PRO 专属模型在无付费账号时自动隐藏，默认 `true` |
 | `wb_dual_prefer` | 双区模型出口偏好：`auto`（按临期紧迫度）/ `cn` / `intl` |
 | `custom_multipliers` / `auto_multipliers` | 手工/实测倍率记录（控制台维护） |
+| `model_caps` | 实测能力补充表：`{"qwenwork/frontier-1": {"vision": true}}`。上游目录不声明多模态/工具能力时（如 qwenwork 供应商列表），把实测结论写在这里；`/api/catalog` 与 `/v1/models` 的 `capabilities` 都会带上 |
 
 ## 常用接口
 

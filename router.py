@@ -8,6 +8,7 @@
 - 一个对外 API Key；模型名支持 `平台/模型` 精确指定，裸模型名在全网关唯一时可直接用。
 """
 
+import contextlib
 import json
 import os
 import re
@@ -26,6 +27,22 @@ LOG_PATH = os.path.join(HERE, "router.log")
 DASHBOARD_PATH = os.path.join(HERE, "dashboard.html")
 
 _log_lock = threading.Lock()
+
+# 网关视角的在飞推理请求数（/v1/*，流式算到流写完）：平台卡片「并发」展示用。
+# 这是"经过网关的"并发，直连引擎的请求不计入——与各引擎自己的账号级在飞数互补。
+_inflight_lock = threading.Lock()
+_inflight = {}
+
+
+@contextlib.contextmanager
+def _platform_inflight(name):
+    with _inflight_lock:
+        _inflight[name] = _inflight.get(name, 0) + 1
+    try:
+        yield
+    finally:
+        with _inflight_lock:
+            _inflight[name] = max(0, _inflight.get(name, 0) - 1)
 
 
 def log(msg):
@@ -420,6 +437,21 @@ def _row_caps(platform, row):
     return caps
 
 
+def _model_caps(x):
+    """_row_caps + config.model_caps 覆盖。
+
+    上游目录（尤其 qwenwork 的供应商列表）不声明多模态/工具能力，只能靠
+    实测补：覆盖表按 "平台/模型" 写 {"vision": true} 之类的硬事实，测得
+    什么补什么，没测的继续留空，前端照旧不显示。改配置后无需重启之外的
+    操作，目录/模型列表下次拉取即生效。
+    """
+    caps = _row_caps(x["platform"], x["row"])
+    ov = (CONFIG.get("model_caps") or {}).get(f"{x['platform']}/{x['public']}")
+    if isinstance(ov, dict):
+        caps.update({k: v for k, v in ov.items() if v is not None})
+    return caps
+
+
 def public_catalog():
     """全平台公共模型目录（15s 缓存）：
 
@@ -763,6 +795,9 @@ def normalize_qoder(a):
         "can_daily_chat": None,
         "realm": a.get("realm"),
         "streak": None,
+        # 账号级并发：引擎 account_views() 附带（在飞租约数 / 闸门上限，0=不限）
+        "inflight": a.get("inflight"),
+        "concurrency_limit": a.get("concurrencyLimit"),
     }
 
 
@@ -893,7 +928,8 @@ def _collect_updates(force=False):
 def platform_status(up):
     """单个引擎的健康 + 账号池聚合。"""
     name = up["name"]
-    out = {"name": name, "base_url": up["base_url"], "health": False, "accounts": [], "error": ""}
+    out = {"name": name, "base_url": up["base_url"], "health": False, "accounts": [],
+           "inflight": _inflight.get(name, 0), "error": ""}
     try:
         req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -961,6 +997,31 @@ def platform_status(up):
             items = items or []
         norm = NORMALIZERS.get(name, normalize_buddy)
         out["accounts"] = [norm(a) for a in items if isinstance(a, dict)]
+        # 账号并发：wb 引擎逐账号给在飞数（/settings.account_inflight）+ 每账号
+        # 上限（account_max_concurrent，0=不限）；qwenwork 只有全局 rate_limit 上限
+        # （0=不限，Buddy2api 不暴露逐账号在飞数）；qoder 由引擎 account_views 附带。
+        if name == "workbuddy":
+            try:
+                st = engine_request(up, "GET", "/settings")
+                limit = int(st.get("account_max_concurrent") or 0)
+                snap = st.get("account_inflight") or {}
+                if not isinstance(snap, dict):
+                    snap = {}
+            except Exception:
+                limit, snap = None, {}
+            for row in out["accounts"]:
+                row["concurrency_limit"] = limit
+                row["inflight"] = (int(snap.get(row.get("uid")) or 0)
+                                   if limit is not None else None)
+        elif name == "qwenwork":
+            try:
+                st = engine_request(up, "GET", "/admin/settings", auth="none")
+                limit = int(st.get("rate_limit_max_concurrent") or 0)
+            except Exception:
+                limit = None
+            for row in out["accounts"]:
+                row["concurrency_limit"] = limit
+                row["inflight"] = None
         # 即将过期的积分：wb 直接给 earliest_expiring（最临期包 + 已算好的天数），
         # qoder 给整池 expires_at；qwenwork 上游不透出过期时间，如实缺省。
         expiring = []
@@ -1336,18 +1397,20 @@ class Handler(BaseHTTPRequestHandler):
                 client_h["X-Realm"] = realm
                 log(f"wb 分区路由: {upstream_model} -> {realm}")
 
-        try:
-            status, headers, result = forward(
-                up, "POST", path, payload, client_h, stream
-            )
-        except (OSError, TimeoutError, HTTPException) as exc:
-            log(f"upstream[{up['name']}] 连接失败: {type(exc).__name__}: {exc}")
-            return self._deny(502, f"上游 {up['name']} 不可达: {exc}", "upstream_error")
+        # 平台在飞计数：从发起到响应体写完（流式 = 整个流）都算
+        with _platform_inflight(up["name"]):
+            try:
+                status, headers, result = forward(
+                    up, "POST", path, payload, client_h, stream
+                )
+            except (OSError, TimeoutError, HTTPException) as exc:
+                log(f"upstream[{up['name']}] 连接失败: {type(exc).__name__}: {exc}")
+                return self._deny(502, f"上游 {up['name']} 不可达: {exc}", "upstream_error")
 
-        # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
-        if stream and not isinstance(result, (bytes, bytearray)):
-            return self._relay_stream(status, headers, result, client_facing, up)
-        return self._relay_json(status, headers, result, client_facing)
+            # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
+            if stream and not isinstance(result, (bytes, bytearray)):
+                return self._relay_stream(status, headers, result, client_facing, up)
+            return self._relay_json(status, headers, result, client_facing)
 
     # ---- 转发实现 ----
 
@@ -1885,8 +1948,15 @@ class Handler(BaseHTTPRequestHandler):
                 continue  # PRO 专属且池里无付费账号：客户端拉不到也调不了
             # 统一带平台前缀：裸名（如 kimi-k3/max-model）让用户看不出模型
             # 归属哪个平台；裸名调用仍兼容（resolve_model 唯一性放行）
-            merged.append({"id": f"{x['platform']}/{x['public']}", "object": "model",
-                           "owned_by": x["platform"]})
+            entry = {"id": f"{x['platform']}/{x['public']}", "object": "model",
+                     "owned_by": x["platform"]}
+            # 能力字段（vision/tools/reasoning）：OpenAI 官方 /v1/models 没有，
+            # 但多数客户端会读；客户端不认识的字段直接忽略，无副作用。
+            caps = _model_caps(x)
+            ability = {k: caps[k] for k in ("vision", "tools", "reasoning") if k in caps}
+            if ability:
+                entry["capabilities"] = ability
+            merged.append(entry)
         self._send_json(200, {"object": "list", "data": merged,
                               "platforms": seen_platforms, "hidden_count": hidden_count})
 
@@ -1931,7 +2001,7 @@ class Handler(BaseHTTPRequestHandler):
                     "realms": x.get("realms") or [],
                     "pro_locked": x["platform"] == "workbuddy" and _wb_entry_locked(x),
                     "multiplier": mult}
-            item["caps"] = _row_caps(x["platform"], x["row"])
+            item["caps"] = _model_caps(x)
             if x["platform"] == "workbuddy" and item["realms"]:
                 # 当前实际出口：区域专属 → 固定；双区 → wb_dual_prefer 决定
                 #（PRO 避让在 _wb_route_realm 里）。route_auto 表示出口由调度
@@ -1948,6 +2018,19 @@ class Handler(BaseHTTPRequestHandler):
                     item["alias_of"] = alias_of  # 本 id 是某逻辑模型在国际版出口的改名
             items.append(item)
         items.sort(key=lambda i: (i["platform"], i["model"]))
+        # 千问办公 auto_multipliers.factor 是「分/token」绝对值（实测 ~0.0000622），
+        # 直接当倍率展示像乱码。改成同平台相对最便宜模型的倍率（x1.00 / x2.57…），
+        # 绝对单价另给 rate_per_ktok（分/千tok），供「额度可用量预估」用。
+        auto_rows = [(i, i["multiplier"].get("factor")) for i in items
+                     if i["platform"] == "qwenwork" and i.get("multiplier")
+                     and i["multiplier"].get("source") == "auto"
+                     and i["multiplier"].get("factor")]
+        if auto_rows:
+            base_item, base_factor = min(auto_rows, key=lambda pair: pair[1])
+            for item, factor in auto_rows:
+                item["multiplier"]["rel_factor"] = round(factor / base_factor, 3)
+                item["multiplier"]["rel_base"] = base_item["model"]
+                item["multiplier"]["rate_per_ktok"] = round(factor * 1000, 6)
         hidden = _hidden_set()
         # hidden 数组是前端实时同步行状态的依据：只回 hidden_count 会让
         # 已隐藏模型在每次加载模型页时被错误覆写成「显示中」

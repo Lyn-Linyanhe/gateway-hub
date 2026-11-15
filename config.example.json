@@ -28,5 +28,8 @@
   "favorite_models": [],
   "custom_multipliers": {},
   "auto_multipliers": {},
-  "qwenwork_reset_at": ""
+  "qwenwork_reset_at": "",
+  "model_caps": {
+    "qwenwork/frontier-1": {"vision": true}
+  }
 }
