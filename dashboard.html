@@ -116,6 +116,12 @@ td.num,th.num{text-align:right}
 .terminal .tbody{background:#16140f;color:#d6d3c9;font:12px/1.7 ui-monospace,Consolas,monospace;padding:12px 14px;max-height:420px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
 .terminal .tbody .ok{color:#10b981}.terminal .tbody .warn{color:#f59e0b}.terminal .tbody .err{color:#ef4444}
 
+/* 纤细滚动条：表格/日志等滚动区域统一圆角细条，避免默认粗条割裂界面 */
+*{scrollbar-width:thin;scrollbar-color:#c9ced8 transparent}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#c9ced8;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#aab1bf}
+::-webkit-scrollbar-track{background:transparent}
 .hidden{display:none!important}
 .view{display:none}.view.active{display:block}
 .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:60;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:10px 18px;font-size:13px}
@@ -262,19 +268,19 @@ td.num,th.num{text-align:right}
       <div class="kpis" id="usage-stats" style="margin-bottom:12px"></div>
       <div id="usage-charts" style="margin-bottom:14px"></div>
       <div class="sub" style="font-weight:700;margin-bottom:6px">换算统计（平台 × 模型 · 实扣口径）<span class="sub" style="font-weight:400">　实测积分/千tok = 实扣积分 ÷ 总token × 1000；缓存命中会把实测值拉低（wb 对缓存部分打折计费）；「真实成本」只有 wb 上游提供（按上游官方美元价折算）</span></div>
-      <div class="tblwrap" style="max-height:260px;margin-bottom:6px">
+      <div class="tblwrap" style="margin-bottom:6px">
         <table><thead><tr>
           <th>平台</th><th>模型</th><th class="num">请求</th><th class="num">总 tok</th><th class="num">实扣积分</th><th class="num">实测 积分/千tok</th><th class="num">目录倍率</th><th class="num">实测 ÷ 目录</th><th class="num">真实成本 ¥</th>
         </tr></thead><tbody id="usage-conv"><tr><td colspan="9" class="empty">—</td></tr></tbody></table>
       </div>
       <div class="sub" id="usage-conv-note" style="margin-bottom:14px"></div>
       <div class="sub" style="font-weight:700;margin-bottom:6px">按模型汇总（当前筛选范围）</div>
-      <div class="tblwrap" style="max-height:220px;margin-bottom:14px">
+      <div class="tblwrap" style="margin-bottom:14px">
         <table><thead><tr>
           <th>平台</th><th>模型</th><th class="num">次数</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">估算价格</th><th class="num">成功率</th>
         </tr></thead><tbody id="usage-permodel"><tr><td colspan="10" class="empty">—</td></tr></tbody></table>
       </div>
-      <div class="tblwrap">
+      <div class="tblwrap" style="max-height:none">
         <table><thead><tr>
           <th>时间</th><th>平台</th><th>模型</th><th>推理强度</th><th>账号</th><th>Key</th><th>模式</th><th>结果</th>
           <th class="num">耗时</th><th class="num">首字</th><th class="num">速度</th>
@@ -991,7 +997,7 @@ function renderUsage(){
     return `<tr><td class="mono">${esc(r.iso)}</td>
       <td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
       <td class="mono">${esc(r.model)}</td>
-      <td>${r.reasoning_effort?`<span class="pill purple">${esc(r.reasoning_effort)}</span>`:'<span class="pill purple">none</span>'}</td>
+      <td>${r.reasoning_effort?`<span class="pill purple">${esc(r.reasoning_effort)}</span>`:'<span class="pill gray" title="上游未记录该请求的思考状态">—</span>'}</td>
       <td>${esc(r.account||'—')}</td><td>${esc(r.key_name||'—')}</td>
       <td>${r.stream===null?'—':(r.stream?'流式':'非流式')}</td>
       <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td>

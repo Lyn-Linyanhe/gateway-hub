@@ -1001,6 +1001,24 @@ def platform_status(up):
                                  "remain": _num(c.get("remain")),
                                  "expire": time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
                                  "days_left": round((ts - time.time()) / 86400, 1)})
+        elif name == "qwenwork":
+            # 千问办公企业配额按月重置（客户端显示「配额下次重置时间」），
+            # 上游 resources 不透出 valid_to，日期由 config qwenwork_reset_at 提供
+            reset_at = str(CONFIG.get("qwenwork_reset_at") or "").strip()
+            if reset_at:
+                try:
+                    ts = time.mktime(time.strptime(reset_at, "%Y-%m-%d"))
+                    for a in items:
+                        res = (a.get("_resources") or {})
+                        remain = _num(res.get("remaining"))
+                        if remain > 0:
+                            expiring.append({"account": a.get("nickname") or "",
+                                             "name": "企业配额（按月重置）",
+                                             "remain": round(remain, 2),
+                                             "expire": reset_at + " 00:00",
+                                             "days_left": round((ts - time.time()) / 86400, 1)})
+                except ValueError:
+                    pass
         out["expiring"] = expiring
     except Exception as exc:
         out["error"] = f"账号聚合失败: {type(exc).__name__}: {exc}"
@@ -1689,7 +1707,13 @@ class Handler(BaseHTTPRequestHandler):
             "model": model,
             "account": row.get("account") or row.get("account_name") or row.get("nickname") or "",
             "key_name": row.get("key_name") or row.get("api_key_name") or "",
-            "reasoning_effort": row.get("reasoning_effort") or row.get("reasoning") or None,
+            # 思考强度：上游给具体档位就用档位；只给了开关状态（Buddy2api 的
+            # reasoning mode）就折成 thinking/none；都没有 → None（前端显示 —）
+            "reasoning_effort": (
+                row.get("reasoning_effort")
+                or {"enabled": "thinking", "disabled": "none",
+                    "effort": "thinking"}.get(str(row.get("reasoning") or ""))
+                or None),
             "stream": bool(row.get("stream")) if row.get("stream") is not None else None,
             "prompt": _num(row.get("prompt_tokens")),
             "completion": _num(row.get("completion_tokens")),
