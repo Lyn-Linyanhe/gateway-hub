@@ -1,0 +1,31 @@
+{
+  "listen_port": 8787,
+  "api_key": "agg-please-change-me",
+  "hide_pro_locked": true,
+  "wb_dual_prefer": "auto",
+  "upstreams": [
+    {
+      "name": "workbuddy",
+      "base_url": "http://127.0.0.1:8788",
+      "api_key": "wb-your-key",
+      "panel_password": "admin"
+    },
+    {
+      "name": "qoder",
+      "base_url": "http://127.0.0.1:8790",
+      "api_key": "",
+      "panel_password": "admin",
+      "repo": "shuishuipingan/qoder2api-hub"
+    },
+    {
+      "name": "qwenwork",
+      "base_url": "http://127.0.0.1:8792",
+      "api_key": "sk-cb-your-key",
+      "repo": "wicm84266964/Buddy2api"
+    }
+  ],
+  "hidden_models": [],
+  "favorite_models": [],
+  "custom_multipliers": {},
+  "auto_multipliers": {}
+}

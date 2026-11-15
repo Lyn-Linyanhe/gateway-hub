@@ -1,0 +1,1551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gateway Hub · 聚合控制台</title>
+<style>
+:root{
+  --bg:#f5f6f8; --panel:#ffffff; --panel2:#f1f3f7; --line:#e8eaef; --line2:#dfe3ea;
+  --fg:#1f2430; --dim:#6b7280; --dim2:#9ca3af;
+  --accent:#5b5bd6; --accent-hover:#4c4cc4; --accent-soft:#eef0fe; --accent-line:#dcdcf8;
+  --green:#16a34a; --green-soft:#e8f7ee;
+  --red:#ef4444; --red-soft:#fdeaea;
+  --orange:#f59e0b; --orange-soft:#fef3e2;
+  --purple:#7c3aed; --purple-soft:#ede9fe;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 4px 16px rgba(16,24,40,.05);
+  --nav-w:216px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-variant-numeric:tabular-nums;display:flex;min-height:100vh}
+.mono{font-family:ui-monospace,Consolas,"Cascadia Mono",monospace}
+button{font:inherit;cursor:pointer;border:none;background:none;color:inherit}
+a{color:var(--accent);text-decoration:none;word-break:break-all}
+input,select{font:inherit;color:var(--fg)}
+
+/* ── 侧边栏 ── */
+.sidebar{width:var(--nav-w);flex-shrink:0;background:var(--panel);border-right:1px solid var(--line);
+  position:sticky;top:0;height:100vh;display:flex;flex-direction:column;padding:16px 12px}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 10px 18px}
+.brand .logo{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:grid;place-items:center;color:#fff;font-weight:800;font-size:15px}
+.brand .name{font-weight:700;font-size:14px}
+.brand .sub{font-size:10px;color:var(--dim2)}
+.navlabel{font-size:11px;color:var(--dim2);padding:12px 12px 6px}
+.nav{display:flex;align-items:center;gap:10px;width:100%;padding:9px 12px;border-radius:10px;font-size:13.5px;color:#4b5563;transition:all .15s}
+.nav svg{width:16px;height:16px;flex-shrink:0}
+.nav:hover{background:var(--panel2)}
+.nav.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.sidebar .grow{flex:1}
+.sidefoot{border-top:1px solid var(--line);padding-top:10px;font-size:12px}
+.sidefoot .row{display:flex;align-items:center;gap:8px;padding:6px 10px;color:var(--dim);border-radius:8px}
+.sidefoot .row:hover{background:var(--panel2);color:var(--fg)}
+.sidefoot a{color:inherit}
+.status{display:flex;align-items:center;gap:7px;padding:8px 10px;font-size:12px;color:var(--dim)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot.g{background:#22c55e;box-shadow:0 0 0 2px rgba(34,197,94,.2)}
+.dot.r{background:#ef4444;box-shadow:0 0 0 2px rgba(239,68,68,.2)}
+.dot.o{background:#f59e0b;box-shadow:0 0 0 2px rgba(245,158,11,.2)}
+
+/* ── 主区 ── */
+.main{flex:1;min-width:0;padding:26px clamp(16px,2.5vw,40px) 60px}
+.pagetitle{font-size:22px;font-weight:700;letter-spacing:-.3px}
+.pagesub{font-size:13px;color:var(--dim);margin:4px 0 22px}
+.pagerow{display:flex;align-items:flex-start;gap:12px}
+.pagerow .grow{flex:1}
+
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid transparent}
+.pill.green{color:var(--green);background:var(--green-soft);border-color:#bfe8cf}
+.pill.red{color:var(--red);background:var(--red-soft);border-color:#f5c2c2}
+.pill.orange{color:#b45309;background:var(--orange-soft);border-color:#f5d9a8}
+.pill.purple{color:var(--purple);background:var(--purple-soft);border-color:#ddd3fb}
+.pill.gray{color:var(--dim);background:var(--panel2);border-color:var(--line)}
+.pill.indigo{color:var(--accent);background:var(--accent-soft);border-color:var(--accent-line)}
+
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:10px;background:var(--accent);color:#fff;border:1px solid var(--accent);font-size:13px;font-weight:600;transition:all .15s}
+.btn:hover{background:var(--accent-hover)}
+.btn.sec{background:var(--panel);color:var(--fg);border-color:var(--line2)}
+.btn.sec:hover{background:var(--panel2)}
+.btn.mini{padding:4px 10px;font-size:12px;border-radius:8px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn svg{width:13px;height:13px}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:18px 20px;margin-bottom:16px}
+.card h3{font-size:14px;font-weight:700;margin-bottom:4px}
+.card .sub{font-size:12px;color:var(--dim)}
+
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-bottom:16px}
+.realmcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:18px 20px}
+.realmcard.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),var(--shadow)}
+.realmtag{font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px}
+.realmtag.intl{color:#0e7490;background:#e0f4f8}
+.realmtag.cn{color:#c2410c;background:#ffedd5}
+.realmurl{font-size:11px;color:var(--dim2);margin-left:8px}
+.realmnum{font-size:28px;font-weight:800;letter-spacing:-.5px;margin:10px 0 2px}
+.realmnum .of{font-size:13px;font-weight:500;color:var(--dim2)}
+.realmmeta{font-size:12px;color:var(--dim)}
+
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:16px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px 20px}
+.kpi .label{font-size:12px;color:var(--dim);margin-bottom:6px}
+.kpi .num{font-size:26px;font-weight:800;letter-spacing:-.5px}
+.kpi .num.green{color:var(--green)}.kpi .num.orange{color:var(--orange)}.kpi .num.indigo{color:var(--accent)}
+.kpi .note{font-size:11px;color:var(--dim2);margin-top:4px}
+
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{background:var(--panel2);font-size:11px;font-weight:600;color:var(--dim);position:sticky;top:0}
+tbody tr:hover{background:var(--panel2)}
+td.num,th.num{text-align:right}
+.tblwrap{overflow:auto;max-height:560px;border:1px solid var(--line);border-radius:12px}
+.bar{position:relative;height:5px;border-radius:4px;background:var(--panel2);min-width:70px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:6px}
+.bar>i{position:absolute;inset:0;right:auto;background:var(--green);border-radius:4px}
+.bar>i.low{background:var(--orange)}
+.name-cell{font-weight:600}
+.sub-cell{font-size:11px;color:var(--dim2)}
+
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.toolbar input[type=text]{flex:1;min-width:180px;min-height:34px;border:1px solid var(--line2);border-radius:10px;padding:0 12px;background:var(--panel)}
+.toolbar input:focus,.toolbar select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.toolbar select{min-height:34px;border:1px solid var(--line2);border-radius:10px;background:var(--panel);padding:0 10px}
+.pager{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+.pagebtn{min-width:28px;height:28px;border-radius:8px;border:1px solid var(--line2);background:var(--panel);color:var(--fg);font-size:12px}
+.pagebtn.cur{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+.terminal{border:1px solid #2b2820;border-radius:14px;overflow:hidden}
+.terminal .thead{background:#1d1b15;padding:7px 14px;font-size:11px;color:#7c796f;display:flex;align-items:center;gap:8px;border-bottom:1px solid #2b2820}
+.terminal .tbody{background:#16140f;color:#d6d3c9;font:12px/1.7 ui-monospace,Consolas,monospace;padding:12px 14px;max-height:420px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.terminal .tbody .ok{color:#10b981}.terminal .tbody .warn{color:#f59e0b}.terminal .tbody .err{color:#ef4444}
+
+.hidden{display:none!important}
+.view{display:none}.view.active{display:block}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:60;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:10px 18px;font-size:13px}
+.empty{padding:18px;text-align:center;color:var(--dim2);font-size:12px}
+.mask{position:fixed;inset:0;background:rgba(15,23,42,.45);backdrop-filter:blur(4px);display:grid;place-items:center;z-index:50}
+.modal{width:380px;background:var(--panel);border-radius:14px;box-shadow:var(--shadow);padding:26px}
+.modal h3{font-size:16px;margin-bottom:6px}
+.modal p{font-size:12px;color:var(--dim);margin-bottom:14px}
+.modal input{width:100%;min-height:34px;border:1px solid var(--line2);border-radius:10px;padding:0 12px;background:var(--panel);margin-bottom:12px}
+.modal input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.modal .err{color:var(--red);font-size:12px;margin-bottom:10px;display:none}
+</style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <span class="logo">G</span>
+    <div><div class="name">Gateway Hub</div><div class="sub" id="brand-version">聚合控制台</div></div>
+  </div>
+  <div class="navlabel">工作台</div>
+  <button class="nav active" data-view="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>总览</button>
+  <div class="navlabel">平台</div>
+  <button class="nav" data-view="accounts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.2 3.4-5 6.5-5s5.7 1.8 6.5 5"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 15.2c2.8.3 5.3 1.9 6 4.8"/></svg>账号</button>
+  <button class="nav" data-view="add"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6M11 8v6"/></svg>添加账号</button>
+  <button class="nav" data-view="models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>模型</button>
+  <div class="navlabel">统计</div>
+  <button class="nav" data-view="usage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 20h18M6 16v-5M11 16V8M16 16v-8M21 16v-3"/></svg>用量</button>
+  <div class="navlabel">运维</div>
+  <button class="nav" data-view="auto"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>自动化</button>
+  <button class="nav" data-view="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.2a1.7 1.7 0 00-1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.2a1.7 1.7 0 001.5-1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.2a1.7 1.7 0 001 1.5h.1a1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1h.2a2 2 0 110 4h-.2a1.7 1.7 0 00-1.5 1z"/></svg>设置</button>
+  <button class="nav" data-view="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h7"/></svg>日志</button>
+  <div class="grow"></div>
+  <div class="sidefoot">
+    <a class="row" href="http://127.0.0.1:8788/" target="_blank">↗ WorkBuddy 引擎看板</a>
+    <a class="row" href="http://127.0.0.1:8790/" target="_blank">↗ Qoder 引擎看板</a>
+    <a class="row" href="http://127.0.0.1:8792/" target="_blank">↗ Buddy2api (QwenWork)</a>
+    <div class="status" id="foot-status"><span class="dot g"></span>网关运行中 · 端口 8787</div>
+  </div>
+</aside>
+
+<main class="main">
+  <div id="view-overview" class="view active">
+    <div class="pagerow"><div><div class="pagetitle">总览</div><div class="pagesub">三平台积分、调用量与最近请求一屏看完。</div></div>
+      <div class="grow"></div><button class="btn sec mini" id="btn-refresh-top">刷新数据</button></div>
+    <div class="grid3" id="realm-cards"></div>
+    <div class="kpis" id="kpis"></div>
+    <div class="card" style="margin-bottom:16px">
+      <h3>即将过期的积分 <span class="sub">按到期时间排序；qwenwork 上游不暴露过期时间，以官方客户端为准</span></h3>
+      <div id="expiring-list"><div class="empty">加载中…</div></div>
+    </div>
+    <div class="card">
+      <h3>最近请求 <span class="sub">全平台合并 · 最新 10 条</span></h3>
+      <div class="tblwrap" style="margin-top:10px">
+        <table><thead><tr><th>时间</th><th>平台</th><th>模型</th><th>账号</th><th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">耗时</th><th>结果</th></tr></thead>
+        <tbody id="recent-body"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-accounts" class="view">
+    <div class="pagetitle">账号</div><div class="pagesub">三平台账号池统一视图；签到调度仍在各引擎内自动运行。</div>
+    <div id="platforms"></div>
+  </div>
+
+  <div id="view-add" class="view">
+    <div class="pagetitle">添加账号</div><div class="pagesub">OAuth 设备授权在这里完成，成功后账号自动进入对应引擎的账号池。</div>
+    <div class="card">
+      <h3>WorkBuddy <span class="sub">copilot.tencent.com / workbuddy.ai</span></h3>
+      <div class="toolbar">
+        <select id="wb-realm" class="btn sec" style="min-height:34px"><option value="cn">国内版</option><option value="intl">国际版</option></select>
+        <button class="btn mini" id="wb-start">生成授权链接</button>
+        <span id="wb-login-status" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div id="wb-link" class="empty">选择版本后点「生成授权链接」</div>
+    </div>
+    <div class="card">
+      <h3>Qoder <span class="sub">qoder.com.cn / qoder.com</span></h3>
+      <div class="toolbar">
+        <select id="qoder-realm" class="btn sec" style="min-height:34px"><option value="cn">国内版 (qoder.com.cn)</option><option value="intl">国际版 (qoder.com)</option></select>
+        <button class="btn mini" id="qoder-start">生成授权链接</button>
+        <span id="qoder-login-status" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div id="qoder-link" class="empty">选择版本后点「生成授权链接」</div>
+    </div>
+    <div class="card">
+      <h3>千问办公 QwenWork <span class="sub">无 OAuth，走本地凭证</span></h3>
+      <div class="toolbar">
+        <button class="btn mini" id="qw-reimport">重新检测并导入</button>
+        <span style="font-size:12px;color:var(--dim)">在官方客户端登录（保持「杭州电子科技大学」企业工作区）后点这里；凭证按 uid 更新，不覆盖已有账号。</span>
+      </div>
+      <div id="qw-status" class="empty"></div>
+    </div>
+  </div>
+
+  <div id="view-models" class="view">
+    <div class="pagetitle">模型</div>
+    <div class="pagesub">控制哪些模型对外可见：隐藏的模型从 /v1/models 拉取列表里消失，调用也会被拒绝。/v1/models 统一带平台前缀（如 workbuddy/kimi-k3），一眼看出归属；裸名调用仍兼容。☆ 标记常用模型，会置顶。</div>
+    <div class="card">
+      <div class="toolbar">
+        <input type="text" id="model-search" placeholder="搜索模型">
+        <select id="model-filter">
+          <option value="">全部平台</option><option value="workbuddy">WorkBuddy</option>
+          <option value="qoder">Qoder</option><option value="qwenwork">千问办公</option>
+        </select>
+        <select id="model-visfilter">
+          <option value="">全部状态</option><option value="visible">仅显示中</option><option value="hidden">仅已隐藏</option>
+        </select>
+        <span style="flex:1"></span>
+        <span class="pill green" id="model-count">—</span>
+        <button class="btn sec mini" id="btn-model-showall">全部恢复显示</button>
+        <button class="btn mini" id="btn-model-refresh">刷新</button>
+      </div>
+      <div class="toolbar hidden" id="model-batchbar" style="background:var(--accent-soft);border-radius:10px;padding:8px 12px">
+        <span class="pill indigo">已选 <b id="msel-count">0</b></span>
+        <button class="btn mini" id="msel-hide">隐藏选中</button>
+        <button class="btn sec mini" id="msel-show">显示选中</button>
+        <button class="btn sec mini" id="msel-clear">取消选择</button>
+        <span style="font-size:12px;color:var(--dim)">跨平台批量操作</span>
+      </div>
+      <div id="model-groups"></div>
+      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits 倍率；Qoder = price_factor（峰）+ 谷价；千问办公目录不暴露单价——行内输入框可手工记录，或直接使用（自动倍率会随使用累计实测值）。WorkBuddy 的 PRO 专属模型（上游目录标注）在账号池没有付费账号时会自动从 /v1/models 隐藏（config.json hide_pro_locked，默认开），会员账号入池后自动恢复。</div>
+    </div>
+  </div>
+
+  <div id="view-usage" class="view">
+    <div class="pagetitle">用量</div><div class="pagesub">三平台最近请求合并（各取最近 500 条；workbuddy 含国内+国际双区，曲线与汇总跟随当前筛选）。</div>
+    <div class="card">
+      <div class="toolbar">
+        <input type="text" id="usage-search" placeholder="搜索模型、账号">
+        <select id="usage-filter">
+          <option value="">全部平台</option><option value="workbuddy">WorkBuddy</option>
+          <option value="qoder">Qoder</option><option value="qwenwork">千问办公</option>
+        </select>
+        <select id="usage-model"><option value="">全部模型</option></select>
+        <select id="usage-account"><option value="">全部账号</option></select>
+        <select id="usage-key"><option value="">全部 Key</option></select>
+        <select id="usage-outcome"><option value="">全部结果</option><option value="ok">成功</option><option value="bad">失败</option></select>
+        <select id="usage-pagesize"><option>10</option><option selected>20</option><option>50</option></select>
+        <button class="btn sec mini" id="btn-usage-refresh">刷新</button>
+        <span class="pager" id="usage-pageinfo"></span>
+        <button class="pagebtn" id="usage-prev">‹</button><button class="pagebtn" id="usage-next">›</button>
+      </div>
+      <div class="kpis" id="usage-stats" style="margin-bottom:12px"></div>
+      <div id="usage-charts" style="margin-bottom:14px"></div>
+      <div class="sub" style="font-weight:700;margin-bottom:6px">换算统计（平台 × 模型 · 实扣口径）<span class="sub" style="font-weight:400">　实测积分/千tok = 实扣积分 ÷ 总token × 1000；缓存命中会把实测值拉低（wb 对缓存部分打折计费）；「真实成本」只有 wb 上游提供（按上游官方美元价折算）</span></div>
+      <div class="tblwrap" style="max-height:260px;margin-bottom:6px">
+        <table><thead><tr>
+          <th>平台</th><th>模型</th><th class="num">请求</th><th class="num">总 tok</th><th class="num">实扣积分</th><th class="num">实测 积分/千tok</th><th class="num">目录倍率</th><th class="num">实测 ÷ 目录</th><th class="num">真实成本 ¥</th>
+        </tr></thead><tbody id="usage-conv"><tr><td colspan="9" class="empty">—</td></tr></tbody></table>
+      </div>
+      <div class="sub" id="usage-conv-note" style="margin-bottom:14px"></div>
+      <div class="sub" style="font-weight:700;margin-bottom:6px">按模型汇总（当前筛选范围）</div>
+      <div class="tblwrap" style="max-height:220px;margin-bottom:14px">
+        <table><thead><tr>
+          <th>平台</th><th>模型</th><th class="num">次数</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">估算价格</th><th class="num">成功率</th>
+        </tr></thead><tbody id="usage-permodel"><tr><td colspan="10" class="empty">—</td></tr></tbody></table>
+      </div>
+      <div class="tblwrap">
+        <table><thead><tr>
+          <th>时间</th><th>平台</th><th>模型</th><th>推理强度</th><th>账号</th><th>Key</th><th>模式</th><th>结果</th>
+          <th class="num">耗时</th><th class="num">首字</th><th class="num">速度</th>
+          <th class="num">输入</th><th class="num">输出</th><th class="num">思考</th><th class="num">缓存</th>
+          <th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">估算价格</th>
+        </tr></thead><tbody id="usage-body"><tr><td colspan="18" class="empty">加载中…</td></tr></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-auto" class="view">
+    <div class="pagetitle">自动化</div><div class="pagesub">签到、成长任务、每日活跃与凭证保活的手动执行入口；定时调度仍在各引擎内自动运行。</div>
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div><h3>每日签到</h3><div class="sub">wb 签到 = 国内版每日签到 + 国际版活跃打卡一次完成，顺带领取可领的兑换码类活动；千问办公每日积分由上游自动发放。</div></div>
+        <span style="flex:1"></span>
+        <button class="btn" id="btn-checkin-all">一键签到（全部平台）</button>
+      </div>
+    </div>
+    <div class="grid3" id="auto-cards"><div class="empty">加载中…</div></div>
+    <div class="card">
+      <h3>调度状态 <span class="sub">平台摘要 + WorkBuddy 引擎调度器实时详情</span></h3>
+      <div id="auto-status" class="sub">加载中…</div>
+    </div>
+    <div class="card">
+      <h3>临期优先调度 <span class="sub">WorkBuddy 引擎原生机制：窗口内的临期积分包按「紧迫度 × 剩余量」权重插队派发</span></h3>
+      <div class="toolbar" style="margin-top:10px">
+        <span class="pill indigo">WorkBuddy</span>
+        <span>临期窗口</span>
+        <input type="number" id="wb-expiring-days" min="1" max="60" style="width:80px;min-height:32px;border:1px solid var(--line2);border-radius:10px;padding:0 10px;background:var(--panel)">
+        <span>天</span>
+        <button class="btn mini" id="btn-expiring-save">保存</button>
+        <span style="flex:1"></span>
+        <span style="font-size:12px;color:var(--dim)" id="wb-expiring-info">加载中…</span>
+      </div>
+      <div class="sub" style="margin-top:8px">机制：账号有临期包（剩余>0 且到期在窗口内）时，派发队列按「紧迫度 × 剩余量」放大权重，最临期的优先消耗。Qoder / 千问办公无此调度维度（单池自动消耗）。改窗口立即生效，无需重启。</div>
+    </div>
+    <div class="card">
+      <h3>操作结果 <span class="sub">保留最近 20 条 · 点「原始返回」展开引擎完整返回</span></h3>
+      <pre id="task-result" class="mono" style="display:none;text-align:left;max-height:300px;overflow:auto;background:var(--panel2);border-radius:10px;padding:12px;margin:8px 0;font-size:12px;white-space:pre-wrap;word-break:break-all"></pre>
+      <div id="task-history"><div class="empty">暂无操作记录</div></div>
+      <div class="toolbar" style="margin-top:8px">
+        <button class="btn sec mini" id="btn-auto-clear">清空记录</button>
+        <span style="font-size:12px;color:var(--dim)">同一操作执行期间按钮锁定，不会重复触发。</span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>任务状态 <span class="sub">来自各引擎 /tasks 接口</span></h3>
+      <div id="tasks-detail" class="sub">点「刷新任务状态」加载</div>
+      <div class="toolbar" style="margin-top:8px">
+        <button class="btn sec mini" id="btn-tasks-status">刷新任务状态</button>
+        <span style="font-size:12px;color:var(--dim)">成长任务在引擎内跑真实会话，耗时可能几十秒到几分钟。</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-settings" class="view">
+    <div class="pagetitle">设置</div><div class="pagesub">控制台自身的连接信息；引擎级设置请进对应引擎看板。</div>
+    <div class="card">
+      <h3>聚合 API（供 ZCode 等客户端使用）</h3>
+      <div class="toolbar" style="margin-top:10px">
+        <span class="pill indigo">Base URL</span><span class="mono">http://127.0.0.1:8787/v1</span>
+        <button class="btn sec mini" id="btn-copy-url">复制</button>
+      </div>
+      <div class="toolbar">
+        <span class="pill indigo">API Key</span><span class="mono" id="set-key">••••••••</span>
+        <button class="btn sec mini" id="btn-reveal-key">显示</button>
+        <button class="btn sec mini" id="btn-copy-key">复制</button>
+      </div>
+      <div class="sub">改 Key：编辑 config.json 的 api_key 后重启 router；客户端模型名统一用 <span class="mono">平台/模型</span>（如 workbuddy/glm-5.3-flash）。</div>
+    </div>
+    <div class="card">
+      <h3>路由偏好 <span class="sub">网关自身行为；引擎级设置请进对应引擎看板</span></h3>
+      <div class="toolbar" style="margin-top:10px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+          <input type="checkbox" id="cfg-hide-pro"> PRO 专属模型自动隐藏（账号池无付费账号时）
+        </label>
+      </div>
+      <div class="toolbar">
+        <span style="font-size:13px">双区模型优先消耗</span>
+        <select id="cfg-dual-prefer" style="min-height:34px;border:1px solid var(--line2);border-radius:10px;background:var(--panel);padding:0 10px">
+          <option value="auto">自动（临期积分包更紧急的区域优先）</option>
+          <option value="cn">国内版</option>
+          <option value="intl">国际版</option>
+        </select>
+        <button class="btn mini" id="btn-gwconfig-save">保存</button>
+      </div>
+      <div class="sub" style="margin-top:8px" id="cfg-realms-info">加载中…</div>
+      <div class="sub" style="margin-top:4px">双区模型 = 同名模型在国内版和国际版都有（glm-5.3、kimi-k3.1-pro 等）。自动模式看各区「最临期积分包」的剩余天数：更紧急的一区优先消耗；若选中区域对该模型有 PRO 门槛且无付费账号，自动避开（如 kimi-k3.1-pro 国际版要会员，会走国内）。</div>
+    </div>
+    <div class="card">
+      <h3>上游版本与更新 <span class="sub">检测三个引擎网关是否有新版本</span></h3>
+      <div id="updates-list" class="sub" style="margin-top:8px">加载中…</div>
+      <div class="toolbar" style="margin-top:8px">
+        <button class="btn sec mini" id="btn-updates-refresh">检查更新</button>
+        <span class="sub-cell">GitHub 源每小时最多查一次；WorkBuddy 走引擎自带检查（官方已转 Telegram 分发，GitHub 无稳定发布源）</span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>引擎面板密码</h3>
+      <div class="sub">config.json 中各上游的 <span class="mono">panel_password</span> 字段（当前 admin）。改了引擎看板密码后要同步这里，控制台才能聚合到该平台的账号池。</div>
+    </div>
+  </div>
+
+  <div id="view-logs" class="view">
+    <div class="pagetitle">日志</div><div class="pagesub">router.log 尾部 120 行。</div>
+    <div class="terminal">
+      <div class="thead"><span class="dot g"></span> gateway-hub · router.log</div>
+      <div class="tbody" id="logbody">加载中…</div>
+    </div>
+  </div>
+</main>
+
+<div class="mask hidden" id="gate">
+  <div class="modal">
+    <h3>Gateway Hub 控制台</h3>
+    <p>输入聚合 API Key（config.json 里的 api_key，agg- 开头）</p>
+    <input id="gate-input" type="password" placeholder="agg-…" autocomplete="off">
+    <div class="err" id="gate-err">Key 不正确</div>
+    <button class="btn" id="gate-btn" style="width:100%;justify-content:center">进入控制台</button>
+  </div>
+</div>
+<div class="toast hidden" id="toast"><span id="toast-text"></span></div>
+
+<script>
+const KEY = () => localStorage.getItem('gh_key') || '';
+const PLATFORM_LABEL = {workbuddy:'WorkBuddy', qoder:'Qoder', qwenwork:'千问办公'};
+function showGate(){ document.getElementById('gate').classList.remove('hidden'); const e=document.getElementById('gate-err'); if(e) e.style.display='none'; }
+function toast(msg, ms=2800){
+  const t=document.getElementById('toast');
+  document.getElementById('toast-text').textContent=msg;
+  t.classList.remove('hidden'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.add('hidden'),ms);
+}
+function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmt(n){ return Math.round(n).toLocaleString(); }
+/* token 专用格式化：≥100 万 → M（百万）、≥1000 → k（千）、小数值原样。
+   只用于 token 计数；积分/金额等仍用 fmt() 保留精确数字。 */
+function fmtTok(n){
+  n=Number(n)||0;
+  if(n>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'k';
+  return String(Math.round(n));
+}
+// 失败判定：fail/error/abort 字样或 "http 500" 形态（router 对上游非 200 生成 "http {code}"，
+// 只匹配 fail|error|abort 会把失败请求当成功统计）
+function isBad(o){ return !!o && o!=='ok' && (/fail|error|abort/i.test(o) || /^http\s/i.test(o)); }
+// _deny 的 error 是 {message,type} 对象，502 异常路径是字符串——统一取人类可读的那份
+function errMsg(r){
+  if(!r) return '';
+  const e=r.error;
+  return typeof e==='string' ? e : (e&&e.message)||r.message||'';
+}
+/* 统一按钮加载态：存原文案 → disabled + 计时 → finally 复位。
+   progress(s) 可选，每秒回调用于自定义执行中文案（如「(2/3) Qoder…」）。 */
+function withBtn(btn, fn, progress){
+  if(!btn) return Promise.resolve().then(fn);
+  if(btn.disabled) return Promise.resolve();
+  btn.dataset.label=btn.textContent;
+  btn.disabled=true;
+  const t0=Date.now();
+  const tick=setInterval(()=>{
+    const s=Math.round((Date.now()-t0)/1000);
+    btn.textContent=progress?progress(s):`${btn.dataset.label}… ${s}s`;
+  },1000);
+  btn.textContent=progress?progress(0):`${btn.dataset.label}…`;
+  return Promise.resolve().then(fn).finally(()=>{
+    clearInterval(tick);
+    btn.disabled=false;
+    btn.textContent=btn.dataset.label;
+  });
+}
+/* 防重复执行：以操作路径为 key 的运行中登记表 */
+const RUNNING=new Set();
+function runOnce(key){
+  if(RUNNING.has(key)){ toast('该操作正在执行中，请等它完成'); return false; }
+  RUNNING.add(key);
+  return true;
+}
+function runDone(key){ RUNNING.delete(key); }
+/* 操作结果历史：全部自动化动作在这里留痕，可回看原始返回 */
+const TASK_HISTORY=[];
+function pushHistory(title, ok, brief, detail){
+  TASK_HISTORY.unshift({t:new Date().toLocaleTimeString('zh-CN',{hour12:false}), title, ok, brief, detail});
+  if(TASK_HISTORY.length>20) TASK_HISTORY.pop();
+  renderHistory();
+}
+function renderHistory(){
+  const el=document.getElementById('task-history');
+  el.innerHTML=TASK_HISTORY.length?TASK_HISTORY.map(h=>`
+    <div style="padding:8px 4px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+      <span class="sub-cell mono">${esc(h.t)}</span>
+      <span class="pill ${h.ok?'green':'red'}" style="flex-shrink:0">${h.ok?'成功':'失败'}</span>
+      <span style="font-weight:600">${esc(h.title)}</span>
+      <span class="sub-cell" style="flex:1;min-width:220px;word-break:break-all">${esc(h.brief)}</span>
+      ${h.detail?`<details style="flex-basis:100%"><summary class="sub-cell" style="cursor:pointer">原始返回</summary><pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel2);border-radius:8px;padding:8px;margin-top:6px;max-height:220px;overflow:auto">${esc(h.detail)}</pre></details>`:''}
+    </div>`).join(''):'<div class="empty">暂无操作记录</div>';
+}
+/* 从引擎返回里提取一句话人类摘要（各引擎返回形状不一，按常见字段名探底） */
+function firstBrief(res){
+  if(res===null||res===undefined) return '';
+  if(typeof res==='string') return res.slice(0,140);
+  if(typeof res!=='object') return String(res).slice(0,140);
+  for(const k of ['msg','message','summary','text','detail','error']){
+    if(typeof res[k]==='string'&&res[k]) return res[k].slice(0,140);
+  }
+  const ks=Object.keys(res).slice(0,6).join(', ');
+  return ks||JSON.stringify(res).slice(0,140);
+}
+/* 签到响应摘要：wb 是 {ok, result:{cn_checkin, intl_daily_chat}}；各引擎形状不一，
+   优先认 results 数组（成功数 + 其中「今日已完成」数），其余按常见字段名探底 */
+function briefForCheckin(r){
+  const res=(r&&r.result&&typeof r.result==='object')?r.result:r;
+  const parts=[];
+  for(const [k,v] of Object.entries(res||{})){
+    if(k==='ok') continue;
+    const label={cn_checkin:'国内',intl_daily_chat:'国际打卡'}[k]||k;
+    if(!(v&&typeof v==='object')){ parts.push(label+': '+v); continue; }
+    if(Array.isArray(v.results)){
+      const okN=v.results.filter(x=>x&&x.ok).length;
+      const done=v.results.filter(x=>x&&(x.state==='already'||/已签|已完成|已领取|已打卡/.test(String(x.msg||'')))).length;
+      parts.push(`${label}: ${okN}/${v.results.length} 成功`+(done?`（${done} 个今日已完成）`:''));
+    } else if(v.skipped){ parts.push(label+': '+(v.msg||'已全部完成，跳过')); }
+    else if(typeof v.msg==='string'&&v.msg){ parts.push(label+': '+v.msg); }
+    else parts.push(label+': '+firstBrief(v));
+  }
+  return parts.join(' · ')||'完成';
+}
+/* 国际版「今天打过没有」的判定口径：last_daily_chat 日期 = 今天。
+   引擎的 canDailyChat 是静态标记（realm==intl 恒 true），不能用来判断。 */
+function todayStr(){
+  const d=new Date();
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+function intlPunched(a){
+  return String((a&&a.last_daily_chat)||'').slice(0,10)===todayStr();
+}
+async function api(p, opt={}) {
+  // 合并而非覆盖：调用方传 Content-Type 时不能把 Authorization 冲掉
+  //（曾导致所有带 body 的写操作按钮统一 401）。
+  const headers = Object.assign({'Authorization': 'Bearer ' + KEY()}, opt.headers||{});
+  const r = await fetch(p, {...opt, headers});
+  if (r.status === 401) { localStorage.removeItem('gh_key'); const err = new Error('401 请重新输入控制台 Key'); err.status = 401; showGate(); throw err; }
+  return r.json();
+}
+
+/* ── 门禁 ── */
+async function tryGate(){
+  const v=document.getElementById('gate-input').value.trim(); if(!v) return;
+  localStorage.setItem('gh_key', v);
+  try{ const r=await api('/api/ping'); if(r.ok){document.getElementById('gate').classList.add('hidden');loadAll();} }
+  catch(e){ if(e.status!==401){document.getElementById('gate-err').style.display='block';localStorage.removeItem('gh_key');} }
+}
+document.getElementById('gate-btn').onclick=tryGate;
+document.getElementById('gate-input').addEventListener('keydown',e=>{if(e.key==='Enter')tryGate();});
+
+/* ── 视图切换 ── */
+const LOADERS={overview:loadOverview, accounts:loadStatus, add:null, models:loadModels, usage:loadUsage, auto:autoView, settings:loadSettings, logs:loadLogs};
+document.querySelectorAll('.nav').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x===b));
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active', v.id==='view-'+b.dataset.view));
+  const fn=LOADERS[b.dataset.view]; if(fn) fn();
+});
+
+/* ── 模型可见性 ── */
+let CATALOG={items:[],hidden:[]};
+let MSEL=new Set();
+async function loadModels(){
+  try{
+    CATALOG=await api('/api/catalog');
+    renderModels();
+  }catch(e){ if(e.status!==401) toast('模型目录加载失败: '+e.message); }
+}
+async function setModelVisible(payload, btn){
+  if(btn){btn.disabled=true;}
+  try{
+    const r=await api('/api/models/visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(r.ok){ CATALOG.hidden=r.hidden; renderModels(); }
+    else toast('失败: '+errMsg(r));
+  }catch(e){ toast('失败: '+e.message); }
+  if(btn)btn.disabled=false;
+}
+async function setModelVisibleBatch(ids, visible, btn){
+  if(btn){btn.disabled=true;}
+  try{
+    const r=await api('/api/models/visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids, visible})});
+    if(r.ok){ CATALOG.hidden=r.hidden; MSEL.clear(); renderModels(); toast(`${visible?'显示':'隐藏'} ${ids.length} 个模型`); }
+    else toast('失败: '+errMsg(r));
+  }catch(e){ toast('失败: '+e.message); }
+  if(btn)btn.disabled=false;
+}
+async function setRate(id, factor, note, btn){
+  if(btn){btn.disabled=true;}
+  try{
+    const r=await api('/api/models/rate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id, factor, note})});
+    if(r.ok){ toast(factor>0?`已记录 ${id} = x${factor}`:'已清除记录'); loadModels(); }
+    else toast('失败: '+errMsg(r));
+  }catch(e){ if(e.status!==401) toast('失败: '+e.message); }
+  if(btn)btn.disabled=false;
+}
+async function setFav(id, fav, btn){
+  if(btn){btn.disabled=true;}
+  try{
+    const r=await api('/api/models/favorite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id, fav})});
+    if(r.ok){ loadModels(); }
+    else toast('失败: '+errMsg(r));
+  }catch(e){ toast('失败: '+e.message); }
+  if(btn)btn.disabled=false;
+}
+function renderModels(){
+  const q=document.getElementById('model-search').value.trim().toLowerCase();
+  const pf=document.getElementById('model-filter').value;
+  const vf=document.getElementById('model-visfilter').value;
+  const hiddenSet=new Set(CATALOG.hidden||[]);
+  // 以实时 hidden 集合为准同步条目标记：切换后立即反映，不等下一次 catalog 拉取
+  (CATALOG.items||[]).forEach(m=>{ m.hidden=hiddenSet.has(m.id); });
+  const items=(CATALOG.items||[]).filter(m=>
+    (!pf||m.platform===pf) &&
+    (!vf||(vf==='hidden'?m.hidden:!m.hidden)) &&
+    (!q||m.id.toLowerCase().includes(q)));
+  // 人的使用习惯排序：常用(收藏)置顶 → 显示中 → 已隐藏；同级按名称
+  const rank=m=> (m.fav?0:1)*10 + (m.hidden?1:0);
+  items.sort((a,b)=> rank(a)-rank(b) || a.id.localeCompare(b.id));
+  const visCount=(CATALOG.items||[]).filter(m=>!m.hidden).length;
+  const proLocked=(CATALOG.items||[]).filter(m=>m.pro_locked).length;
+  // 计数口径与 /v1/models 实际可见一致：PRO 锁定的模型客户端拉不到，单列
+  document.getElementById('model-count').textContent=(proLocked>0
+    ?`显示 ${visCount-proLocked} / PRO 锁定 ${proLocked} / 隐藏 `
+    :`显示 ${visCount} / 隐藏 `)+`${(CATALOG.hidden||[]).length} · 共 ${CATALOG.total}`;
+  document.getElementById('model-batchbar').classList.toggle('hidden', MSEL.size===0);
+  document.getElementById('msel-count').textContent=MSEL.size;
+  const groups={};
+  items.forEach(m=>{ (groups[m.platform]=groups[m.platform]||[]).push(m); });
+  function fmtMult(mult){
+    if(!mult) return '<span class="sub-cell">—</span>';
+    const tag=mult.source==='manual'?' <span class="pill purple">手记</span>':(mult.source==='auto'?` <span class="pill indigo">自动</span>`:'');
+    if(mult.valley!==undefined) return `<span class="mono">x${mult.factor}</span><div class="sub-cell">谷 x${mult.valley}</div>${tag}`;
+    return `<span class="mono">x${mult.factor}</span>${tag}`;
+  }
+  document.getElementById('model-groups').innerHTML=Object.keys(groups).map(pf2=>{
+    const rows=groups[pf2].map(m=>{
+      const hid=hiddenSet.has(m.id);
+      const realmPill=(m.realms&&m.realms.length===1)?` <span class="pill gray" title="上游仅在此区域提供该模型">${m.realms[0]==='cn'?'仅国内':'仅国际'}</span>`:'';
+      const routePill=(m.route&&m.realms&&m.realms.length>1)
+        ?` <span class="pill indigo" title="双区模型：出口由调度策略决定（设置页「路由偏好」可改）">出口: ${m.route_auto?'自动→':''}${m.route==='cn'?'国内':'国际'}</span>`:'';
+      const proPill=m.requires_pro?' <span class="pill purple" title="上游目录标注：需要 WorkBuddy 付费会员（PRO）">PRO</span>':'';
+      const st=m.pro_locked
+        ?'<span class="pill orange" title="需要付费会员，当前账号池无付费账号：已从 /v1/models 自动隐藏，会员账号入池后自动恢复">PRO 专属 · 自动隐藏</span>'
+        :(hid?'<span class="pill gray">已隐藏</span>':'<span class="pill green">显示中</span>');
+      const act=hid?`<button class="btn mini" data-mv="${esc(m.id)}" data-v="1">恢复显示</button>`
+                   :`<button class="btn sec mini" data-mv="${esc(m.id)}" data-v="0">隐藏</button>`;
+      const sub=[];
+      if(m.upstream && m.upstream!==m.model) sub.push('上游名: '+esc(m.upstream));
+      if(m.alt && m.alt!==m.model) sub.push('官方名: '+esc(m.alt));
+      if(m.alias_of) sub.push(`国际版改名：与 ${esc(m.alias_of)} 是同一模型（推荐调基础 id，出口由临期调度自动选）`);
+      if(m.aliased_to) sub.push(`国际版出口自动改写为 ${esc(m.aliased_to)}（同一模型）`);
+      if(m.desc) sub.push(`<span title="${esc(m.desc)}">${esc(String(m.desc).slice(0,60))}${String(m.desc).length>60?'…':''}</span>`);
+      const subHtml=sub.length?`<div class="sub-cell">${sub.join(' · ')}</div>`:'';
+      // 规格：上下文/最大输出/思考档位/多模态（上游目录字段，缺的隐去）
+      const caps=m.caps||{};
+      const fk=v=>v>=1e6?(Math.round(v/1e5)/10)+'M':(v>=1e3?Math.round(v/1e3)+'k':String(v));
+      const spec=[];
+      if(caps.ctx) spec.push('上下文 '+fk(caps.ctx)+(caps.ctx_windows&&caps.ctx_windows.length>1?'（档 '+caps.ctx_windows.map(fk).join('/')+'）':''));
+      if(caps.max_out) spec.push('最大输出 '+fk(caps.max_out));
+      if(caps.efforts&&caps.efforts.length) spec.push('思考 '+caps.efforts.join('/')+(caps.effort_default?`（默认 ${esc(caps.effort_default)}）`:'')+(caps.can_disable===false?'·不可关':''));
+      else if(caps.reasoning===false) spec.push('不支持思考');
+      if(caps.vision) spec.push('视觉');
+      if(caps.tools) spec.push('工具');
+      const specHtml=spec.length?`<div class="sub-cell mono" style="color:var(--dim)">▣ ${spec.join(' · ')}</div>`:'';
+      const manual=m.multiplier&&m.multiplier.source==='manual';
+      const isAuto=m.multiplier&&m.multiplier.source==='auto';
+      const autoCell=isAuto?`<div class="sub-cell">自动实测 · ${m.multiplier.samples} 窗口 · 累计 ${Number(m.multiplier.credit).toFixed(2)} 分 / ${Number(m.multiplier.tokens).toLocaleString()} tok</div>`:'';
+      const rateCell=(pf2==='qwenwork'&&!m.multiplier)||manual||isAuto
+        ? `<div class="toolbar" style="gap:4px;margin:0">
+             <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc((manual||isAuto)&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:70px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
+             <button class="btn mini" data-ratesave="${esc(m.id)}">存</button>
+             ${manual?`<button class="btn sec mini" data-rateclear="${esc(m.id)}">清除</button>`:''}
+           </div>${autoCell}${manual?`<div class="sub-cell">手工记录 ${esc(m.multiplier.note||m.multiplier.recorded_at||'')}</div>`:''}`
+        : fmtMult(m.multiplier);
+      const star=m.fav?'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="0" title="取消常用" style="color:var(--orange);border:none;background:none;padding:2px 4px">★</button>':'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="1" title="标为常用" style="border:none;background:none;padding:2px 4px">☆</button>';
+      return `<tr>
+        <td><input type="checkbox" class="msel-box" data-msel="${esc(m.id)}" ${MSEL.has(m.id)?'checked':''}></td>
+        <td class="name-cell"><span class="mono">${esc(m.id)}</span>${proPill}${realmPill}${routePill} ${star}${subHtml}${specHtml}</td>
+        <td>${rateCell}</td><td>${st}</td><td style="text-align:right">${act}</td></tr>`;
+    }).join('');
+    return `<div style="margin-bottom:16px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <span class="name-cell" style="font-size:13px">${esc(PLATFORM_LABEL[pf2]||pf2)}</span>
+        <span class="sub-cell">${groups[pf2].length} 个 · 隐藏 ${groups[pf2].filter(m=>hiddenSet.has(m.id)).length}</span>
+        <span style="flex:1"></span>
+        <button class="btn sec mini" data-mp="${esc(pf2)}" data-v="0">整平台隐藏</button>
+        <button class="btn sec mini" data-mp="${esc(pf2)}" data-v="1">整平台显示</button>
+      </div>
+      <table><thead><tr>
+        <th style="width:30px"><input type="checkbox" class="msel-all" data-mall="${esc(pf2)}"></th>
+        <th>模型 ID（带前缀）</th><th>倍率</th><th>状态</th><th style="text-align:right">操作</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`;
+  }).join('') || '<div class="empty">没有匹配的模型</div>';
+  document.querySelectorAll('[data-mv]').forEach(b=>b.onclick=()=>setModelVisible({id:b.dataset.mv, visible:b.dataset.v==='1'}, b));
+  document.querySelectorAll('[data-mp]').forEach(b=>b.onclick=()=>setModelVisible({platform:b.dataset.mp, visible:b.dataset.v==='1'}, b));
+  document.querySelectorAll('[data-ratesave]').forEach(b=>b.onclick=()=>{
+    const id=b.dataset.ratesave;
+    const input=document.querySelector(`[data-rate="${CSS.escape(id)}"]`);
+    const v=parseFloat((input?.value||'').trim());
+    if(!(v>0)){toast('请输入大于 0 的倍率数值');return;}
+    setRate(id,v,'',b);
+  });
+  document.querySelectorAll('[data-rateclear]').forEach(b=>b.onclick=()=>setRate(b.dataset.rateclear,0,'',b));
+  document.querySelectorAll('.msel-box').forEach(c=>c.onchange=()=>{
+    if(c.checked) MSEL.add(c.dataset.msel); else MSEL.delete(c.dataset.msel);
+    document.getElementById('model-batchbar').classList.toggle('hidden', MSEL.size===0);
+    document.getElementById('msel-count').textContent=MSEL.size;
+  });
+  document.querySelectorAll('.msel-all').forEach(c=>c.onchange=()=>{
+    document.querySelectorAll(`.msel-box[data-msel^="${CSS.escape(c.dataset.mall)}/"]`).forEach(box=>{
+      box.checked=c.checked;
+      if(c.checked) MSEL.add(box.dataset.msel); else MSEL.delete(box.dataset.msel);
+    });
+    document.getElementById('model-batchbar').classList.toggle('hidden', MSEL.size===0);
+    document.getElementById('msel-count').textContent=MSEL.size;
+  });
+  document.querySelectorAll('[data-fav]').forEach(b=>b.onclick=()=>setFav(b.dataset.fav, b.dataset.favv==='1'));
+}
+document.getElementById('msel-hide').onclick=()=>setModelVisibleBatch([...MSEL], false);
+document.getElementById('msel-show').onclick=()=>setModelVisibleBatch([...MSEL], true);
+document.getElementById('msel-clear').onclick=()=>{ MSEL.clear(); renderModels(); };
+document.getElementById('btn-model-refresh').onclick=loadModels;
+document.getElementById('btn-model-showall').onclick=()=>setModelVisible({visible:true});
+document.getElementById('model-search').oninput=renderModels;
+document.getElementById('model-filter').onchange=renderModels;
+document.getElementById('model-visfilter').onchange=renderModels;
+  document.getElementById('usage-model').onchange=()=>{UPAGE=1;renderUsage();};
+  document.getElementById('usage-account').onchange=()=>{UPAGE=1;renderUsage();};
+  document.getElementById('usage-key').onchange=()=>{UPAGE=1;renderUsage();};
+
+
+/* ── 总览 + 账号池 ── */
+let LAST_STATUS=null;
+async function loadStatus(){
+  try{
+    const d=await api('/api/status'); LAST_STATUS=d;
+    if(document.getElementById('view-overview').classList.contains('active')) loadOverview();
+    // 有签到在跑时不重绘账号表：重绘会把「签到中…」的禁用按钮换回可用状态，
+    // 用户容易再点一次造成重复执行
+    if(document.getElementById('view-accounts').classList.contains('active')
+       && ![...RUNNING].some(k=>k.startsWith('checkin/'))) renderPlatforms(d.platforms);
+  }catch(e){ if(e.status!==401) toast('加载失败: '+e.message); }
+}
+function renderExpiring(rows){
+  const el=document.getElementById('expiring-list');
+  if(!rows.length){el.innerHTML='<div class="empty">暂无已知过期信息</div>';return;}
+  el.innerHTML=`<div class="tblwrap"><table><thead><tr>
+    <th>平台</th><th>账号</th><th>积分包</th><th class="num">剩余</th><th>到期时间</th><th>剩余天数</th>
+  </tr></thead><tbody>`+rows.map(r=>{
+    const d=r.days_left;
+    const cls=d===null||d===undefined?'gray':(d<=7?'red':(d<=14?'orange':'green'));
+    const label=d===null||d===undefined?'—':(d<=0?'已过期':(d<1?Math.round(d*24)+' 小时':Math.ceil(d)+' 天'));
+    return `<tr><td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
+      <td>${esc(r.account||'—')}</td><td>${esc(r.name||'')}</td>
+      <td class="num">${fmt(r.remain)}</td><td class="mono">${esc(r.expire||'')}</td>
+      <td><span class="pill ${cls}">${label}</span></td></tr>`;
+  }).join('')+`</tbody></table></div>`;
+}
+
+function renderOverview(d){
+  renderExpiring(d.expiring||[]);
+  const cards=d.platforms.map(p=>{
+    const rem=p.accounts.reduce((s,a)=>s+(a.remain||0),0);
+    const n=p.accounts.length;
+    return `<div class="realmcard">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="realmtag ${p.name==='qoder'?'intl':'cn'}">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
+        <span class="realmurl mono">${esc(p.base_url)}</span>
+        <span class="pill ${p.health?'green':'red'}" style="margin-left:auto">${p.health?'在线':'离线'}</span>
+      </div>
+      <div class="realmnum" style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${fmt(rem)} <span class="of">剩余积分</span></div>
+      <div class="realmmeta">${n} 个账号 · ${p.error?esc(p.error):'账号池聚合正常'}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('realm-cards').innerHTML=cards;
+  document.getElementById('kpis').innerHTML=`
+    <div class="kpi"><div class="label">平台在线</div><div class="num indigo">${d.kpi.platforms_ok}<span style="font-size:14px;color:var(--dim2)">/${d.kpi.platforms_total}</span></div><div class="note">引擎健康检查</div></div>
+    <div class="kpi"><div class="label">账号总数</div><div class="num">${d.kpi.accounts}</div><div class="note">三平台合计</div></div>
+    <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">可代执行平台</div></div>
+    <div class="kpi"><div class="label">各平台余额</div><div class="num" style="font-size:15px;line-height:1.9">${d.platforms.map(p=>`<div>${esc(PLATFORM_LABEL[p.name]||p.name)}: <b style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${p.accounts.some(a=>a.remain===null)?'见客户端':fmt(p.accounts.reduce((s,a)=>s+(a.remain||0),0))}</b></div>`).join('')}</div><div class="note">口径互不相同，不做加总</div></div>`;
+}
+function renderPlatforms(platforms){
+  document.getElementById('platforms').innerHTML=platforms.map(p=>{
+    const rows=p.accounts.map(a=>{
+      const unknown=a.remain===null;
+      const pct=!unknown&&a.size?Math.min(100,a.remain/a.size*100):0;
+      // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡
+      const punched=intlPunched(a);
+      const ck=(a.realm==='intl')
+        ?(punched?'<span class="pill green" title="'+esc(a.last_daily_chat||'')+'">今日已打卡</span>':'<span class="pill orange">待打卡</span>')
+        :(a.checked_in===null?'<span class="pill green">上游自动</span>'
+        :a.checked_in?'<span class="pill green">今日已签</span>'
+        :(a.can_checkin?'<span class="pill orange">待签</span>':'<span class="pill gray">—</span>'));
+      const st=!a.enabled?'<span class="pill red">停用</span>':'<span class="pill green">启用</span>';
+      const creditCell=unknown?'<span class="pill gray">以官方客户端为准</span>'
+        :(a.size===null?`<span class="num">${fmt(a.remain)}</span><div class="sub-cell">无固定配额，按上游实扣</div>`
+        :`<span class="num">${fmt(a.remain)}</span><div class="sub-cell">/ ${fmt(a.size)}</div>`);
+      const barCell=unknown?'<span class="sub-cell">快照不可用（刷新令牌被官方客户端绑定）</span>'
+        :(a.size===null?'<span class="pill green">'+fmt(a.remain)+'</span>'
+        :`<span class="bar"><i class="${pct<25?'low':''}" style="width:${pct}%"></i></span>${esc(a.pct||pct.toFixed(1)+'%')}`);
+      return `<tr><td class="name-cell">${esc(a.name)}<div class="sub-cell">${esc(a.sub||'')}</div></td>
+        <td class="num">${creditCell}</td>
+        <td>${barCell}</td>
+        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`:''}</td><td>${st}</td></tr>`;
+    }).join('');
+    const rem=p.accounts.reduce((s,a)=>s+(a.remain||0),0);
+    const allUnknown=p.accounts.length>0&&p.accounts.every(a=>a.remain===null);
+    return `<div class="card">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+        <span class="name-cell" style="font-size:14px">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
+        <span class="pill ${p.health?'green':'red'}">${p.health?'在线':'离线'}</span>
+        <span class="sub-cell mono">${esc(p.base_url)}</span>
+        <span style="flex:1"></span>
+        <span class="sub-cell">${p.accounts.length} 账号 · ${allUnknown?'余额以官方客户端为准':fmt(rem)+' 分'}</span>
+        <button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>
+      </div>
+      ${rows?`<div class="tblwrap"><table><thead><tr><th>账号</th><th class="num">积分</th><th>余量</th><th>签到</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
+        :`<div class="empty">${p.error?esc(p.error):'该平台暂无账号'}</div>`}
+    </div>`;
+  }).join('');
+  document.querySelectorAll('#platforms [data-checkin]').forEach(b=>b.onclick=()=>doCheckin(b.dataset.checkin,b));
+}
+
+/* ── 用量 ── */
+let USAGE={rows:[],usd_cny:null}, UPAGE=1;
+let USAGE_RATE={}; // "平台/模型" -> {factor, source}（目录倍率，供换算统计比对）
+async function loadUsage(){
+  try{
+    const [d, cat] = await Promise.all([
+      api('/api/usage?limit=500'),
+      api('/api/catalog').catch(()=>null),
+    ]);
+    USAGE=d; UPAGE=1;
+    USAGE_RATE={};
+    if(cat && Array.isArray(cat.items)){
+      for(const it of cat.items){
+        if(it.multiplier && it.multiplier.factor) USAGE_RATE[it.id]={factor:Number(it.multiplier.factor), source:it.multiplier.source||''};
+      }
+    }
+    renderUsage();
+  }catch(e){ if(e.status!==401) toast('用量加载失败: '+e.message); }
+}
+function usageFiltered(){
+  const q=document.getElementById('usage-search').value.trim().toLowerCase();
+  const pf=document.getElementById('usage-filter').value;
+  const oc=document.getElementById('usage-outcome').value;
+  const mm=document.getElementById('usage-model').value;
+  const ac=document.getElementById('usage-account').value;
+  const ky=document.getElementById('usage-key').value;
+  return USAGE.rows.filter(r=>
+    (!pf||r.platform===pf) &&
+    (!mm||r.model===mm) &&
+    (!ac||(r.account||'')===ac) &&
+    (!ky||(r.key_name||'')===ky) &&
+    (!oc||(oc==='ok'? !isBad(r.outcome) : isBad(r.outcome))) &&
+    (!q||((r.model||'')+(r.account||'')).toLowerCase().includes(q)));
+}
+function fillUsageOptions(id, values){
+  const sel=document.getElementById(id);
+  const cur=sel.value;
+  const opts=['<option value="">'+sel.options[0].text+'</option>'].concat(
+    values.sort().map(v=>`<option${v===cur?' selected':''}>${esc(v)}</option>`));
+  sel.innerHTML=opts.join('');
+}
+function renderUsageStats(rows){
+  const sum=k=>rows.reduce((s,r)=>s+(r[k]||0),0);
+  const okN=rows.filter(r=>!isBad(r.outcome)).length;
+  const credit=rows.reduce((s,r)=>s+((r.credit==null||isNaN(Number(r.credit)))?0:Number(r.credit)),0);
+  const price=(USAGE.usd_cny&&credit>0)?'¥'+(credit*USAGE.usd_cny).toFixed(2):'—';
+  const rate=rows.length?Math.round(okN/rows.length*100)+'%':'—';
+  const prompt=sum('prompt'), cached=sum('cached');
+  const hit=prompt>0?Math.round(cached/prompt*100):null;
+  document.getElementById('usage-stats').innerHTML=`
+    <div class="kpi"><div class="label">请求数</div><div class="num indigo">${rows.length}</div><div class="note">当前筛选范围</div></div>
+    <div class="kpi"><div class="label">成功率</div><div class="num ${okN===rows.length?'green':'orange'}">${rate}</div><div class="note">${okN}/${rows.length} 成功</div></div>
+    <div class="kpi"><div class="label">总输入 / 输出</div><div class="num" style="font-size:18px">${fmtTok(prompt)} / ${fmtTok(sum('completion'))}</div><div class="note">缓存命中 ${fmtTok(cached)} tok</div></div>
+    <div class="kpi"><div class="label">缓存命中率</div><div class="num ${hit===null?'':(hit>=60?'green':(hit>=25?'orange':'red'))}">${hit===null?'—':hit+'%'}</div><div class="note">缓存 tok ÷ 输入 tok（千问上游不回传）</div></div>
+    <div class="kpi"><div class="label">积分消耗</div><div class="num orange">${credit?credit.toFixed(2):'—'}</div><div class="note">估算 ${price}</div></div>`;
+}
+/* 用量曲线（多平台）：时间分桶的 token 堆叠柱（桶内按平台分段）+ 各平台缓存命中率折线 */
+function renderUsageCharts(rows){
+  const el=document.getElementById('usage-charts');
+  const pts=rows.filter(r=>r.at>0).sort((a,b)=>a.at-b.at);
+  if(pts.length<2){
+    el.innerHTML='<div class="empty">时间序列数据不足（需要至少 2 条带时间的请求记录）</div>';
+    return;
+  }
+  const t0=pts[0].at, t1=Math.max(pts[pts.length-1].at, t0+60), span=t1-t0;
+  const nB=Math.min(30, Math.max(8, Math.ceil(span/300)+1)); // 目标 ≥5 分钟/桶
+  const step=span/nB;
+  const B=Array.from({length:nB},(_,i)=>({s:t0+i*step, n:0, pf:{}}));
+  for(const r of pts){
+    const bi=Math.min(nB-1, Math.max(0, Math.floor((r.at-t0)/step)));
+    const b=B[bi];
+    const pf=(b.pf[r.platform]=b.pf[r.platform]||{tin:0,tout:0,tca:0,n:0});
+    b.n++; pf.n++; pf.tin+=r.prompt||0; pf.tout+=r.completion||0; pf.tca+=r.cached||0;
+  }
+  const PF_ORDER=['workbuddy','qoder','qwenwork'];
+  const PF_COLOR={workbuddy:'var(--accent)', qoder:'#0891b2', qwenwork:'var(--orange)'};
+  const present=PF_ORDER.filter(p=>B.some(b=>(b.pf[p]||{}).n>0));
+  const pfSum=(b,p,k)=>((b.pf[p]||{})[k]||0);
+  const W=900, Hp=200, padL=52, padR=10, padT=12, padB=24;
+  const iw=W-padL-padR, ih=Hp-padT-padB;
+  const bw=iw/nB;
+  const maxTok=Math.max(1, ...B.map(b=>present.reduce((s,p)=>s+pfSum(b,p,'tin')+pfSum(b,p,'tout'),0)));
+  const fmtT=v=>v>=1e6?(v/1e6).toFixed(1)+'M':(v>=1e3?(v/1e3).toFixed(1)+'k':Math.round(v));
+  const hhmm=t=>{const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+  // 图 1：token 堆叠柱——桶内按平台分段（段 = 该平台输入+输出；明细在悬停提示里）
+  let g='';
+  B.forEach((b,i)=>{
+    if(!b.n) return;
+    let cum=0;
+    const x=padL+i*bw+bw*0.12, w=Math.max(bw*0.76,1);
+    for(const p of present){
+      const tot=pfSum(b,p,'tin')+pfSum(b,p,'tout');
+      if(tot<=0) continue;
+      const h=Math.max((tot/maxTok)*ih, 0.4);
+      const y=padT+ih-cum-h;
+      g+=`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${PF_COLOR[p]}" rx="2"><title>${hhmm(b.s)} ${PLATFORM_LABEL[p]||p}：输入 ${fmtTok(pfSum(b,p,'tin'))} / 输出 ${fmtTok(pfSum(b,p,'tout'))} / 缓存 ${fmtTok(pfSum(b,p,'tca'))} tok · ${pfSum(b,p,'n')} 次请求</title></rect>`;
+      cum+=h;
+    }
+  });
+  const y0=padT+ih;
+  const grid=[0.5,1].map(f=>{const y=y0-ih*f;return `<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="var(--line)" stroke-dasharray="3 3"/><text x="${padL-6}" y="${y+4}" text-anchor="end" font-size="10" fill="var(--dim2)">${fmtT(maxTok*f)}</text>`;}).join('');
+  const ticks=[0,0.33,0.66,1].map(f=>`<text x="${padL+(iw)*f}" y="${y0+14}" text-anchor="${f===0?'start':(f===1?'end':'middle')}" font-size="10" fill="var(--dim2)">${hhmm(t0+span*f)}</text>`).join('');
+  const chart1=`<svg viewBox="0 0 ${W} ${Hp}" style="width:100%;display:block" role="img" aria-label="token 使用曲线（按平台分段）">
+    ${grid}<line x1="${padL}" y1="${y0}" x2="${W-padR}" y2="${y0}" stroke="var(--line2)"/>
+    ${g}${ticks}
+    <text x="${padL-6}" y="${y0+4}" text-anchor="end" font-size="10" fill="var(--dim2)">0</text>
+  </svg>`;
+  // 图 2：各平台缓存命中率折线（全程无缓存数据的平台不画——千问办公不回传）
+  const yH=v=>padT+ih*(1-v/100);
+  const grid2=[0,25,50,75,100].map(v=>`<line x1="${padL}" y1="${yH(v)}" x2="${W-padR}" y2="${yH(v)}" stroke="var(--line)" stroke-dasharray="3 3"/><text x="${padL-6}" y="${yH(v)+4}" text-anchor="end" font-size="10" fill="var(--dim2)">${v}%</text>`).join('');
+  let lines='', dots='', hitLegend=[], noCache=[];
+  for(const p of present){
+    const totalCa=B.reduce((s,b)=>s+pfSum(b,p,'tca'),0);
+    if(totalCa<=0){ noCache.push(PLATFORM_LABEL[p]||p); continue; }
+    const series=[];
+    B.forEach((b,i)=>{
+      const tin=pfSum(b,p,'tin');
+      if(tin>0){
+        const hit=Math.min(100, pfSum(b,p,'tca')/tin*100);
+        series.push([padL+i*bw+bw/2, yH(hit), hit, b.s, b.pf[p]]);
+      }
+    });
+    if(series.length>1){
+      lines+=`<polyline points="${series.map(s=>s[0]+','+s[1]).join(' ')}" fill="none" stroke="${PF_COLOR[p]}" stroke-width="2" stroke-linejoin="round"/>`;
+    }
+    dots+=series.map(s=>`<circle cx="${s[0]}" cy="${s[1]}" r="2.4" fill="${PF_COLOR[p]}"><title>${hhmm(s[3])} ${PLATFORM_LABEL[p]||p} 缓存命中率 ${s[2].toFixed(1)}%（缓存 ${fmtTok(s[4].tca)} / 输入 ${fmtTok(s[4].tin)} tok）</title></circle>`).join('');
+    hitLegend.push(`<span class="pill" style="color:${PF_COLOR[p]};background:var(--panel2);border-color:var(--line)">— ${PLATFORM_LABEL[p]||p}</span>`);
+  }
+  const chart2=`<svg viewBox="0 0 ${W} ${Hp}" style="width:100%;display:block" role="img" aria-label="各平台缓存命中率曲线">
+    ${grid2}${lines}${dots}
+    <line x1="${padL}" y1="${y0}" x2="${W-padR}" y2="${y0}" stroke="var(--line2)"/>${ticks}
+  </svg>`;
+  const legend1=present.map(p=>`<span class="pill" style="color:${PF_COLOR[p]};background:var(--panel2);border-color:var(--line)">■ ${PLATFORM_LABEL[p]||p}</span>`).join('');
+  el.innerHTML=`
+    <div class="card" style="margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+        <h3 style="margin:0">Token 使用 <span class="sub">按时间分桶 · 桶内按平台分段 · 当前筛选范围</span></h3>
+        <span style="flex:1"></span>
+        ${legend1}
+        <span class="sub-cell">${nB} 桶 × ${fmtT(step)}s</span>
+      </div>
+      ${chart1}
+    </div>
+    <div class="card" style="margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+        <h3 style="margin:0">缓存命中率 <span class="sub">各平台 缓存 tok ÷ 输入 tok</span></h3>
+        <span style="flex:1"></span>
+        ${hitLegend}
+        ${noCache.length?`<span class="sub-cell">${esc(noCache.join('/'))} 上游不回传缓存，无曲线</span>`:''}
+      </div>
+      ${chart2}
+    </div>`;
+}
+function renderUsagePerModel(rows){
+  const agg={};
+  for(const r of rows){
+    const cr=(r.credit==null||isNaN(Number(r.credit)))?0:Number(r.credit);
+    const k=(r.platform||'?')+'|'+(r.model||'?');
+    const e=agg[k]||(agg[k]={platform:r.platform,model:r.model,count:0,prompt:0,completion:0,cached:0,total:0,credit:0,ok:0});
+    e.count++; e.prompt+=r.prompt||0; e.completion+=r.completion||0; e.cached+=r.cached||0;
+    e.total+=r.total||0; e.credit+=cr;
+    if(!isBad(r.outcome)) e.ok++;
+  }
+  const list=Object.values(agg).sort((a,b)=>b.count-a.count);
+  document.getElementById('usage-permodel').innerHTML=list.length?list.map(e=>{
+    const rate=e.count?Math.round(e.ok/e.count*100)+'%':'—';
+    const price=(USAGE.usd_cny&&e.credit>0)?'¥'+(e.credit*USAGE.usd_cny).toFixed(2):'—';
+    return `<tr><td><span class="pill indigo">${esc(PLATFORM_LABEL[e.platform]||e.platform)}</span></td>
+      <td class="mono">${esc(e.model)}</td><td class="num">${e.count}</td>
+      <td class="num">${fmtTok(e.prompt)}</td><td class="num">${fmtTok(e.completion)}</td><td class="num">${fmtTok(e.cached)}</td>
+      <td class="num" style="font-weight:700">${fmtTok(e.total)}</td>
+      <td class="num" style="color:${e.credit?'var(--orange)':'inherit'}">${e.credit?e.credit.toFixed(2):'—'}</td>
+      <td class="num">${price}</td><td class="num">${rate}</td></tr>`;
+  }).join(''):'<tr><td colspan="10" class="empty">—</td></tr>';
+}
+function renderUsage(){
+  const rows=usageFiltered(), size=+document.getElementById('usage-pagesize').value;
+  const pages=Math.max(1,Math.ceil(rows.length/size)); if(UPAGE>pages)UPAGE=pages;
+  const slice=rows.slice((UPAGE-1)*size,UPAGE*size);
+  const rate=USAGE.usd_cny;
+  document.getElementById('usage-body').innerHTML = slice.length? slice.map(r=>{
+    const bad=isBad(r.outcome);
+    const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
+    const cachedPct=r.total?Math.round(r.cached/r.total*100):0;
+    const price=(cr&&rate)?'¥'+(cr*rate).toFixed(4):'—';
+    return `<tr><td class="mono">${esc(r.iso)}</td>
+      <td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
+      <td class="mono">${esc(r.model)}</td>
+      <td>${r.reasoning_effort?`<span class="pill purple">${esc(r.reasoning_effort)}</span>`:'<span class="pill purple">none</span>'}</td>
+      <td>${esc(r.account||'—')}</td><td>${esc(r.key_name||'—')}</td>
+      <td>${r.stream===null?'—':(r.stream?'流式':'非流式')}</td>
+      <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td>
+      <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}</td>
+      <td class="num">${r.ttft_ms?(r.ttft_ms/1000).toFixed(2)+' s':'—'}</td>
+      <td class="num">${r.speed==null?'—':esc(r.speed)}</td>
+      <td class="num">${fmtTok(r.prompt)}</td><td class="num">${fmtTok(r.completion)}</td>
+      <td class="num">${r.reasoning||0}</td>
+      <td class="num">${r.cached?cachedPct+'%':'0'}</td>
+      <td class="num" style="font-weight:700">${fmtTok(r.total)}</td>
+      <td class="num" style="color:${cr?'var(--orange)':'inherit'}">${cr==null?'—':cr.toFixed(2)}</td>
+      <td class="num" style="color:var(--dim)">${price}</td></tr>`;
+  }).join('') : '<tr><td colspan="18" class="empty">暂无请求记录</td></tr>';
+  document.getElementById('usage-pageinfo').textContent=`共 ${rows.length} 条 · 第 ${UPAGE}/${pages} 页`;
+  fillUsageOptions('usage-model',[...new Set(USAGE.rows.map(r=>r.model||''))].filter(Boolean));
+  fillUsageOptions('usage-account',[...new Set(USAGE.rows.map(r=>r.account||''))].filter(Boolean));
+  fillUsageOptions('usage-key',[...new Set(USAGE.rows.map(r=>r.key_name||''))].filter(Boolean));
+  renderUsageStats(rows);
+  renderUsageCharts(rows);
+  renderUsageConversion(rows);
+  renderUsagePerModel(rows);
+}
+/* 换算统计：平台×模型的实扣积分 vs token，对照目录倍率；wb 另有真实成本锚点 */
+function renderUsageConversion(rows){
+  const tb=document.getElementById('usage-conv');
+  const note=document.getElementById('usage-conv-note');
+  const agg={};
+  for(const r of rows){
+    const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
+    const cny=(r.cost_cny==null||isNaN(Number(r.cost_cny)))?null:Number(r.cost_cny);
+    if(cr===null && cny===null) continue; // 没有任何计费数据的行不进统计
+    const k=(r.platform||'?')+'|'+(r.model||'?');
+    const e=agg[k]||(agg[k]={platform:r.platform,model:r.model,n:0,tok:0,credit:0,hasCredit:false,cny:0,hasCny:false});
+    e.n++;
+    e.tok+=(r.total||0);
+    if(cr!==null){ e.credit+=cr; e.hasCredit=true; }
+    if(cny!==null){ e.cny+=cny; e.hasCny=true; }
+  }
+  const list=Object.values(agg).sort((a,b)=>b.credit-a.credit);
+  if(!list.length){
+    tb.innerHTML='<tr><td colspan="9" class="empty">当前筛选范围没有带计费数据的请求</td></tr>';
+    note.textContent=''; return;
+  }
+  tb.innerHTML=list.map(e=>{
+    const rate=e.tok>0&&e.hasCredit?e.credit/e.tok*1000:null;
+    const key=e.platform+'/'+e.model;
+    const cat=USAGE_RATE[key];
+    const factor=cat?cat.factor:null;
+    const ratio=(rate!==null&&factor>0)?rate/factor:null;
+    const pfColor={workbuddy:'var(--accent)',qoder:'#0891b2',qwenwork:'var(--orange)'}[e.platform]||'var(--accent)';
+    return `<tr>
+      <td><span class="pill" style="color:${pfColor};background:var(--panel2);border-color:var(--line)">${esc(PLATFORM_LABEL[e.platform]||e.platform)}</span></td>
+      <td class="mono">${esc(e.model)}</td>
+      <td class="num">${e.n}</td>
+      <td class="num">${fmtTok(e.tok)}</td>
+      <td class="num" style="color:${e.hasCredit&&e.credit?'var(--orange)':'inherit'}">${e.hasCredit?e.credit.toFixed(3):'—'}</td>
+      <td class="num" style="font-weight:600">${rate!==null?rate.toFixed(4):'—'}</td>
+      <td class="num">${factor!=null?('x'+factor+(cat.source?` <span class="sub-cell">${esc(cat.source)}</span>`:'')):'—'}</td>
+      <td class="num" style="color:${ratio!=null?(ratio>1.15?'var(--red)':(ratio<0.85?'var(--green)':'inherit')):'inherit'}">${ratio!=null?ratio.toFixed(2):'—'}</td>
+      <td class="num">${e.hasCny?'¥'+e.cny.toFixed(4):'—'}</td></tr>`;
+  }).join('');
+  // 平台级汇总行
+  const bypf={};
+  for(const e of list){
+    const p=bypf[e.platform]||(bypf[e.platform]={n:0,tok:0,credit:0,cny:0});
+    p.n+=e.n; p.tok+=e.tok; p.credit+=e.credit; p.cny+=e.cny;
+  }
+  const summary=Object.entries(bypf).map(([p,v])=>{
+    const rate=v.tok>0?v.credit/v.tok*1000:null;
+    return `${PLATFORM_LABEL[p]||p}: ${v.n} 次 · ${fmtTok(v.tok)} tok · ${v.credit.toFixed(2)} 分（${rate!==null?rate.toFixed(4):'—'}/千tok）${v.cny?` · 真实 ¥${v.cny.toFixed(2)}`:''}`;
+  }).join('　|　');
+  note.textContent='平台汇总（当前筛选）→ '+summary;
+}
+document.getElementById('btn-usage-refresh').onclick=loadUsage;
+document.getElementById('usage-filter').onchange=()=>{UPAGE=1;renderUsage();};
+document.getElementById('usage-outcome').onchange=()=>{UPAGE=1;renderUsage();};
+document.getElementById('usage-pagesize').onchange=()=>{UPAGE=1;renderUsage();};
+document.getElementById('usage-search').oninput=()=>{UPAGE=1;renderUsage();};
+document.getElementById('usage-prev').onclick=()=>{if(UPAGE>1){UPAGE--;renderUsage();}};
+document.getElementById('usage-next').onclick=()=>{UPAGE++;renderUsage();};
+
+/* ── 自动化 ── */
+async function autoView(){ await loadAuto(); loadTasksStatus(); loadExpiringWindow(); }
+async function loadExpiringWindow(){
+  const info=document.getElementById('wb-expiring-info');
+  const input=document.getElementById('wb-expiring-days');
+  try{
+    const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({platform:'workbuddy',path:'settings',method:'GET',body:{}})});
+    const lim=(r.result||{}).limits||{};
+    const ew=lim.expiring_window_days||{};
+    input.value=ew.global??'';
+    const parts=[];
+    if(ew.global!==null&&ew.global!==undefined) parts.push('全局 '+ew.global+' 天');
+    if(ew.intl!==null&&ew.intl!==undefined) parts.push('国际版 '+ew.intl+' 天');
+    if(ew.cn!==null&&ew.cn!==undefined) parts.push('国内版 '+ew.cn+' 天');
+    info.textContent=parts.length?('当前: '+parts.join(' · ')):'当前: 引擎默认';
+  }catch(e){ info.textContent='读取失败: '+e.message; }
+}
+document.getElementById('btn-expiring-save').onclick=async function(){
+  this.disabled=true;
+  const v=parseInt(document.getElementById('wb-expiring-days').value,10);
+  if(!(v>=1&&v<=60)){toast('窗口天数需在 1-60 之间');this.disabled=false;return;}
+  try{
+    const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({platform:'workbuddy',path:'settings/save',method:'POST',body:{expiring_window_days:v}})});
+    if(r.ok){toast('临期窗口已设为 '+v+' 天，立即生效');loadExpiringWindow();}
+    else toast('失败: '+errMsg(r));
+  }catch(e){toast('失败: '+e.message);}
+  this.disabled=false;
+};
+/* 平台卡片的动作清单：所有自动化入口按平台归位（原来散在 4 张卡里） */
+const AUTO_BUTTONS={
+  workbuddy:[
+    {t:'签到+打卡', k:'checkin/workbuddy', run:b=>doCheckin('workbuddy',b), primary:true},
+    {t:'每日活跃打卡', k:'dailychat/workbuddy', run:b=>dailyChat(b)},
+    {t:'运行成长任务', k:'task/run/workbuddy', run:b=>runTask('run','workbuddy',b)},
+    {t:'领取任务奖励', k:'task/claim/workbuddy', run:b=>runTask('claim','workbuddy',b)},
+    {t:'猫猫旅行', k:'task/travel/workbuddy', run:b=>runTask('travel','workbuddy',b)},
+    {t:'连登奖励', k:'task/streak-bonus/workbuddy', run:b=>runTask('streak-bonus','workbuddy',b)},
+    {t:'夜猫子（23-08）', k:'task/night/workbuddy', run:b=>runTask('night','workbuddy',b)},
+    {t:'Token 全池保活', k:'engine/workbuddy/accounts/refresh', run:b=>runEngine({platform:'workbuddy',path:'accounts/refresh'},b)},
+    {t:'积分刷新', k:'engine/workbuddy/accounts/credits/fetch', run:b=>runEngine({platform:'workbuddy',path:'accounts/credits/fetch'},b)},
+    {t:'立即巡检一轮', k:'engine/workbuddy/scheduler/trigger', run:b=>runEngine({platform:'workbuddy',path:'scheduler/trigger'},b)},
+  ],
+  qoder:[
+    {t:'签到', k:'checkin/qoder', run:b=>doCheckin('qoder',b), primary:true},
+    {t:'领取全部福利', k:'task/run/qoder', run:b=>runTask('run','qoder',b), primary:true},
+    {t:'猫猫旅行', k:'task/travel/qoder', run:b=>runTask('travel','qoder',b)},
+    {t:'Token 保活', k:'engine/qoder/accounts/refresh', run:b=>runEngine({platform:'qoder',path:'accounts/refresh'},b)},
+    {t:'积分刷新', k:'engine/qoder/accounts/credits', run:b=>runEngine({platform:'qoder',path:'accounts/credits'},b)},
+  ],
+  qwenwork:[
+    {t:'Token 保活 + 领取', k:'engine/qwenwork/admin/accounts/keepalive-all',
+     run:b=>runEngine({platform:'qwenwork',path:'admin/accounts/keepalive-all',body:{channels:['qwenwork']}},b)},
+  ],
+};
+function renderAutoCards(){
+  const el=document.getElementById('auto-cards');
+  const plats=(LAST_STATUS&&LAST_STATUS.platforms)||[];
+  if(!plats.length){ el.innerHTML='<div class="empty">加载中…</div>'; return; }
+  el.innerHTML=plats.map(p=>{
+    const accs=p.accounts||[];
+    const signed=accs.filter(a=>a.checked_in).length;
+    const punch=accs.filter(a=>a.realm==='intl'&&a.enabled&&!intlPunched(a)).length;
+    let foot;
+    if(p.name==='qwenwork') foot='每日积分由上游自动发放，无需签到；令牌续期被官方客户端绑定，保活失败属预期（11-29 到期后客户端重登 + 重新导入）。';
+    else if(p.name==='workbuddy') foot=`已签 ${signed}/${accs.length} · 待打卡 ${punch} · 调度器每天自动执行，按钮用于补签。`;
+    else foot=`已签 ${signed}/${accs.length} · 调度器每天自动执行，按钮用于补签。`;
+    const btns=(AUTO_BUTTONS[p.name]||[]).map((b,i)=>
+      `<button class="btn ${b.primary?'':'sec'} mini" data-ap="${esc(p.name)}" data-ai="${i}">${esc(b.t)}</button>`).join('');
+    return `<div class="realmcard">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="realmtag ${p.name==='qoder'?'intl':'cn'}">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
+        <span class="pill ${p.health?'green':'red'}">${p.health?'在线':'离线'}</span>
+        <span class="sub-cell" style="margin-left:auto">${accs.length} 账号</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 10px">${btns||'<span class="sub-cell">该平台无手动操作</span>'}</div>
+      <div class="sub-cell" style="border-top:1px solid var(--line);padding-top:8px">${esc(foot)}</div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('[data-ap]').forEach(b=>b.onclick=()=>{
+    const item=(AUTO_BUTTONS[b.dataset.ap]||[])[+b.dataset.ai];
+    if(item) item.run(b);
+  });
+}
+function relTime(t){
+  if(!t) return '';
+  const ts=Date.parse(String(t).replace(' ','T'));
+  if(isNaN(ts)) return '';
+  const s=Math.round((Date.now()-ts)/1000);
+  if(s<0) return '';
+  if(s<60) return `（${s} 秒前）`;
+  if(s<3600) return `（${Math.floor(s/60)} 分钟前）`;
+  if(s<86400) return `（${Math.floor(s/3600)} 小时前）`;
+  return `（${Math.floor(s/86400)} 天前）`;
+}
+async function loadAuto(){
+  let summary=[];
+  try{
+    const d=await api('/api/status'); LAST_STATUS=d;
+    renderAutoCards();
+    summary=d.platforms.map(p=>{
+      const signed=p.accounts.filter(a=>a.checked_in).length;
+      const punch=p.accounts.filter(a=>a.realm==='intl'&&a.enabled&&!intlPunched(a)).length;
+      let line=`${PLATFORM_LABEL[p.name]||p.name}: ${p.health?'在线':'离线'} · ${p.accounts.length} 账号`;
+      if(p.name==='qwenwork') line+=' · 上游自动发放';
+      else if(p.name==='workbuddy') line+=` · 已签 ${signed} · 待打卡 ${punch}`;
+      else line+=` · 已签 ${signed}`;
+      return line;
+    });
+  }catch(e){ summary=['状态加载失败: '+e.message]; }
+  // 调度器详情（wb 引擎）——与摘要合并渲染，不覆盖摘要
+  let sched=null;
+  try{
+    const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({platform:'workbuddy',path:'scheduler',method:'GET',body:{}})});
+    sched=r.result||{};
+  }catch(e){/* 调度器详情失败不影响主状态 */}
+  renderAutoStatus(summary, sched);
+}
+function renderAutoStatus(summary, s){
+  const el=document.getElementById('auto-status');
+  const rows=[`<div class="sub" style="margin-bottom:8px">${summary.map(esc).join('　|　')}</div>`];
+  if(!s){ el.innerHTML=rows.join('')+'<div class="sub-cell">调度器详情不可用（引擎离线或代理失败）</div>'; return; }
+  const dc=s.daily_chat||{};
+  const done=((dc.done_slots)||[]).length, total=((dc.times)||[]).length;
+  const schedRows=[
+    ['调度模式', s.mode||'—'],
+    ['上次巡检', (s.last_run_time||'—')+' '+relTime(s.last_run_time)],
+    ['下次巡检', s.next_run_time||'—'],
+    ['每日活跃打卡', total?`今日已打 ${done}/${total} 时段 · 下次 ${dc.next_slot||'—'}`
+      +((dc.live||[]).length?` · 进行中 ${dc.live.length}`:'')
+      +(s.enabled===false?' · ⚠ 调度器已暂停':'') :'—'],
+  ];
+  rows.push('<div class="tblwrap" style="max-height:none"><table><tbody>'+
+    schedRows.map(([k,v])=>`<tr><td class="sub-cell" style="width:110px">${esc(k)}</td><td>${esc(v)}</td></tr>`).join('')+
+    '</tbody></table></div>');
+  const logs=(s.logs||[]).slice(-3);
+  if(logs.length){
+    rows.push('<div class="sub-cell" style="margin-top:8px">最近调度日志：</div>');
+    rows.push(logs.map(l=>`<div class="sub-cell mono">${esc(l)}</div>`).join(''));
+  }
+  el.innerHTML=rows.join('');
+}
+async function doCheckin(name,btn){
+  const key='checkin/'+name;
+  if(!runOnce(key)) return;
+  await withBtn(btn, async()=>{
+    try{
+      const r=await api('/api/checkin/'+name,{method:'POST'});
+      const brief=r.ok?briefForCheckin(r):errMsg(r);
+      pushHistory('签到 · '+(PLATFORM_LABEL[name]||name), !!r.ok, brief, JSON.stringify(r,null,1));
+      toast(r.ok?`[${PLATFORM_LABEL[name]||name}] ${brief}`:'签到失败: '+brief, 3600);
+    }catch(e){
+      if(e.status!==401){ toast('签到失败: '+e.message); pushHistory('签到 · '+(PLATFORM_LABEL[name]||name), false, e.message,''); }
+    }
+    setTimeout(()=>{loadAuto();loadStatus();},900);
+  }).finally(()=>runDone(key));
+}
+document.querySelectorAll('[data-checkin]').forEach(b=>b.onclick=()=>doCheckin(b.dataset.checkin,b));
+document.getElementById('btn-checkin-all').onclick=async function(){
+  if(!runOnce('checkin-all')) return;
+  let cur='一键签到…';
+  await withBtn(this, async()=>{
+    const names=['workbuddy','qoder','qwenwork'];
+    for(let i=0;i<names.length;i++){
+      const n=names[i];
+      cur=`(${i+1}/${names.length}) ${PLATFORM_LABEL[n]||n}…`;
+      const key='checkin/'+n;
+      if(RUNNING.has(key)){ continue; }
+      RUNNING.add(key);
+      try{
+        const r=await api('/api/checkin/'+n,{method:'POST'});
+        pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), !!r.ok, r.ok?briefForCheckin(r):errMsg(r), JSON.stringify(r,null,1));
+      }catch(e){ pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), false, e.message,''); }
+      runDone(key);
+    }
+    toast('一键签到完成，详见操作结果');
+    loadAuto(); loadStatus();
+  }, ()=>cur).finally(()=>runDone('checkin-all'));
+};
+
+/* ── 每日活跃打卡（wb 国际版） ── */
+async function dailyChat(btn){
+  const key='dailychat/workbuddy';
+  if(!runOnce(key)) return;
+  await withBtn(btn, async()=>{
+    try{
+      await loadStatus();
+      const accs=((LAST_STATUS&&LAST_STATUS.platforms)||[]).find(p=>p.name==='workbuddy');
+      const pending=((accs&&accs.accounts)||[]).filter(a=>a.realm==='intl'&&a.enabled&&!intlPunched(a));
+      if(!pending.length){
+        toast('没有待打卡的国际版账号（全部已打或不可打）');
+        pushHistory('每日活跃打卡', true, '没有待打卡的国际版账号（全部已打或不可打）','');
+        return;
+      }
+      const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({platform:'workbuddy',path:'accounts/daily-chat',method:'POST',body:{uids:pending.map(a=>a.uid)}})});
+      showTaskResult(`每日活跃打卡（${pending.length} 个账号）`, r);
+      loadStatus();
+    }catch(e){
+      if(e.status!==401){ toast('打卡失败: '+e.message); pushHistory('每日活跃打卡', false, e.message,''); }
+    }
+  }, s=>`打卡中… ${s}s`).finally(()=>runDone(key));
+}
+
+/* ── 操作结果展示 + 引擎代理 / 任务按钮 ── */
+function showTaskResult(title, r){
+  const out=document.getElementById('task-result');
+  out.style.display='block';
+  const brief=r.ok?firstBrief(r.result):(errMsg(r)||'执行失败');
+  const detail=JSON.stringify(r,null,1);
+  out.innerHTML=`<b>${esc(title)}</b> — <span style="color:${r.ok?'var(--green)':'var(--red)'}">${esc(r.ok?'成功':'失败: '+brief)}</span>
+    <details style="margin-top:6px"><summary class="sub-cell" style="cursor:pointer">原始返回</summary>
+    <pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;margin-top:6px">${esc(detail.slice(0,3000))}</pre></details>`;
+  pushHistory(title, !!r.ok, brief, detail);
+}
+function runEngine(payload, btn){
+  const key='engine/'+payload.platform+'/'+payload.path;
+  if(!runOnce(key)) return;
+  const label=(PLATFORM_LABEL[payload.platform]||payload.platform)+' · '+payload.path;
+  withBtn(btn, async()=>{
+    try{
+      const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      showTaskResult(label, r);
+      toast(r.ok?`${label} 已执行`:'失败，详见操作结果');
+      loadStatus();
+    }catch(e){
+      if(e.status!==401){ toast('失败: '+e.message); pushHistory(label,false,e.message,''); }
+    }
+  }).finally(()=>runDone(key));
+}
+
+/* ── 任务中心 ── */
+async function runTask(action, platform, btn){
+  const key=`task/${action}/${platform}`;
+  if(!runOnce(key)) return;
+  const label=`${PLATFORM_LABEL[platform]||platform} · ${action}`;
+  const out=document.getElementById('task-result');
+  await withBtn(btn, async()=>{
+    out.style.display='block';
+    out.innerHTML=`<b>${esc(label)}</b> — <span class="sub-cell">执行中…（成长任务在引擎里跑真实会话，可能要几十秒到几分钟）</span>`;
+    try{
+      const r=await api(`/api/tasks/${action}/${platform}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      showTaskResult(`${label}${r.label?' · '+r.label:''}`, r);
+      toast(r.ok?`[${PLATFORM_LABEL[platform]||platform}] ${r.label||action} 已执行`:'任务执行失败: '+errMsg(r), 3200);
+      loadTasksStatus();
+    }catch(e){
+      if(e.status!==401){
+        out.innerHTML=`<b>${esc(label)}</b> — <span style="color:var(--red)">失败: ${esc(e.message)}</span>`;
+        pushHistory(label,false,e.message,'');
+      }
+    }
+  }, s=>`${label}… ${s}s`).finally(()=>runDone(key));
+}
+async function loadTasksStatus(){
+  const el=document.getElementById('tasks-detail');
+  el.textContent='加载中…';
+  const parts=[];
+  for(const p of ['workbuddy','qoder']){
+    try{
+      const d=await api('/api/tasks/'+p);
+      if(d.ok===false){ parts.push(`${PLATFORM_LABEL[p]}: ${errMsg(d)||'状态获取失败'}`); continue; }
+      const res=d.result;
+      let brief='';
+      if(Array.isArray(res)) brief=res.length+' 项任务';
+      else if(res && typeof res==='object'){
+        const ks=Object.keys(res);
+        brief=ks.includes('accounts')?('账号 '+(res.accounts.length||ks.length)+' 个'):(ks.slice(0,4).join(', '));
+      } else brief=JSON.stringify(res).slice(0,80);
+      parts.push(`${PLATFORM_LABEL[p]}: ${brief}`);
+    }catch(e){parts.push(`${PLATFORM_LABEL[p]}: 状态获取失败（${e.message}）`);}
+  }
+  el.textContent=parts.join('　|　')+'　|　千问办公: 上游自动';
+}
+document.getElementById('btn-tasks-status').onclick=loadTasksStatus;
+document.getElementById('btn-auto-clear').onclick=()=>{
+  TASK_HISTORY.length=0; renderHistory();
+  document.getElementById('task-result').style.display='none';
+};
+
+/* ── OAuth 添加账号 ── */
+async function startLogin(platform,realmSel,statusId,linkId,btn){
+  const realm=document.getElementById(realmSel).value;
+  const st=document.getElementById(statusId), lk=document.getElementById(linkId);
+  if(btn){btn.disabled=true;}
+  st.textContent='生成中…'; lk.textContent='';
+  const reenable=()=>{ if(btn) btn.disabled=false; };
+  try{
+    const r=await api('/api/login/start/'+platform,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({realm})});
+    if(!r.ok){ st.textContent='失败: '+errMsg(r); reenable(); return; }
+    lk.innerHTML=`<a href="${esc(r.authUrl)}" target="_blank">${esc(r.authUrl)}</a><div class="sub-cell">点链接在新窗口完成登录，本页每 3 秒自动轮询</div>`;
+    st.textContent='等待授权…';
+    const state=r.state;
+    let timer=null;
+    const stopPoll=()=>{ if(timer){clearInterval(timer);timer=null;} reenable(); };
+    timer=setInterval(async()=>{
+      try{
+        const p=await api(`/api/login/poll?platform=${platform}&state=${encodeURIComponent(state)}`);
+        if(p.ok===false){ stopPoll(); st.textContent='轮询失败: '+(errMsg(p)||'引擎返回错误'); return; }
+        const s=p.result||{}; const sst=(s.status||'').toString();
+        st.textContent=s.message||sst||'等待授权…';
+        if(sst && sst!=='pending'){
+          stopPoll();
+          st.textContent=/ok|success|added|complete/i.test(sst)?'✓ 授权完成，账号已入库':('状态: '+sst);
+          loadStatus();
+        }
+      }catch(e){ stopPoll(); st.textContent='轮询失败: '+e.message; }
+    },3000);
+  }catch(e){ st.textContent='失败: '+e.message; reenable(); }
+}
+document.getElementById('wb-start').onclick=function(){startLogin('workbuddy','wb-realm','wb-login-status','wb-link',this);};
+document.getElementById('qoder-start').onclick=function(){startLogin('qoder','qoder-realm','qoder-login-status','qoder-link',this);};
+document.getElementById('qw-reimport').onclick=async function(){
+  this.disabled=true;const st=document.getElementById('qw-status');st.textContent='检测中…';
+  try{
+    const r=await api('/api/qwenwork/reimport',{method:'POST'});
+    st.textContent=r.ok?('导入完成: '+JSON.stringify(r.result).slice(0,140)):('失败: '+(errMsg(r)||'未知'));
+    if(r.ok)loadStatus();
+  }catch(e){st.textContent='失败: '+e.message;}
+  this.disabled=false;
+};
+
+/* ── 设置 / 日志 ── */
+async function loadSettings(){
+  const k=KEY();
+  document.getElementById('set-key').textContent=document.getElementById('btn-reveal-key').textContent==='隐藏'?k:'••••••••';
+  try{
+    const d=await api('/api/gwconfig');
+    document.getElementById('cfg-hide-pro').checked=!!d.hide_pro_locked;
+    document.getElementById('cfg-dual-prefer').value=d.wb_dual_prefer||'auto';
+    const r=d.wb_realms||{};
+    const fmtD=v=>v==null?'—':(v<1?Math.round(v*24)+' 小时':Math.ceil(v)+' 天');
+    const line=x=>x?`最临期 ${fmtD(x.min_days_left)} / ${x.expiring_remain} 分`:'无临期包';
+    document.getElementById('cfg-realms-info').textContent=
+      `当前临期概况：国内版 ${line(r.cn)} · 国际版 ${line(r.intl)}`;
+  }catch(e){ document.getElementById('cfg-realms-info').textContent='路由偏好读取失败: '+e.message; }
+  loadUpdates();
+}
+/* 上游版本与更新：qoder/buddy 由网关直查 GitHub release tag；wb 走引擎 /updates */
+async function loadUpdates(force){
+  const el=document.getElementById('updates-list');
+  el.textContent='检查中…';
+  try{
+    if(force){
+      // 先让 wb 引擎跑一次自带检查（其它平台由网关直查 GitHub）
+      await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({platform:'workbuddy',path:'updates/check'})}).catch(()=>null);
+    }
+    const d=await api('/api/updates'+(force?'?force=1':''));
+    el.innerHTML=(d.rows||[]).map(r=>{
+      const badge=r.has_update===true?'<span class="pill red">有更新</span>'
+        :(r.has_update===false?'<span class="pill green">已是最新</span>':'<span class="pill gray">未知</span>');
+      return `<div style="display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--line);flex-wrap:wrap">
+        <span class="name-cell" style="min-width:88px">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span>
+        <span class="mono">当前 ${esc(r.current||'—')}</span>
+        <span class="mono" style="color:${r.has_update?'var(--red)':'inherit'}">最新 ${esc(r.latest||'—')}</span>
+        ${badge}
+        ${r.source?`<span class="sub-cell">源: ${esc(r.source)}</span>`:''}
+        ${r.error?`<span class="sub-cell" style="color:var(--orange)">${esc(r.error)}</span>`:''}
+      </div>`;
+    }).join('')||'<div class="empty">—</div>';
+  }catch(e){ el.textContent='版本检查失败: '+e.message; }
+}
+document.getElementById('btn-updates-refresh').onclick=async function(){
+  await withBtn(this, async()=>{ await loadUpdates(true); toast('更新检查完成'); });
+};
+document.getElementById('btn-gwconfig-save').onclick=async function(){
+  await withBtn(this, async()=>{
+    try{
+      const r=await api('/api/gwconfig',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({hide_pro_locked:document.getElementById('cfg-hide-pro').checked,
+                             wb_dual_prefer:document.getElementById('cfg-dual-prefer').value})});
+      if(r.ok){ toast('路由偏好已保存'); loadSettings(); }
+      else toast('失败: '+errMsg(r));
+    }catch(e){ if(e.status!==401) toast('失败: '+e.message); }
+  });
+};
+async function copyText(text, btn){
+  let ok=false;
+  try{ await navigator.clipboard.writeText(text); ok=true; }
+  catch(e){
+    // 非安全上下文降级：临时 textarea + execCommand
+    try{
+      const ta=document.createElement('textarea');
+      ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      ok=document.execCommand('copy'); document.body.removeChild(ta);
+    }catch(e2){ ok=false; }
+  }
+  if(btn){ const old=btn.textContent; btn.textContent=ok?'已复制 ✓':'复制失败'; setTimeout(()=>btn.textContent=old,1200); }
+  if(!ok) toast('复制失败，请手动选择文本复制');
+}
+document.getElementById('btn-copy-url').onclick=()=>copyText('http://127.0.0.1:8787/v1',document.getElementById('btn-copy-url'));
+document.getElementById('btn-copy-key').onclick=()=>{
+  const shown=document.getElementById('set-key').textContent;
+  copyText(shown.startsWith('•')?KEY():shown, document.getElementById('btn-copy-key'));
+};
+document.getElementById('btn-reveal-key').onclick=function(){
+  const show=this.textContent==='显示';
+  this.textContent=show?'隐藏':'显示'; loadSettings();
+};
+async function loadLogs(){
+  try{
+    const d=await api('/api/logs');
+    const body=document.getElementById('logbody');
+    body.innerHTML=esc(d.lines||'').split('\n').map(l=>{
+      if(/checkin|签到/.test(l))return `<span class="ok">${l}</span>`;
+      if(/失败|ERROR|Traceback|不可达|error/i.test(l))return `<span class="err">${l}</span>`;
+      if(/WARN|启动|Key/.test(l))return `<span class="warn">${l}</span>`;
+      return l;
+    }).join('\n')||'<span style="color:#7c796f">暂无日志</span>';
+    body.scrollTop=body.scrollHeight;
+  }catch(e){ if(e.status!==401) document.getElementById('logbody').textContent='日志加载失败: '+e.message; }
+}
+
+/* ── 总览渲染 ── */
+function loadOverview(){
+  if(LAST_STATUS){
+    renderOverview(LAST_STATUS);
+    const rows=(USAGE.rows||[]).slice(0,10);
+    document.getElementById('recent-body').innerHTML=rows.length?rows.map(r=>{
+      const bad=isBad(r.outcome);
+      const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
+      return `<tr><td class="mono">${esc(r.iso)}</td>
+        <td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
+        <td class="mono">${esc(r.model)}</td><td>${esc(r.account||'—')}</td>
+        <td class="num" style="font-weight:700">${fmtTok(r.total)}</td>
+        <td class="num" style="color:${cr?'var(--orange)':'inherit'}">${cr==null?'—':cr.toFixed(2)}</td>
+        <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}</td>
+        <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td></tr>`;
+    }).join(''):'<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
+  }
+  api('/api/usage?limit=100').then(d=>{
+    USAGE=d;
+    if(LAST_STATUS) renderOverview(LAST_STATUS);
+    const rows=(d.rows||[]).slice(0,10);
+    document.getElementById('recent-body').innerHTML=rows.length?rows.map(r=>{
+      const bad=isBad(r.outcome);
+      const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
+      return `<tr><td class="mono">${esc(r.iso)}</td>
+        <td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
+        <td class="mono">${esc(r.model)}</td><td>${esc(r.account||'—')}</td>
+        <td class="num" style="font-weight:700">${fmtTok(r.total)}</td>
+        <td class="num" style="color:${cr?'var(--orange)':'inherit'}">${cr==null?'—':cr.toFixed(2)}</td>
+        <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}</td>
+        <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td></tr>`;
+    }).join(''):'<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
+  }).catch(()=>{});
+}
+document.getElementById('btn-refresh-top').onclick=()=>{loadStatus();loadOverview();};
+
+/* ── 启动 ── */
+function gateHidden(){return document.getElementById('gate').classList.contains('hidden');}
+(async function init(){
+  try{ const h=await fetch('/health').then(x=>x.json()); if(h.version) document.getElementById('brand-version').textContent='聚合控制台 · v'+h.version; }catch(e){}
+  if(!KEY()){showGate();return;}
+  try{const r=await api('/api/ping');if(r.ok){loadAll();}else showGate();}
+  catch(e){showGate();}
+})();
+function loadAll(){loadStatus();loadOverview();}
+/* 30 秒定时刷新只作用于当前视图：全量 loadAll 会重复请求 usage 并把
+   用户没在看的数据也刷一遍；账号视图的签到执行期间不重绘（见 loadStatus 守卫） */
+setInterval(()=>{
+  if(!KEY()||!gateHidden()) return;
+  const active=(document.querySelector('.view.active')||{}).id||'';
+  if(active==='view-auto'){ if(!RUNNING.size) loadAuto(); return; }
+  if(active==='view-usage'){ loadUsage(); return; }
+  if(active==='view-logs'){ loadLogs(); return; }
+  if(active==='view-models') return; // 目录有 15s 缓存语义，静置即可
+  if(active==='view-add'||active==='view-settings') return;
+  loadStatus(); // 总览/账号：loadStatus 内部按活跃视图分流渲染
+},30000);
+</script>
+</body>
+</html>
