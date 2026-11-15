@@ -170,6 +170,15 @@ td.num,th.num{text-align:right}
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
+      <h3>额度可用量预估 <span class="sub">余额 ÷ 近期有效单价（按最近 500 条请求实扣；千问办公为余额差实测）。缓存命中率、思考档位、输入长度都会改变实际可用量</span></h3>
+      <div class="tblwrap" style="margin-top:10px">
+        <table><thead><tr>
+          <th>平台</th><th class="num">余额（启用账号）</th><th class="num">近期单价</th><th class="num">预计可用 TOKEN</th>
+        </tr></thead><tbody id="overview-estimate"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody></table>
+      </div>
+      <div class="sub" id="overview-estimate-note" style="margin-top:8px"></div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
       <h3>即将过期的积分 <span class="sub">按到期时间排序；qwenwork 上游不暴露过期时间，以官方客户端为准</span></h3>
       <div id="expiring-list"><div class="empty">加载中…</div></div>
     </div>
@@ -225,7 +234,7 @@ td.num,th.num{text-align:right}
 
   <div id="view-models" class="view">
     <div class="pagetitle">模型</div>
-    <div class="pagesub">控制哪些模型对外可见：隐藏的模型从 /v1/models 拉取列表里消失，调用也会被拒绝。/v1/models 统一带平台前缀（如 workbuddy/kimi-k3），一眼看出归属；裸名调用仍兼容。☆ 标记常用模型，会置顶。</div>
+    <div class="pagesub">管理模型可见性与常用标记：隐藏后客户端拉取列表和调用都会被拒绝；/v1/models 统一带平台前缀。</div>
     <div class="card">
       <div class="toolbar">
         <input type="text" id="model-search" placeholder="搜索模型">
@@ -234,7 +243,7 @@ td.num,th.num{text-align:right}
           <option value="qoder">Qoder</option><option value="qwenwork">千问办公</option>
         </select>
         <select id="model-visfilter">
-          <option value="">全部状态</option><option value="visible">仅显示中</option><option value="hidden">仅已隐藏</option>
+          <option value="visible" selected>仅显示中</option><option value="hidden">仅已隐藏</option><option value="">全部状态</option>
         </select>
         <span style="flex:1"></span>
         <span class="pill green" id="model-count">—</span>
@@ -249,7 +258,7 @@ td.num,th.num{text-align:right}
         <span style="font-size:12px;color:var(--dim)">跨平台批量操作</span>
       </div>
       <div id="model-groups"></div>
-      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits 倍率；Qoder = price_factor（峰）+ 谷价；千问办公目录不暴露单价——行内输入框可手工记录，或直接使用（自动倍率会随使用累计实测值）。WorkBuddy 的 PRO 专属模型（上游目录标注）在账号池没有付费账号时会自动从 /v1/models 隐藏（config.json hide_pro_locked，默认开），会员账号入池后自动恢复。</div>
+      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits；Qoder = price_factor（峰/谷）；千问办公目录不暴露单价，自动倍率按余额差累计实测。PRO 专属模型在账号池没有付费账号时自动从 /v1/models 隐藏（config.json hide_pro_locked）。</div>
     </div>
   </div>
 
@@ -280,13 +289,6 @@ td.num,th.num{text-align:right}
         </tr></thead><tbody id="usage-conv"><tr><td colspan="9" class="empty">—</td></tr></tbody></table>
       </div>
       <div class="sub" id="usage-conv-note" style="margin-bottom:14px"></div>
-      <div class="sub" style="font-weight:700;margin-bottom:6px">额度可用量预估（按最近实测单价）<span class="sub" style="font-weight:400">　余额 ÷ 实测单价；缓存命中率、思考档位、输入长度都会改变实际值，仅作量级参考</span></div>
-      <div class="tblwrap" style="margin-bottom:6px">
-        <table><thead><tr>
-          <th>平台</th><th>模型 / 口径</th><th class="num">当前余额</th><th class="num">实测单价 分/千tok</th><th class="num">近期 token 占比</th><th class="num">预计可用 TOKEN</th>
-        </tr></thead><tbody id="usage-estimate"><tr><td colspan="6" class="empty">—</td></tr></tbody></table>
-      </div>
-      <div class="sub" id="usage-estimate-note" style="margin-bottom:14px"></div>
       <div class="sub" style="font-weight:700;margin-bottom:6px">按模型汇总（当前筛选范围）</div>
       <div class="tblwrap" style="margin-bottom:14px">
         <table><thead><tr>
@@ -433,6 +435,7 @@ function fmt(n){ return Math.round(n).toLocaleString(); }
    只用于 token 计数；积分/金额等仍用 fmt() 保留精确数字。 */
 function fmtTok(n){
   n=Number(n)||0;
+  if(n>=1e9) return (n/1e9).toFixed(2)+'B';
   if(n>=1e6) return (n/1e6).toFixed(2)+'M';
   if(n>=1e3) return (n/1e3).toFixed(1)+'k';
   return String(Math.round(n));
@@ -658,19 +661,20 @@ function renderModels(){
       const realmPill=(m.realms&&m.realms.length===1)?` <span class="pill gray" title="上游仅在此区域提供该模型">${m.realms[0]==='cn'?'仅国内':'仅国际'}</span>`:'';
       const routePill=(m.route&&m.realms&&m.realms.length>1)
         ?` <span class="pill indigo" title="双区模型：出口由调度策略决定（设置页「路由偏好」可改）">出口: ${m.route_auto?'自动→':''}${m.route==='cn'?'国内':'国际'}</span>`:'';
-      const proPill=m.requires_pro?' <span class="pill purple" title="上游目录标注：需要 WorkBuddy 付费会员（PRO）">PRO</span>':'';
+      const proPill=(m.requires_pro&&!m.pro_locked)?' <span class="pill purple" title="上游目录标注：需要 WorkBuddy 付费会员（PRO）">PRO</span>':'';
       const st=m.pro_locked
         ?'<span class="pill orange" title="需要付费会员，当前账号池无付费账号：已从 /v1/models 自动隐藏，会员账号入池后自动恢复">PRO 专属 · 自动隐藏</span>'
-        :(hid?'<span class="pill gray">已隐藏</span>':'<span class="pill green">显示中</span>');
+        :(hid?'<span class="pill gray">已隐藏</span>':'');
       const act=hid?`<button class="btn mini" data-mv="${esc(m.id)}" data-v="1">恢复显示</button>`
                    :`<button class="btn sec mini" data-mv="${esc(m.id)}" data-v="0">隐藏</button>`;
-      const sub=[];
-      if(m.upstream && m.upstream!==m.model) sub.push('上游名: '+esc(m.upstream));
-      if(m.alt && m.alt!==m.model) sub.push('官方名: '+esc(m.alt));
-      if(m.alias_of) sub.push(`国际版改名：与 ${esc(m.alias_of)} 是同一模型（推荐调基础 id，出口由临期调度自动选）`);
-      if(m.aliased_to) sub.push(`国际版出口自动改写为 ${esc(m.aliased_to)}（同一模型）`);
-      if(m.desc) sub.push(`<span title="${esc(m.desc)}">${esc(String(m.desc).slice(0,60))}${String(m.desc).length>60?'…':''}</span>`);
-      const subHtml=sub.length?`<div class="sub-cell">${sub.join(' · ')}</div>`:'';
+      // 元信息合成一行，不再按「官方名/上游名/别名/描述」各占一行
+      const meta=[];
+      if(m.desc) meta.push(`<span title="${esc(m.desc)}">${esc(String(m.desc).slice(0,56))}${String(m.desc).length>56?'…':''}</span>`);
+      if(m.alt && String(m.alt).toLowerCase()!==String(m.model).toLowerCase()) meta.push('官方名 '+esc(m.alt));
+      if(m.upstream && m.upstream!==m.model) meta.push('上游名 '+esc(m.upstream));
+      if(m.alias_of) meta.push('国际版与 '+esc(m.alias_of)+' 同模型');
+      if(m.aliased_to) meta.push('国际版出口改写为 '+esc(m.aliased_to));
+      const subHtml=meta.length?`<div class="sub-cell">${meta.join(' · ')}</div>`:'';
       // 规格：上下文/最大输出/思考档位/多模态（上游目录字段，缺的隐去）
       const caps=m.caps||{};
       const fk=v=>v>=1e6?(Math.round(v/1e5)/10)+'M':(v>=1e3?Math.round(v/1e3)+'k':String(v));
@@ -686,29 +690,26 @@ function renderModels(){
       const isAuto=m.multiplier&&m.multiplier.source==='auto';
       let rateCell;
       if(isAuto){
-        // 千问办公的自动值是「余额差 ÷ token」的绝对单价（分/token，~0.0000622），
-        // 当倍率显示像乱码。这里给同平台相对倍率（相对最便宜模型 = x1.00），
-        // 绝对单价按分/千tok 放在副行，额度预估用的也是它。
+        // 千问办公的自动值是绝对单价（分/token），倍率列只留「相对倍率 + 实测单价」两行
         const mt=m.multiplier;
         const rateK=(mt.rate_per_ktok!=null)?Number(mt.rate_per_ktok):(Number(mt.factor||0)*1000);
         const rel=(mt.rel_factor!=null)?('x'+Number(mt.rel_factor).toFixed(2)):'—';
-        rateCell=`<div style="font-weight:600">${rel} <span class="sub-cell" style="font-weight:400">相对</span></div>
-          <div class="sub-cell">${esc((mt.rel_base||'基准')+' = x1.00')} · 实测 ${rateK.toFixed(4)} 分/千tok</div>
-          <div class="sub-cell">自动实测 · ${mt.samples||0} 窗口 · 累计 ${Number(mt.credit||0).toFixed(2)} 分 / ${Number(mt.tokens||0).toLocaleString()} tok</div>`;
+        rateCell=`<span class="mono" style="font-weight:600">${rel}</span> <span class="sub-cell">相对</span>
+          <div class="sub-cell" title="自动实测 ${mt.samples||0} 窗口 · 累计 ${Number(mt.credit||0).toFixed(2)} 分 / ${Number(mt.tokens||0).toLocaleString()} tok">${rateK.toFixed(4)} 分/千tok · ${mt.samples||0} 窗口</div>`;
       } else if(pf2==='qwenwork'&&(!m.multiplier||manual)){
         rateCell=`<div class="toolbar" style="gap:4px;margin:0">
-             <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc(manual&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:70px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
+             <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc(manual&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:64px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
              <button class="btn mini" data-ratesave="${esc(m.id)}">存</button>
              ${manual?`<button class="btn sec mini" data-rateclear="${esc(m.id)}">清除</button>`:''}
-           </div>${manual?`<div class="sub-cell">手工记录 ${esc(m.multiplier.note||m.multiplier.recorded_at||'')}</div>`:''}`;
+           </div>`;
       } else {
         rateCell=fmtMult(m.multiplier);
       }
       const star=m.fav?'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="0" title="取消常用" style="color:var(--orange);border:none;background:none;padding:2px 4px">★</button>':'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="1" title="标为常用" style="border:none;background:none;padding:2px 4px">☆</button>';
       return `<tr>
         <td><input type="checkbox" class="msel-box" data-msel="${esc(m.id)}" ${MSEL.has(m.id)?'checked':''}></td>
-        <td class="name-cell"><span class="mono">${esc(m.id)}</span>${proPill}${realmPill}${routePill} ${star}${subHtml}${specHtml}</td>
-        <td>${rateCell}</td><td>${st}</td><td style="text-align:right">${act}</td></tr>`;
+        <td class="name-cell"><span class="mono">${esc(m.id)}</span> ${st}${proPill}${realmPill}${routePill} ${star}${subHtml}${specHtml}</td>
+        <td>${rateCell}</td><td style="text-align:right">${act}</td></tr>`;
     }).join('');
     return `<div style="margin-bottom:16px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
@@ -720,7 +721,7 @@ function renderModels(){
       </div>
       <table><thead><tr>
         <th style="width:30px"><input type="checkbox" class="msel-all" data-mall="${esc(pf2)}"></th>
-        <th>模型 ID（带前缀）</th><th>倍率</th><th>状态</th><th style="text-align:right">操作</th>
+        <th>模型</th><th>倍率</th><th style="text-align:right">操作</th>
       </tr></thead><tbody>${rows}</tbody></table>
     </div>`;
   }).join('') || '<div class="empty">没有匹配的模型</div>';
@@ -769,6 +770,7 @@ let LAST_STATUS=null;
 async function loadStatus(){
   try{
     const d=await api('/api/status'); LAST_STATUS=d;
+    if(EST_CACHE.rows) renderEstimate();   // 余额到货后刷新预估（用量数据 5 分钟缓存）
     if(document.getElementById('view-overview').classList.contains('active')) loadOverview();
     // 有签到在跑时不重绘账号表：重绘会把「签到中…」的禁用按钮换回可用状态，
     // 用户容易再点一次造成重复执行
@@ -811,8 +813,7 @@ function renderOverview(d){
   document.getElementById('kpis').innerHTML=`
     <div class="kpi"><div class="label">平台在线</div><div class="num indigo">${d.kpi.platforms_ok}<span style="font-size:14px;color:var(--dim2)">/${d.kpi.platforms_total}</span></div><div class="note">引擎健康检查</div></div>
     <div class="kpi"><div class="label">账号总数</div><div class="num">${d.kpi.accounts}</div><div class="note">三平台合计</div></div>
-    <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">可代执行平台</div></div>
-    <div class="kpi"><div class="label">各平台余额</div><div class="num" style="font-size:15px;line-height:1.9">${d.platforms.map(p=>`<div>${esc(PLATFORM_LABEL[p.name]||p.name)}: <b style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${p.accounts.some(a=>a.remain===null)?'见客户端':fmt(p.accounts.reduce((s,a)=>s+(a.remain||0),0))}</b></div>`).join('')}</div><div class="note">口径互不相同，不做加总</div></div>`;
+    <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">可代执行平台</div></div>`;
 }
 let ACC_PLATFORMS=null;                 // 账号页最近一次数据：切换区域筛选时复用，不重新请求
 const REALM_LABEL={cn:'国内版',intl:'国际版'};
@@ -893,6 +894,22 @@ function renderPlatforms(platforms){
 let USAGE={rows:[],usd_cny:null}, UPAGE=1;
 let USAGE_RATE={}; // "平台/模型" -> {factor, source}（目录倍率，供换算统计比对）
 let AUTO_RATE={};  // 千问办公自动实测：id -> {rateK:分/千tok, samples, credit, tokens, rel, base, model}
+function buildRateMaps(cat){
+  const usageRate={}, autoRate={};
+  if(cat && Array.isArray(cat.items)){
+    for(const it of cat.items){
+      if(it.multiplier && it.multiplier.factor) usageRate[it.id]={factor:Number(it.multiplier.factor), source:it.multiplier.source||''};
+      if(it.platform==='qwenwork' && it.multiplier && it.multiplier.source==='auto'){
+        const f=Number(it.multiplier.factor)||0;
+        autoRate[it.id]={rateK:(it.multiplier.rate_per_ktok!=null?Number(it.multiplier.rate_per_ktok):f*1000),
+          samples:it.multiplier.samples||0, credit:Number(it.multiplier.credit)||0,
+          tokens:Number(it.multiplier.tokens)||0, rel:it.multiplier.rel_factor,
+          base:it.multiplier.rel_base, model:it.model};
+      }
+    }
+  }
+  return {usageRate, autoRate};
+}
 async function loadUsage(){
   try{
     const [d, cat] = await Promise.all([
@@ -900,24 +917,9 @@ async function loadUsage(){
       api('/api/catalog').catch(()=>null),
     ]);
     USAGE=d; UPAGE=1;
-    USAGE_RATE={}; AUTO_RATE={};
-    if(cat && Array.isArray(cat.items)){
-      for(const it of cat.items){
-        if(it.multiplier && it.multiplier.factor) USAGE_RATE[it.id]={factor:Number(it.multiplier.factor), source:it.multiplier.source||''};
-        if(it.platform==='qwenwork' && it.multiplier && it.multiplier.source==='auto'){
-          const f=Number(it.multiplier.factor)||0;
-          AUTO_RATE[it.id]={rateK:(it.multiplier.rate_per_ktok!=null?Number(it.multiplier.rate_per_ktok):f*1000),
-            samples:it.multiplier.samples||0, credit:Number(it.multiplier.credit)||0,
-            tokens:Number(it.multiplier.tokens)||0, rel:it.multiplier.rel_factor,
-            base:it.multiplier.rel_base, model:it.model};
-        }
-      }
-    }
+    const maps=buildRateMaps(cat);
+    USAGE_RATE=maps.usageRate; AUTO_RATE=maps.autoRate;
     renderUsage();
-    // 预估要余额：状态还没载入时补拉一次（不阻塞表格渲染）
-    if(!LAST_STATUS){
-      api('/api/status').then(st=>{LAST_STATUS=st; renderUsageEstimate();}).catch(()=>{});
-    }
   }catch(e){ if(e.status!==401) toast('用量加载失败: '+e.message); }
 }
 function usageFiltered(){
@@ -1110,7 +1112,6 @@ function renderUsage(){
   renderUsageCharts(rows);
   renderUsageConversion(rows);
   renderUsagePerModel(rows);
-  renderUsageEstimate();
 }
 /* 换算统计：平台×模型的实扣积分 vs token，对照目录倍率；wb 另有真实成本锚点 */
 function renderUsageConversion(rows){
@@ -1163,22 +1164,39 @@ function renderUsageConversion(rows){
   }).join('　|　');
   note.textContent='平台汇总（当前筛选）→ '+summary;
 }
-/* 额度可用量预估：余额 ÷ 实测单价（分/千tok）
-   - wb/qoder：单价取用量行 credit ÷ token（缓存折扣反映在实扣里）
-   - 千问办公：用量行没有积分，用余额差实测的 auto 单价（分/tok ×1000）
-   比例与结构用全部近期日志（不随表格筛选），余额取 /api/status 的启用账号。 */
-function renderUsageEstimate(){
-  const tb=document.getElementById('usage-estimate');
-  const note=document.getElementById('usage-estimate-note');
+/* 额度可用量预估（总览页）：余额 ÷ 近期有效单价 → 预计可用 token。
+   单价 = Σ(模型实扣积分) ÷ Σ(token)；千问办公用量行没有积分，用
+   「余额差 ÷ token」的实测单价（config.auto_multipliers）。混合单价按
+   近期 token 量加权，避免用量少的模型把均值带偏。 */
+let EST_CACHE={ts:0, rows:null, auto:{}};
+async function loadEstimate(force){
+  if(!force && EST_CACHE.rows && Date.now()-EST_CACHE.ts < 300000){ renderEstimate(); return; }
+  try{
+    const [d,cat]=await Promise.all([
+      api('/api/usage?limit=500'),
+      api('/api/catalog').catch(()=>null),
+    ]);
+    EST_CACHE={ts:Date.now(), rows:(d&&d.rows)||[], auto:buildRateMaps(cat).autoRate};
+    renderEstimate();
+  }catch(e){ /* 静默：总览其他块照常 */ }
+}
+function renderEstimate(){
+  const tb=document.getElementById('overview-estimate');
+  const note=document.getElementById('overview-estimate-note');
   if(!tb) return;
-  const agg={};
-  for(const r of USAGE.rows){
-    const key=(r.platform||'?')+'/'+(r.model||'?');
-    const e=agg[key]||(agg[key]={platform:r.platform,model:r.model,tok:0,credit:0,hasCredit:false,n:0});
-    e.n++; e.tok+=(r.total||0);
+  const rows=EST_CACHE.rows||[];
+  // 1) 每个平台/模型的 token 量与实扣积分
+  const per={};
+  for(const r of rows){
+    const p=r.platform||'?', m=r.model||'?';
+    const e=(per[p]=per[p]||{tok:0, credit:0, hasCredit:false, models:{}});
+    e.tok+=Number(r.total)||0;
+    const mx=e.models[m]=e.models[m]||{tok:0, credit:0, hasCredit:false};
+    mx.tok+=Number(r.total)||0;
     const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
-    if(cr!==null){ e.credit+=cr; e.hasCredit=true; }
+    if(cr!==null){ mx.credit+=cr; mx.hasCredit=true; e.credit+=cr; e.hasCredit=true; }
   }
+  // 2) 余额：只算启用账号（停用账号不参与调度，不能当可用额度）
   const bal={};
   for(const p of ((LAST_STATUS&&LAST_STATUS.platforms)||[])){
     let sum=0, any=false;
@@ -1188,72 +1206,58 @@ function renderUsageEstimate(){
     }
     bal[p.name]=any?sum:null;
   }
-  const byPf={};
-  const getPf=p=>byPf[p]||(byPf[p]={models:[],tok:0,credit:0,hasCredit:false});
-  for(const e of Object.values(agg)){
-    const key=e.platform+'/'+e.model;
-    let rateK=null, src='';
-    if(e.hasCredit&&e.tok>0){ rateK=e.credit/e.tok*1000; src='实扣'; }
-    else if(AUTO_RATE[key]){ rateK=AUTO_RATE[key].rateK; src='余额差'; }
-    if(rateK==null||!(rateK>0)) continue;
-    const pf=getPf(e.platform);
-    pf.models.push({model:e.model,tok:e.tok,rateK,src});
-    pf.tok+=e.tok;
-    if(e.hasCredit){ pf.credit+=e.credit; pf.hasCredit=true; }
-  }
-  // 千问办公有实测但近期没用过的模型也列出来（占比 —）
-  for(const [id,m] of Object.entries(AUTO_RATE)){
-    const i=id.indexOf('/'); if(i<0) continue;
-    const p=id.slice(0,i), model=id.slice(i+1);
-    const pf=getPf(p);
-    if(!pf.models.some(x=>x.model===model)) pf.models.push({model,tok:0,rateK:m.rateK,src:'余额差'});
-  }
-  const order=['workbuddy','qoder','qwenwork'].filter(p=>byPf[p]||bal[p]!=null);
+  const order=['workbuddy','qoder','qwenwork'].filter(p=>bal[p]!=null || per[p]);
   if(!order.length){
-    tb.innerHTML='<tr><td colspan="6" class="empty">没有可用于估算的实测单价（先跑几次请求）</td></tr>';
-    note.textContent=''; return;
+    tb.innerHTML='<tr><td colspan="4" class="empty">暂无余额与用量数据</td></tr>';
+    if(note) note.textContent='';
+    return;
   }
   let html='', total=0, parts=[];
   for(const p of order){
-    const pf=byPf[p]||{models:[],tok:0,credit:0,hasCredit:false};
+    const e=per[p]||{tok:0,credit:0,hasCredit:false,models:{}};
     const balance=bal[p];
-    let blended=null;
-    if(pf.hasCredit&&pf.tok>0) blended=pf.credit/pf.tok*1000;
-    else{
-      const withTok=pf.models.filter(m=>m.tok>0);
-      if(withTok.length){
-        const t=withTok.reduce((s,m)=>s+m.tok,0);
-        blended=withTok.reduce((s,m)=>s+m.tok*m.rateK,0)/t;
-      } else if(pf.models.length){
-        blended=pf.models.reduce((s,m)=>s+m.rateK,0)/pf.models.length;
+    // 每个模型的有效单价：实扣优先，其次千问余额差实测
+    const priced=[];
+    for(const [m,v] of Object.entries(e.models)){
+      let rateK=null;
+      if(v.hasCredit && v.tok>0) rateK=v.credit/v.tok*1000;
+      else{
+        const a=EST_CACHE.auto[p+'/'+m];
+        if(a && a.rateK>0) rateK=a.rateK;
       }
+      if(rateK>0) priced.push({model:m, tok:v.tok, rateK});
     }
-    const est=(balance!=null&&blended>0)?balance/blended*1000:null;
+    // 千问办公：近期没用过但有实测单价的模型，只参与「无用量时」的兜底均价
+    const fallback=[];
+    for(const [id,a] of Object.entries(EST_CACHE.auto)){
+      const i=id.indexOf('/'); if(i<0) continue;
+      if(id.slice(0,i)!==p) continue;
+      if(!priced.some(x=>x.model===id.slice(i+1))) fallback.push(a.rateK);
+    }
+    let rateK=null;
+    const wt=priced.filter(x=>x.tok>0);
+    if(wt.length){
+      const tt=wt.reduce((s,x)=>s+x.tok,0);
+      rateK=wt.reduce((s,x)=>s+x.tok*x.rateK,0)/tt;
+    } else if(priced.length){
+      rateK=priced.reduce((s,x)=>s+x.rateK,0)/priced.length;
+    } else if(fallback.length){
+      rateK=fallback.reduce((s,x)=>s+x,0)/fallback.length;
+    }
+    const est=(balance!=null && rateK>0)?balance/rateK*1000:null;
     if(est){ total+=est; parts.push((PLATFORM_LABEL[p]||p)+' '+fmtTok(est)); }
-    html+=`<tr style="background:var(--panel2)">
+    html+=`<tr>
       <td><span class="pill indigo">${esc(PLATFORM_LABEL[p]||p)}</span></td>
-      <td><b>按近期结构加权</b><div class="sub-cell">${pf.models.length} 个模型有实测单价</div></td>
       <td class="num">${balance!=null?fmt(balance)+' 分':'—'}</td>
-      <td class="num" style="font-weight:600">${blended>0?blended.toFixed(4):'—'}</td>
-      <td class="num">${pf.tok?'100%':'—'}</td>
+      <td class="num">${rateK>0?rateK.toFixed(4)+' <span class="sub-cell">分/千tok</span>':'<span class="sub-cell">无实测单价</span>'}</td>
       <td class="num" style="font-weight:700;color:var(--accent)">${est?fmtTok(est):'—'}</td></tr>`;
-    const models=pf.models.slice().sort((a,b)=>b.tok-a.tok).slice(0,8);
-    for(const m of models){
-      const share=pf.tok>0?(m.tok/pf.tok*100):null;
-      const e2=(balance!=null)?balance/m.rateK*1000:null;
-      html+=`<tr>
-        <td></td>
-        <td class="mono">${esc(m.model)} <span class="sub-cell">${esc(m.src)}</span></td>
-        <td class="num">${balance!=null?fmt(balance)+' 分':'—'}</td>
-        <td class="num">${m.rateK.toFixed(4)}</td>
-        <td class="num">${share!=null?share.toFixed(1)+'%':'—'}</td>
-        <td class="num">${e2?fmtTok(e2):'—'}</td></tr>`;
-    }
   }
   tb.innerHTML=html;
-  note.textContent=(total>0)
-    ? ('合计约 '+fmtTok(total)+' tok（'+parts.join(' + ')+'）· 各平台按自己的余额与实测单价分别折算（积分口径不同不能相加，只加总 token 量级）；模型行的「预计可用」= 假设余额全部花在该模型。')
-    : '余额未加载或没有实测单价，暂时无法估算（状态接口返回后会自动刷新；也可以先跑几次请求让上游记录用量）。';
+  if(note){
+    note.textContent=(total>0)
+      ? ('合计约 '+fmtTok(total)+' tok（'+parts.join(' + ')+'）。各平台积分口径不同不能相加，只合计 token 量级；缓存命中率越高，同样余额能跑出的 token 越多。')
+      : '余额或实测单价还没准备好：先跑几次请求，让上游记录用量后自动刷新。';
+  }
 }
 document.getElementById('btn-usage-refresh').onclick=loadUsage;
 document.getElementById('usage-filter').onchange=()=>{UPAGE=1;renderUsage();};
@@ -1681,6 +1685,7 @@ async function loadLogs(){
 
 /* ── 总览渲染 ── */
 function loadOverview(){
+  loadEstimate();   // 5 分钟缓存；强制刷新走顶部「刷新数据」按钮
   if(LAST_STATUS){
     renderOverview(LAST_STATUS);
     const rows=(USAGE.rows||[]).slice(0,10);
@@ -1713,7 +1718,7 @@ function loadOverview(){
     }).join(''):'<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
   }).catch(()=>{});
 }
-document.getElementById('btn-refresh-top').onclick=()=>{loadStatus();loadOverview();};
+document.getElementById('btn-refresh-top').onclick=()=>{loadStatus();loadOverview();loadEstimate(true);};
 
 /* ── 启动 ── */
 function gateHidden(){return document.getElementById('gate').classList.contains('hidden');}
