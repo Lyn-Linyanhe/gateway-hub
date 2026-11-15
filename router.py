@@ -801,6 +801,15 @@ def normalize_qoder(a):
     }
 
 
+def _buddy_realm(domain):
+    """千问办公账号的区域：引擎只给域名（qwenwork 行的 domain 形如
+    gateway.qwenwork.cn），按后缀判国内/国际；没有域名就返回 None（显示 —）。"""
+    d = str(domain or "").strip().lower()
+    if not d:
+        return None
+    return "cn" if d.endswith(".cn") else "intl"
+
+
 def normalize_buddy(a):
     # Buddy2api 账号行的快照来自刷新流程，而 qwenwork 的刷新令牌被官方客户端
     # 设备绑定、续期必被拒，快照永远是 0；真实余额走 /admin/accounts/{id}/resources
@@ -824,7 +833,8 @@ def normalize_buddy(a):
         "checked_in": None,
         "can_checkin": True,
         "can_daily_chat": None,
-        "realm": None,
+        "realm": _buddy_realm(a.get("domain")),
+        "domain": a.get("domain"),
         "streak": None,
     }
 

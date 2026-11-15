@@ -183,7 +183,13 @@ td.num,th.num{text-align:right}
   </div>
 
   <div id="view-accounts" class="view">
-    <div class="pagetitle">账号</div><div class="pagesub">三平台账号池统一视图；签到调度仍在各引擎内自动运行。</div>
+    <div class="pagetitle">账号</div><div class="pagesub">三平台账号池统一视图；区域标签按引擎返回的 realm（千问办公按登录域名后缀判定）。签到调度仍在各引擎内自动运行。</div>
+    <div class="toolbar" style="margin-bottom:12px">
+      <select id="acc-realm-filter" class="btn sec" style="min-height:34px">
+        <option value="">全部区域</option><option value="cn">仅国内版</option><option value="intl">仅国际版</option>
+      </select>
+      <span class="sub" id="acc-realm-counts"></span>
+    </div>
     <div id="platforms"></div>
   </div>
 
@@ -751,6 +757,8 @@ document.getElementById('btn-model-showall').onclick=()=>setModelVisible({visibl
 document.getElementById('model-search').oninput=renderModels;
 document.getElementById('model-filter').onchange=renderModels;
 document.getElementById('model-visfilter').onchange=renderModels;
+// 账号页区域筛选：只重排已有数据，不额外请求（30s 轮询会带着最新池子重绘）
+document.getElementById('acc-realm-filter').onchange=()=>{ if(ACC_PLATFORMS) renderPlatforms(ACC_PLATFORMS); };
   document.getElementById('usage-model').onchange=()=>{UPAGE=1;renderUsage();};
   document.getElementById('usage-account').onchange=()=>{UPAGE=1;renderUsage();};
   document.getElementById('usage-key').onchange=()=>{UPAGE=1;renderUsage();};
@@ -806,9 +814,28 @@ function renderOverview(d){
     <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">可代执行平台</div></div>
     <div class="kpi"><div class="label">各平台余额</div><div class="num" style="font-size:15px;line-height:1.9">${d.platforms.map(p=>`<div>${esc(PLATFORM_LABEL[p.name]||p.name)}: <b style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${p.accounts.some(a=>a.remain===null)?'见客户端':fmt(p.accounts.reduce((s,a)=>s+(a.remain||0),0))}</b></div>`).join('')}</div><div class="note">口径互不相同，不做加总</div></div>`;
 }
+let ACC_PLATFORMS=null;                 // 账号页最近一次数据：切换区域筛选时复用，不重新请求
+const REALM_LABEL={cn:'国内版',intl:'国际版'};
+function realmPill(a){
+  if(a.realm==='cn')  return `<span class="realmtag cn" title="${esc(a.domain||'引擎返回 realm=cn')}">国内版</span>`;
+  if(a.realm==='intl')return `<span class="realmtag intl" title="${esc(a.domain||'引擎返回 realm=intl')}">国际版</span>`;
+  return '<span class="pill gray" title="上游未返回区域信息">—</span>';
+}
 function renderPlatforms(platforms){
+  ACC_PLATFORMS=platforms;
+  const sel=document.getElementById('acc-realm-filter');
+  const rf=sel?sel.value:'';   // ''=全部 / cn / intl
+  // 顶部合计：一眼看清池子构成（国内/国际/未标注）
+  const allAcc=(platforms||[]).flatMap(p=>p.accounts||[]);
+  const cN=allAcc.filter(a=>a.realm==='cn').length, iN=allAcc.filter(a=>a.realm==='intl').length;
+  const uN=allAcc.length-cN-iN;
+  const cnt=document.getElementById('acc-realm-counts');
+  if(cnt) cnt.textContent=`国内版 ${cN} · 国际版 ${iN}`+(uN?` · 未标注 ${uN}`:'');
   document.getElementById('platforms').innerHTML=platforms.map(p=>{
-    const rows=p.accounts.map(a=>{
+    const full=p.accounts||[];
+    const pcn=full.filter(a=>a.realm==='cn').length, pintl=full.filter(a=>a.realm==='intl').length;
+    const accs=rf?full.filter(a=>a.realm===rf):full;
+    const rows=accs.map(a=>{
       const unknown=a.remain===null;
       const pct=!unknown&&a.size?Math.min(100,a.remain/a.size*100):0;
       // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡
@@ -838,12 +865,13 @@ function renderPlatforms(platforms){
         :(a.size===null?'<span class="pill green">'+fmt(a.remain)+'</span>'
         :`<span class="bar"><i class="${pct<25?'low':''}" style="width:${pct}%"></i></span>${esc(a.pct||pct.toFixed(1)+'%')}`);
       return `<tr><td class="name-cell">${esc(a.name)}<div class="sub-cell">${esc(a.sub||'')}</div></td>
+        <td>${realmPill(a)}</td>
         <td class="num">${creditCell}</td>
         <td>${barCell}</td>
         <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
     }).join('');
-    const rem=p.accounts.reduce((s,a)=>s+(a.remain||0),0);
-    const allUnknown=p.accounts.length>0&&p.accounts.every(a=>a.remain===null);
+    const rem=full.reduce((s,a)=>s+(a.remain||0),0);
+    const allUnknown=full.length>0&&full.every(a=>a.remain===null);
     return `<div class="card">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
         <span class="name-cell" style="font-size:14px">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
@@ -851,11 +879,11 @@ function renderPlatforms(platforms){
         <span class="pill ${p.inflight?'indigo':'gray'}" title="经网关的当前在飞推理请求（流式算到流写完）；直连引擎的请求不计入">并发 ${p.inflight||0}</span>
         <span class="sub-cell mono">${esc(p.base_url)}</span>
         <span style="flex:1"></span>
-        <span class="sub-cell">${p.accounts.length} 账号 · ${allUnknown?'余额以官方客户端为准':fmt(rem)+' 分'}</span>
+        <span class="sub-cell">${full.length} 账号 · 国内 ${pcn} / 国际 ${pintl}${rf?` · 筛选中 ${accs.length}`:''} · ${allUnknown?'余额以官方客户端为准':fmt(rem)+' 分'}</span>
         <button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>
       </div>
-      ${rows?`<div class="tblwrap"><table><thead><tr><th>账号</th><th class="num">积分</th><th>余量</th><th>签到</th><th>并发</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
-        :`<div class="empty">${p.error?esc(p.error):'该平台暂无账号'}</div>`}
+      ${rows?`<div class="tblwrap"><table><thead><tr><th>账号</th><th>区域</th><th class="num">积分</th><th>余量</th><th>签到</th><th>并发</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
+        :`<div class="empty">${p.error?esc(p.error):(rf?'该平台暂无'+REALM_LABEL[rf]+'账号':'该平台暂无账号')}</div>`}
     </div>`;
   }).join('');
   document.querySelectorAll('#platforms [data-checkin]').forEach(b=>b.onclick=()=>doCheckin(b.dataset.checkin,b));
