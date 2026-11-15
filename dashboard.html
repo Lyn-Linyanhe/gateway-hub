@@ -489,19 +489,36 @@ function firstBrief(res){
   const ks=Object.keys(res).slice(0,6).join(', ');
   return ks||JSON.stringify(res).slice(0,140);
 }
-/* 签到响应摘要：wb 是 {ok, result:{cn_checkin, intl_daily_chat}}；各引擎形状不一，
-   优先认 results 数组（成功数 + 其中「今日已完成」数），其余按常见字段名探底 */
+/* 签到响应摘要：wb 是 {ok, result:{cn_checkin, intl_daily_chat}}；qoder 是
+   {ok, result:{results:[...], accounts:[...]}}。只把**带 ok 字段的数组**当
+   账号结果行（qoder 的 accounts 是附带清单），其余按常见字段名探底。
+   旧实现只认 v.results，qoder 的顶层 results 数组被 firstBrief 兜底成
+   "results: 0, 1 · accounts: 0, 1"——签到成功也看不懂。 */
 function briefForCheckin(r){
   const res=(r&&r.result&&typeof r.result==='object')?r.result:r;
   const parts=[];
+  const looksRows=arr=>Array.isArray(arr)&&arr.some(x=>x&&typeof x==='object'&&('ok'in x));
   for(const [k,v] of Object.entries(res||{})){
     if(k==='ok') continue;
-    const label={cn_checkin:'国内',intl_daily_chat:'国际打卡'}[k]||k;
+    const label={cn_checkin:'国内',intl_daily_chat:'国际打卡',results:'签到'}[k]||k;
     if(!(v&&typeof v==='object')){ parts.push(label+': '+v); continue; }
-    if(Array.isArray(v.results)){
-      const okN=v.results.filter(x=>x&&x.ok).length;
-      const done=v.results.filter(x=>x&&(x.state==='already'||/已签|已完成|已领取|已打卡/.test(String(x.msg||'')))).length;
-      parts.push(`${label}: ${okN}/${v.results.length} 成功`+(done?`（${done} 个今日已完成）`:''));
+    const raw=looksRows(v)?v:(looksRows(v.results)?v.results:null);
+    if(raw){
+      // 成功数 + 真正到账的积分 + 「今日已完成」+ 下次窗口：
+      // 只报「N/N 成功」会让「今天早就领过了」看起来像点了个寂寞
+      const rows=raw.filter(x=>x&&typeof x==='object');
+      const okN=rows.filter(x=>x.ok).length;
+      const done=rows.filter(x=>x.state==='already'
+        ||/已签|已完成|已领取|已打卡/.test(String(x.message||x.msg||''))).length;
+      const earned=rows.reduce((s,x)=>s+(Number(x.earned_credit)||0),0);
+      const nxt=rows.map(x=>x.next_available_note).find(Boolean);
+      let seg=`${label}: ${okN}/${rows.length} 成功`;
+      if(earned>0) seg+=` · +${earned} 积分`;
+      else if(done) seg+=`（${done} 个今日已完成）`;
+      if(nxt&&!earned) seg+=` · 下次 ${nxt}`;
+      parts.push(seg);
+    } else if(Array.isArray(v)){
+      continue;   // 附带清单（如 qoder accounts），不是结果行
     } else if(v.skipped){ parts.push(label+': '+(v.msg||'已全部完成，跳过')); }
     else if(typeof v.msg==='string'&&v.msg){ parts.push(label+': '+v.msg); }
     else parts.push(label+': '+firstBrief(v));

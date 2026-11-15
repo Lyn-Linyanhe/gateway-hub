@@ -1032,6 +1032,27 @@ CHECKIN_PATHS = {
 }
 
 
+def _checkin_tally(result):
+    """从签到响应里抽出 (成功账号数, 账号总数)，抽不到返回 None。
+
+    各引擎形状不同：wb 是 {cn_checkin:{results:[...]}, intl_daily_chat:{...}}，
+    qoder 直接是 {results:[...]}。全部失败时顶层 ok 必须给 false——旧实现
+    恒定 ok=True，账号 token 全失效时前端仍弹「签到成功」，掩盖真实故障。
+    """
+    if not isinstance(result, dict):
+        return None
+    groups = []
+    if isinstance(result.get("results"), list):
+        groups.append(result["results"])
+    for value in result.values():
+        if isinstance(value, dict) and isinstance(value.get("results"), list):
+            groups.append(value["results"])
+    rows = [row for group in groups for row in group if isinstance(row, dict)]
+    if not rows:
+        return None
+    return sum(1 for row in rows if row.get("ok")), len(rows)
+
+
 def tail_log(lines=120):
     try:
         with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
@@ -1479,8 +1500,19 @@ class Handler(BaseHTTPRequestHandler):
                 intl_part = {"error": f"{type(exc).__name__}: {exc}"}
         if intl_part is not None:
             result = {"cn_checkin": result, "intl_daily_chat": intl_part}
+        # 顶层 ok 必须反映账号级成败：全部失败时不能回「签到成功」
+        tally = _checkin_tally(result)
+        nested_error = isinstance(result, dict) and any(
+            isinstance(v, dict) and v.get("error") for v in result.values())
+        failed = isinstance(result, dict) and (bool(result.get("error")) or nested_error)
+        ok = (tally[0] > 0) if tally else not failed
         log(f"checkin[{name}] -> {json.dumps(result, ensure_ascii=False)[:200]}")
-        self._send_json(200, {"ok": True, "platform": name, "result": result})
+        payload = {"ok": ok, "platform": name, "result": result}
+        if tally:
+            payload["checked"], payload["total"] = tally
+        if not ok:
+            payload["error"] = "签到失败：所有账号均未成功"
+        self._send_json(200, payload)
 
     # ---- 任务中心（成长任务 / 猫猫旅行 / 福利领取，代理到各引擎） ----
 
