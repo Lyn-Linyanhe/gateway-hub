@@ -812,8 +812,13 @@ function renderExpiring(rows){
 function renderOverview(d){
   renderExpiring(d.expiring||[]);
   const cards=d.platforms.map(p=>{
-    const rem=p.accounts.reduce((s,a)=>s+(a.remain||0),0);
+    // 只算启用账号：停用账号不参与调度，且千问的两个账号可能读同一钱包
+    const rem=p.accounts.reduce((s,a)=>s+(a.enabled?(a.remain||0):0),0);
     const n=p.accounts.length;
+    const mism=p.accounts.filter(a=>a.identity_mismatch).length;
+    const meta=mism
+      ? `<span style="color:var(--orange)">${mism} 个账号身份异常（token 与资料不一致）</span>`
+      : (p.error?esc(p.error):'账号池聚合正常');
     return `<div class="realmcard">
       <div style="display:flex;align-items:center;gap:8px">
         <span class="realmtag ${p.name==='qoder'?'intl':'cn'}">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
@@ -821,7 +826,7 @@ function renderOverview(d){
         <span class="pill ${p.health?'green':'red'}" style="margin-left:auto">${p.health?'在线':'离线'}</span>
       </div>
       <div class="realmnum" style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${fmt(rem)} <span class="of">剩余积分</span></div>
-      <div class="realmmeta">${n} 个账号 · ${p.error?esc(p.error):'账号池聚合正常'}</div>
+      <div class="realmmeta">${n} 个账号 · ${meta}</div>
     </div>`;
   }).join('');
   document.getElementById('realm-cards').innerHTML=cards;
@@ -857,7 +862,10 @@ function renderPlatforms(platforms){
       // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡
       const punched=intlPunched(a);
       const ck=(a.realm==='intl')
-        ?(punched?'<span class="pill green" title="'+esc(a.last_daily_chat||'')+'">今日已打卡</span>'
+        ?(punched
+          ?(a.daily_chat_verified===false
+            ?'<span class="pill orange" title="引擎已记今日完成，但今天没有跑完网页通道；每日活跃积分未确认到账">已打卡未计费</span>'
+            :'<span class="pill green" title="'+esc(a.last_daily_chat||'')+'">今日已打卡</span>')
           :(a.daily_chat_error
             ?'<span class="pill red" title="'+esc(a.daily_chat_error)+'">打卡失败</span>'
             :'<span class="pill orange">待打卡</span>'))
@@ -883,13 +891,17 @@ function renderPlatforms(platforms){
       const barCell=unknown?'<span class="sub-cell">快照不可用（刷新令牌被官方客户端绑定）</span>'
         :(a.size===null?'<span class="pill green">'+fmt(a.remain)+'</span>'
         :`<span class="bar"><i class="${pct<25?'low':''}" style="width:${pct}%"></i></span>${esc(a.pct||pct.toFixed(1)+'%')}`);
-      return `<tr><td class="name-cell">${esc(a.name)}<div class="sub-cell">${esc(a.sub||'')}</div></td>
+      const idw=a.identity_mismatch;
+      const warn=idw?`<span class="pill orange" title="${esc((idw&&idw.message)||'客户端身份与 token 不一致')}">身份异常</span>`:'';
+      return `<tr><td class="name-cell">${esc(a.name)} ${warn}<div class="sub-cell">${esc(a.sub||'')}</div></td>
         <td>${realmPill(a)}</td>
         <td class="num">${creditCell}</td>
         <td>${barCell}</td>
-        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`:''}${(a.realm==='intl'&&!punched&&a.daily_chat_error)?`<div class="sub-cell" title="${esc(a.daily_chat_error)}">${esc(String(a.daily_chat_error).slice(0,46))}${String(a.daily_chat_error).length>46?'…':''}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
+        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?(a.daily_chat_verified===false
+          ?`<div class="sub-cell">网页通道未完成，积分未确认</div>`
+          :`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`):''}${(a.realm==='intl'&&!punched&&a.daily_chat_error)?`<div class="sub-cell" title="${esc(a.daily_chat_error)}">${esc(String(a.daily_chat_error).slice(0,46))}${String(a.daily_chat_error).length>46?'…':''}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
     }).join('');
-    const rem=full.reduce((s,a)=>s+(a.remain||0),0);
+    const rem=full.reduce((s,a)=>s+(a.enabled?(a.remain||0):0),0);
     const allUnknown=full.length>0&&full.every(a=>a.remain===null);
     return `<div class="card">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">

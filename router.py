@@ -875,10 +875,17 @@ def normalize_buddy(a):
         size = _num(limit) if limit is not None else None
     else:
         remain, size = None, None
+    acct_type = str(a.get("account_type") or "")
+    org = str(a.get("org_name") or "")
+    plan = str(a.get("plan_name") or "")
+    if acct_type == "enterprise":
+        sub = "企业 · " + (org or plan or "企业版")
+    else:
+        sub = "个人" + ((" · " + plan) if plan else "")
     return {
         "uid": a.get("id"),
         "name": a.get("nickname") or a.get("name") or str(a.get("id")),
-        "sub": a.get("provider", ""),
+        "sub": sub,
         "enabled": a.get("status") == "active",
         "remain": remain,
         "size": size,
@@ -888,6 +895,12 @@ def normalize_buddy(a):
         "can_daily_chat": None,
         "realm": _buddy_realm(a.get("domain")),
         "domain": a.get("domain"),
+        "account_type": acct_type,
+        "enterprise_id": a.get("enterprise_id") or "",
+        "org_name": org,
+        "plan_name": plan,
+        # 引擎导入时发现「资料是企业、token 是个人」会写这条；页面据此提示
+        "identity_mismatch": a.get("identity_mismatch"),
         "streak": None,
     }
 
