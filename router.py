@@ -157,21 +157,17 @@ def upstream_models(up):
 # ---------------------------------------------------------------------------
 
 _wb_realm_lock = threading.Lock()
-_wb_realm_cache = {"ts": 0.0, "meta": {}}
+_wb_realm_cache = {"ts": 0.0, "meta": {}, "refreshing": False}
 
 # 与 wb 引擎 wb_proxy.INTL_MODEL_ALIASES 保持一致：国际版出口对老 id 的改名
 # 映射（引擎转发时自动重写为上游真名，客户端和目录始终用逻辑 id）。
 WB_INTL_ALIAS = {"deepseek-v4.1-flash": "deepseek-v4.1-flash-sg"}
 
 
-def _wb_realm_meta():
-    """workbuddy 双区目录元数据（15s 缓存）：{模型id: {"realms": [...], "pro": [...]}}。"""
-    now = time.time()
-    with _wb_realm_lock:
-        if now - _wb_realm_cache["ts"] < 15 and _wb_realm_cache["meta"]:
-            return _wb_realm_cache["meta"]
-    up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
+def _wb_realm_fetch(up):
+    """拉双区目录并写缓存；全部分区都失败时保留旧 meta（只推进 ts）。"""
     meta = {}
+    ok_any = False
     if up:
         for realm in ("cn", "intl"):
             try:
@@ -180,6 +176,7 @@ def _wb_realm_meta():
                     headers=_upstream_headers(up))
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                ok_any = True
                 for m in (data.get("data") or []):
                     mid = m.get("id")
                     if not mid:
@@ -192,26 +189,43 @@ def _wb_realm_meta():
                 log(f"wb 分区目录[{realm}] 拉取失败: {type(exc).__name__}: {exc}")
                 continue  # 分区目录拉不到就当未知：不标注、不隐藏、不注入区域
     with _wb_realm_lock:
-        _wb_realm_cache["ts"] = now
-        _wb_realm_cache["meta"] = meta
+        _wb_realm_cache["ts"] = time.time()
+        if ok_any:
+            _wb_realm_cache["meta"] = meta
+        _wb_realm_cache["refreshing"] = False
     return meta
 
 
-_wb_state_lock = threading.Lock()
-_wb_state_cache = {"ts": 0.0, "state": {}}
+def _wb_realm_meta():
+    """workbuddy 双区目录元数据（15s 缓存，过期后台刷新）。
 
-
-def _wb_pool_state():
-    """wb 账号池概览（60s 缓存）：各区临期包紧迫度 + 是否有付费账号。
-
-    {"realms": {realm: {"min_days_left", "expiring_remain", "paid"}},
-     "paid_any": bool} —— 供双区模型出口选择与 PRO 锁定判定共用。
+    这份元数据在 /v1/chat 的路由热路径上（决定 X-Realm）。旧实现过期时**同步**
+    拉 /v1/models?realm=cn+intl（实测 ~80ms，引擎忙时更久），等于每 15s 卡一个
+    请求的首字。改成 stale-while-revalidate：过期先用手上的旧值，后台单飞刷新
+    （模型增删晚 15s 生效不影响正确性）。
     """
     now = time.time()
-    with _wb_state_lock:
-        if now - _wb_state_cache["ts"] < 60:
-            return _wb_state_cache["state"]
+    with _wb_realm_lock:
+        if _wb_realm_cache["meta"] and now - _wb_realm_cache["ts"] < 15:
+            return _wb_realm_cache["meta"]
+        stale = _wb_realm_cache["meta"]
+        start = bool(stale) and not _wb_realm_cache["refreshing"]
+        if start:
+            _wb_realm_cache["refreshing"] = True
     up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
+    if stale:
+        if start and up:
+            threading.Thread(target=_wb_realm_fetch, args=(up,), daemon=True).start()
+        return stale
+    return _wb_realm_fetch(up)  # 首次启动：没有旧值，只能同步拉一次
+
+
+_wb_state_lock = threading.Lock()
+_wb_state_cache = {"ts": 0.0, "state": {}, "refreshing": False}
+
+
+def _wb_pool_fetch(up):
+    """拉 /accounts?realm=all 并写池状态缓存；拉不到沿用上次结果。"""
     state = {"realms": {}, "paid_any": False}
     if up:
         try:
@@ -241,9 +255,33 @@ def _wb_pool_state():
         except Exception:
             state = _wb_state_cache.get("state") or state  # 拉不到沿用上次结果
     with _wb_state_lock:
-        _wb_state_cache["ts"] = now
+        _wb_state_cache["ts"] = time.time()
         _wb_state_cache["state"] = state
+        _wb_state_cache["refreshing"] = False
     return state
+
+
+def _wb_pool_state():
+    """wb 账号池概览（60s 缓存，过期后台刷新）：各区临期包紧迫度 + 是否有付费账号。
+
+    {"realms": {realm: {"min_days_left", "expiring_remain", "paid"}},
+     "paid_any": bool} —— 供双区模型出口选择与 PRO 锁定判定共用。
+    与 _wb_realm_meta 同理走 stale-while-revalidate：过期不阻塞请求首字。
+    """
+    now = time.time()
+    with _wb_state_lock:
+        if now - _wb_state_cache["ts"] < 60:
+            return _wb_state_cache["state"]
+        stale = _wb_state_cache["state"]
+        start = bool(stale) and not _wb_state_cache["refreshing"]
+        if start:
+            _wb_state_cache["refreshing"] = True
+    up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
+    if stale:
+        if start and up:
+            threading.Thread(target=_wb_pool_fetch, args=(up,), daemon=True).start()
+        return stale
+    return _wb_pool_fetch(up)
 
 
 def _wb_paid_any():
@@ -1418,6 +1456,8 @@ class Handler(BaseHTTPRequestHandler):
                 client_h["X-Realm"] = realm
                 log(f"wb 分区路由: {upstream_model} -> {realm}")
 
+        t_route = time.time()
+
         # 平台在飞计数：从发起到响应体写完（流式 = 整个流）都算
         with _platform_inflight(up["name"]):
             try:
@@ -1432,13 +1472,15 @@ class Handler(BaseHTTPRequestHandler):
             if stream and not isinstance(result, (bytes, bytearray)):
                 return self._relay_stream(status, headers, result, client_facing, up,
                                           t0=t0, t_head=time.time(), label=model,
-                                          t_parse=t_parse, t_payload=t_payload)
+                                          t_parse=t_parse, t_payload=t_payload,
+                                          t_route=t_route)
             return self._relay_json(status, headers, result, client_facing)
 
     # ---- 转发实现 ----
 
     def _relay_stream(self, status, headers, chunks, client_facing, up,
-                      t0=None, t_head=None, label="", t_parse=None, t_payload=None):
+                      t0=None, t_head=None, label="", t_parse=None, t_payload=None,
+                      t_route=None):
         self.send_response(status)
         ctype = headers.get("Content-Type", "text/event-stream")
         self.send_header("Content-Type", ctype)
@@ -1493,10 +1535,12 @@ class Handler(BaseHTTPRequestHandler):
             first_ms = int((first_data_at - t0) * 1000) if first_data_at else -1
             parse_ms = int((t_parse - t0) * 1000) if t_parse else -1
             body_ms = int((t_payload - t_parse) * 1000) if (t_payload and t_parse) else -1
-            # 首字拆解：parse=读 body+JSON 解析，body=重新序列化，head=解析+引擎响应头，
-            # first=第一个 data: 块，total=整条流
+            route_ms = int((t_route - t_payload) * 1000) if (t_route and t_payload) else -1
+            # 首字拆解：parse=读 body+JSON 解析，body=重新序列化，route=双区/账号池
+            # 路由判定，head=解析+引擎响应头，first=第一个 data: 块，total=整条流
             log(f"timing {label} head={head_ms}ms first={first_ms}ms "
-                f"parse={parse_ms}ms body={body_ms}ms total={total_ms}ms")
+                f"parse={parse_ms}ms body={body_ms}ms route={route_ms}ms "
+                f"total={total_ms}ms")
 
     def _relay_json(self, status, headers, data, client_facing):
         if status >= 400:
