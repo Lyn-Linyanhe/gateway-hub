@@ -177,7 +177,7 @@ td.num,th.num{text-align:right}
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
-      <h3>额度可用量预估 <span class="sub">按最近 24 小时实测单价折算；千问 flash 按 90% 缓存命中估算，副行给出 0% 缓存下限</span></h3>
+      <h3>额度可用量预估 <span class="sub">按最近 24 小时实测单价折算；千问带缓存的模型按 90% 命中估算，副行给出 0% 缓存下限</span></h3>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr>
           <th>平台</th><th class="num">余额</th><th>模型</th><th class="num">预计 token 数量</th>
@@ -1270,7 +1270,7 @@ function renderEstimate(){
       continue;
     }
     models.forEach((m,i)=>{
-      const range=(m.est_tokens_nocache!=null&&m.est_tokens!=null)
+      const range=(m.est_tokens_nocache!=null&&m.est_tokens!=null&&m.est_tokens_nocache!==m.est_tokens)
         ?`<div class="sub-cell">0% 缓存下限 ${fmtTok(m.est_tokens_nocache)}</div>`
         :(m.cache_assumed?`<div class="sub-cell">按 ${Math.round((m.cache_hit_rate||0)*100)}% 缓存命中估算</div>`:'');
       html+=`<tr>${i===0

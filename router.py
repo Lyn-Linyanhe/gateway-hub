@@ -908,6 +908,18 @@ def normalize_buddy(a):
 NORMALIZERS = {"workbuddy": normalize_wb, "qoder": normalize_qoder, "qwenwork": normalize_buddy}
 
 
+def _signable_account(a):
+    """这个账号今天是否有「每日一次」的动作要完成。
+
+    wb 国内/qoder 看 checked_in 是否有值（签到体系存在），wb 国际看活跃打卡
+    资格；qwenwork 的 checked_in 恒为 None（上游自动发放），不计入分母。
+    qoder 签完后 canCheckin 会变 false，所以不能用 can_checkin 判分母。
+    """
+    if a.get("realm") == "intl" and a.get("can_daily_chat"):
+        return True
+    return a.get("checked_in") is not None
+
+
 # ---------------------------------------------------------------------------
 # 上游版本更新检测：qoder/buddy 走 GitHub Releases 的 302 跳转（HEAD 请求拿
 # 最终 URL 里的 tag，不吃 API 60次/小时的匿名配额）；workbuddy 用引擎自带的
@@ -1089,31 +1101,38 @@ def platform_status(up):
                 row["concurrency_limit"] = limit
                 row["inflight"] = (int(snap.get(row.get("uid")) or 0)
                                    if limit is not None else None)
-            # 国际版待打卡账号：把今天最近一次 daily_chat 的失败原因带上，
-            # 看板才能区分「还没到点」和「打了但被上游拒绝」——后者只显示
-            # 一个「待打卡」会让人以为是显示 bug。
-            pending = [r for r in out["accounts"]
-                       if r.get("realm") == "intl" and r.get("enabled")
-                       and not r.get("daily_chatted_today")]
-            if pending:
+            # 国际版账号：区分「真跑了网页通道」和「只有桌面腿/旧标记」。
+            # 网页通道才是每日活跃积分认可的那一步，只凭 lastDailyChat 会
+            # 把「已盖章但没计费」显示成绿色的「今日已打卡」。
+            intl_rows = [r for r in out["accounts"] if r.get("realm") == "intl"]
+            if intl_rows:
                 try:
                     hist = engine_request(
-                        up, "GET", "/activity/history?range=today&task=daily_chat&limit=100")
+                        up, "GET", "/activity/history?range=today&task=daily_chat&limit=100",
+                        timeout=8)
                     rows = hist.get("rows") if isinstance(hist, dict) else []
                 except Exception:
                     rows = []
-                latest = {}
+                latest_ok, latest_bad = {}, {}
                 for hr in rows:  # 引擎按最新在前返回
                     if not isinstance(hr, dict):
                         continue
                     uid = str(hr.get("uid") or "")
-                    if uid and uid not in latest:
-                        latest[uid] = hr
-                for row in out["accounts"]:
-                    hit = latest.get(str(row.get("uid") or ""))
-                    if hit and not hit.get("ok"):
-                        row["daily_chat_error"] = str(hit.get("message") or "")[:240]
-                        row["daily_chat_error_at"] = hit.get("ts")
+                    if not uid:
+                        continue
+                    target = latest_ok if hr.get("ok") else latest_bad
+                    target.setdefault(uid, hr)
+                for row in intl_rows:
+                    uid = str(row.get("uid") or "")
+                    if row.get("daily_chatted_today"):
+                        okrow = latest_ok.get(uid)
+                        row["daily_chat_verified"] = bool(
+                            okrow and "网页通道" in str(okrow.get("message") or ""))
+                    else:
+                        bad = latest_bad.get(uid)
+                        if bad:
+                            row["daily_chat_error"] = str(bad.get("message") or "")[:240]
+                            row["daily_chat_error_at"] = bad.get("ts")
         elif name == "qwenwork":
             try:
                 st = engine_request(up, "GET", "/admin/settings", auth="none")
@@ -1193,6 +1212,34 @@ def platform_status(up):
 _estimate_lock = threading.Lock()
 _estimate_cache = {"ts": 0.0, "data": None}
 ESTIMATE_TTL = 120.0
+
+# qwenwork 各模型的实测单价（2026-11-16，柳业宏号，2k prompt 冷/热各一次）。
+# 千问的用量日志不带 cached_tokens，auto_multipliers 的 factor 是余额差÷token
+# 的混合均值，样本一小就会被冷请求和余额差噪声抬到几十倍（曾出现 ling 833 分/1M、
+# flash 554 分/1M）。这里按实测值固定下来，缓存命中用 hit_rate 假设，估算同时
+# 给出 0% 缓存下限。单位：分/千 token。
+QWEN_MODEL_RATES = {
+    "qwork-auto":      {"public": "flash",             "hit_per_ktok": 0.00159, "miss_per_ktok": 0.01562, "hit_rate": 0.90},
+    "ling-3.1-flash":  {"public": "ling-3.1-flash",    "hit_per_ktok": 0.004115,"miss_per_ktok": 0.004115,"hit_rate": 0.0},
+    "glm-5.3-flash":   {"public": "glm-5.3-flash",     "hit_per_ktok": 0.010425,"miss_per_ktok": 0.010425,"hit_rate": 0.0},
+    "deepseek-flash":  {"public": "deepseek-flash",    "hit_per_ktok": 0.02057, "miss_per_ktok": 0.02057, "hit_rate": 0.0},
+    "qwen3.8-flash":   {"public": "qwen3.8-flash",     "hit_per_ktok": 0.00444, "miss_per_ktok": 0.01521, "hit_rate": 0.90},
+    "qwen4-max":       {"public": "qwen4-max",         "hit_per_ktok": 0.00317, "miss_per_ktok": 0.05102, "hit_rate": 0.90},
+    "step-5-preview":  {"public": "step-5-preview",    "hit_per_ktok": 0.03197, "miss_per_ktok": 0.1009,  "hit_rate": 0.90},
+    "qwen3.8-max-preview": {"public": "qwen3.8-max-preview", "hit_per_ktok": 0.51554, "miss_per_ktok": 0.51554, "hit_rate": 0.0},
+}
+QWEN_RATE_BY_PUBLIC = {spec["public"]: spec for spec in QWEN_MODEL_RATES.values()}
+
+
+def _estimate_public_model(platform, model):
+    """引擎内部模型名 -> 网关公开 id，用于可见性过滤和展示。"""
+    if platform == "qwenwork":
+        spec = QWEN_MODEL_RATES.get(model)
+        if spec:
+            return spec["public"]
+        if model == "qwork-advanced":
+            return "auto"
+    return model
 
 
 def _estimate_rows(up):
@@ -1320,13 +1367,34 @@ def estimate_snapshot(force=False):
         for mname, ms in by_model.items():
             if ms["tokens"] < 1000 or ms["credit"] <= 0:
                 continue
-            rate_k = ms["credit"] / ms["tokens"] * 1000
+            if name == "qwenwork" and mname not in QWEN_MODEL_RATES:
+                continue  # 没实测过的千问模型不给数字，避免把噪声当单价
+            public = _estimate_public_model(name, mname)
+            if _model_hidden(name, public):
+                continue  # 隐藏/不可选的模型不该出现在「额度预估」里
+            spec = QWEN_MODEL_RATES.get(mname) if name == "qwenwork" else None
+            extra = {}
+            if spec:
+                rate_k = (spec["hit_rate"] * spec["hit_per_ktok"]
+                          + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
+                miss_k = spec["miss_per_ktok"]
+                extra = {"cache_hit_rate": spec["hit_rate"],
+                         "cache_assumed": True,
+                         "rate_nocache_per_ktok": round(miss_k, 6),
+                         "est_tokens_nocache": (int(balance / miss_k * 1000)
+                                                if (balance > 0 and miss_k > 0) else None)}
+            else:
+                rate_k = ms["credit"] / ms["tokens"] * 1000
             est_tok = (balance / rate_k * 1000) if (balance > 0 and rate_k > 0) else None
-            models.append({"model": mname, "tokens": int(ms["tokens"]),
-                           "rate_per_ktok": round(rate_k, 6),
-                           "est_tokens": int(est_tok) if est_tok else None})
-        models.sort(key=lambda x: -x["tokens"])
-        item["models"] = models[:6]
+            row = {"model": public, "tokens": int(ms["tokens"]),
+                   "rate_per_ktok": round(rate_k, 6),
+                   "est_tokens": int(est_tok) if est_tok else None}
+            row.update(extra)
+            models.append(row)
+        # 按「这个模型能跑多少 token」从多到少排：模型页是选型用的，
+        # 谁最耐用谁排前面；旧口径按采样 token 排会把刚测的小样本排到最后。
+        models.sort(key=lambda x: -(x.get("est_tokens") or 0))
+        item["models"] = models[:12]
         item.update({
             "rows": len(ats),
             "sample_hours": round(span_h, 1),
@@ -1803,11 +1871,13 @@ class Handler(BaseHTTPRequestHandler):
         platforms = [platform_status(up) for up in CONFIG["upstreams"]]
         # 「今日签到」KPI 把国际版活跃打卡也算进来：它没有签到动作，但同样
         # 是每天一次的收益；只统计 can_checkin 会让国际号永远不出现在分母里。
+        # 分子分母都走同一个资格判定，避免出现「5/4」这种 checked > checkable。
         checked = sum(1 for p in platforms for a in p["accounts"]
-                      if a["checked_in"] or a.get("daily_chatted_today"))
+                      if _signable_account(a)
+                      and (a["checked_in"] or (a.get("daily_chatted_today")
+                                               and a.get("daily_chat_verified") is not False)))
         checkable = sum(1 for p in platforms for a in p["accounts"]
-                        if (a["can_checkin"] and a["checked_in"] is not None)
-                        or (a.get("realm") == "intl" and a.get("can_daily_chat")))
+                        if _signable_account(a))
         # 即将过期积分聚合：跨平台不加总余额，但过期时间线是统一的时间轴，可排序
         expiring_all = []
         for p in platforms:
@@ -2346,11 +2416,37 @@ class Handler(BaseHTTPRequestHandler):
                 mult = {"factor": custom[full].get("factor"), "source": "manual",
                         "note": custom[full].get("note", ""),
                         "recorded_at": custom[full].get("recorded_at", "")}
-            if mult is None and full in auto:
-                ent = auto[full]
+            # 千问办公的公开 id `flash` 在引擎里实际路由到 qwork-auto，
+            # 自动倍率按引擎内部名记录；不做这层映射，模型页会把最便宜的
+            # 档位显示成「无单价」。
+            auto_key = ("qwenwork/qwork-auto"
+                        if x["platform"] == "qwenwork" and x["public"] == "flash"
+                        else full)
+            if mult is None and auto_key in auto:
+                ent = auto[auto_key]
                 mult = {"factor": ent.get("factor"), "source": "auto",
                         "samples": ent.get("samples"),
                         "credit": ent.get("credit"), "tokens": ent.get("tokens")}
+            # 千问的 auto 均值会被「冷请求 + 余额差噪声」抬高（实测出现过
+            # ling 833 分/1M、flash 554 分/1M）。有实测值的模型统一用实测
+            # 单价覆盖；没有实测值的模型不给 auto 数字，避免把噪声当单价。
+            if x["platform"] == "qwenwork":
+                spec = QWEN_RATE_BY_PUBLIC.get(x["public"])
+                if spec:
+                    rate_k = (spec["hit_rate"] * spec["hit_per_ktok"]
+                              + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
+                    miss_1m = spec["miss_per_ktok"] * 1000
+                    if spec["hit_rate"] > 0:
+                        note = (f"按 {int(spec['hit_rate'] * 100)}% 缓存命中实测估算；"
+                                f"0% 缓存 {miss_1m:.2f} 分/1M")
+                    else:
+                        note = f"实测无缓存 {miss_1m:.2f} 分/1M"
+                    mult = {"factor": rate_k / 1000.0, "source": "auto",
+                            "samples": 0, "credit": 0, "tokens": 0,
+                            "note": note}
+                else:
+                    if not (mult and mult.get("source") == "manual"):
+                        mult = None
             # 千问办公：把官方套餐名（标准/高级/Qwen4-Max 预览版…）并进展示名
             if x["platform"] == "qwenwork":
                 if qwen_names is None:
