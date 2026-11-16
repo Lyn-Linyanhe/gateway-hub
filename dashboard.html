@@ -177,7 +177,7 @@ td.num,th.num{text-align:right}
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
-      <h3>额度可用量预估 <span class="sub">按最近 24 小时实测单价折算；千问带缓存的模型按 90% 命中估算，副行给出 0% 缓存下限</span></h3>
+      <h3>额度可用量预估 <span class="sub">按官方目录单价折算（wb/qoder，未计缓存折扣）；千问按实测缓存假设（90% 命中，副行 0% 下限）。双区模型按它可用的分区余额计算</span></h3>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr>
           <th>平台</th><th class="num">余额</th><th>模型</th><th class="num">预计 token 数量</th>
@@ -1270,12 +1270,14 @@ function renderEstimate(){
       continue;
     }
     models.forEach((m,i)=>{
+      const scope=(m.balance_scope&&m.model_balance!=null)
+        ?`<div class="sub-cell">${esc(m.balance_scope)} · 可用 ${fmt(m.model_balance)} 分</div>`:'';
       const range=(m.est_tokens_nocache!=null&&m.est_tokens!=null&&m.est_tokens_nocache!==m.est_tokens)
         ?`<div class="sub-cell">0% 缓存下限 ${fmtTok(m.est_tokens_nocache)}</div>`
         :(m.cache_assumed?`<div class="sub-cell">按 ${Math.round((m.cache_hit_rate||0)*100)}% 缓存命中估算</div>`:'');
       html+=`<tr>${i===0
         ? `<td rowspan="${models.length}" style="vertical-align:top">${label}</td><td rowspan="${models.length}" class="num" style="vertical-align:top">${bal}</td>`
-        : ''}<td class="mono">${esc(m.model)}${range}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'—'}</td></tr>`;
+        : ''}<td class="mono">${esc(m.model)}${scope}${range}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'—'}</td></tr>`;
     });
   }
   tb.innerHTML=html||'<tr><td colspan="4" class="empty">暂无数据</td></tr>';

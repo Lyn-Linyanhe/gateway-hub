@@ -1290,6 +1290,23 @@ def estimate_snapshot(force=False):
         if hit and not force and now - _estimate_cache["ts"] < ESTIMATE_TTL:
             return hit
     auto = CONFIG.get("auto_multipliers") or {}
+    # 目录单价与分区：wb 的同一模型国内/国际是两个出口，余额也分池；
+    # 预估必须按模型可用分区取余额，不能一律用平台总额。
+    try:
+        cat_rows = public_catalog()
+    except Exception:
+        cat_rows = []
+    cat_info = {}
+    for x in cat_rows:
+        try:
+            mult = _row_multiplier(x["platform"], x["row"]) or {}
+        except Exception:
+            mult = {}
+        cat_info[(x["platform"], x["public"])] = {
+            "realms": list(x.get("realms") or []),
+            "factor": mult.get("factor"),
+            "valley": mult.get("valley"),
+        }
     qw_credit = sum(float(v.get("credit") or 0) for k, v in auto.items() if k.startswith("qwenwork/"))
     qw_tokens = sum(float(v.get("tokens") or 0) for k, v in auto.items() if k.startswith("qwenwork/"))
     qw_fallback = (qw_credit / qw_tokens * 1000) if qw_tokens > 0 else None
@@ -1303,7 +1320,13 @@ def estimate_snapshot(force=False):
             if a.get("enabled") and a.get("remain") is not None:
                 balance += float(a["remain"])
                 enabled += 1
+        realm_bal = {}
+        for a in accounts:
+            if a.get("enabled") and a.get("remain") is not None:
+                rk = a.get("realm") or "cn"
+                realm_bal[rk] = realm_bal.get(rk, 0.0) + float(a["remain"])
         item = {"name": name, "balance": round(balance, 2), "enabled": enabled,
+                "realm_balances": {k: round(v, 2) for k, v in realm_bal.items()},
                 "health": bool(st.get("health")), "error": st.get("error") or ""}
         exp_remain, soon_remain, pool_days, reset_days = 0.0, 0.0, None, None
         for x in (st.get("expiring") or []):
@@ -1372,23 +1395,51 @@ def estimate_snapshot(force=False):
             public = _estimate_public_model(name, mname)
             if _model_hidden(name, public):
                 continue  # 隐藏/不可选的模型不该出现在「额度预估」里
+            info = cat_info.get((name, public)) or {}
+            if not info:
+                # 上游会改名（如 Qwen4-Max-Preview → Qwen4-Max）：usage 里的
+                # 旧名匹配不到目录时按包含关系回退，避免退化成实测单价。
+                for (cp, cpub), ci in cat_info.items():
+                    if cp == name and cpub and (cpub in public or public in cpub):
+                        info = ci
+                        break
+            realms = info.get("realms") or []
+            model_balance, scope = balance, ""
+            if realms and realm_bal:
+                scoped = sum(realm_bal.get(r, 0.0) for r in realms)
+                if abs(scoped - balance) > 0.01:
+                    model_balance = scoped
+                    if len(realms) == 1:
+                        scope = "仅国际" if realms[0] == "intl" else "仅国内"
+                    else:
+                        scope = "双区合计"
             spec = QWEN_MODEL_RATES.get(mname) if name == "qwenwork" else None
             extra = {}
+            rate_src = "measured"
             if spec:
                 rate_k = (spec["hit_rate"] * spec["hit_per_ktok"]
                           + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
                 miss_k = spec["miss_per_ktok"]
+                rate_src = "cache_assumed"
                 extra = {"cache_hit_rate": spec["hit_rate"],
                          "cache_assumed": True,
                          "rate_nocache_per_ktok": round(miss_k, 6),
-                         "est_tokens_nocache": (int(balance / miss_k * 1000)
-                                                if (balance > 0 and miss_k > 0) else None)}
+                         "est_tokens_nocache": (int(model_balance / miss_k * 1000)
+                                                if (model_balance > 0 and miss_k > 0) else None)}
+            elif name in ("workbuddy", "qoder") and info.get("factor"):
+                # 用官方目录单价（分/千tok，wb 的 credits / qoder 的 price_factor）：
+                # 不随最近 24h 的缓存命中率漂移，是保守的「全价」口径。
+                rate_k = float(info["factor"])
+                rate_src = "catalog"
             else:
                 rate_k = ms["credit"] / ms["tokens"] * 1000
-            est_tok = (balance / rate_k * 1000) if (balance > 0 and rate_k > 0) else None
+            est_tok = (model_balance / rate_k * 1000) if (model_balance > 0 and rate_k > 0) else None
             row = {"model": public, "tokens": int(ms["tokens"]),
                    "rate_per_ktok": round(rate_k, 6),
-                   "est_tokens": int(est_tok) if est_tok else None}
+                   "est_tokens": int(est_tok) if est_tok else None,
+                   "rate_source": rate_src,
+                   "model_balance": round(model_balance, 2) if scope else None,
+                   "balance_scope": scope}
             row.update(extra)
             models.append(row)
         # 按「这个模型能跑多少 token」从多到少排：模型页是选型用的，
