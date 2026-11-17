@@ -177,7 +177,7 @@ td.num,th.num{text-align:right}
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
-      <h3>额度可用量预估 <span class="sub">按官方目录单价折算（wb/qoder，未计缓存折扣）；千问按实测缓存假设（90% 命中，副行 0% 下限）。双区模型按它可用的分区余额计算</span></h3>
+      <h3>额度可用量预估 <span class="sub">目录单价或已记录扣费样本估算；缓存假设与未知值会标注，非保证容量</span></h3>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr>
           <th>平台</th><th class="num">余额</th><th>模型</th><th class="num">预计 token 数量</th>
@@ -264,7 +264,7 @@ td.num,th.num{text-align:right}
         <span style="font-size:12px;color:var(--dim)">跨平台批量操作</span>
       </div>
       <div id="model-groups"></div>
-      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits；Qoder = price_factor（峰/谷）；千问办公目录不暴露单价，自动倍率按余额差累计实测。PRO 专属模型在账号池没有付费账号时自动从 /v1/models 隐藏（config.json hide_pro_locked）。</div>
+      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits；Qoder = price_factor（峰/谷）；千问办公目录不暴露单价，使用短样本参考价并标注缓存假设，不再按余额差自动推算。PRO 专属模型在账号池没有付费账号时自动从 /v1/models 隐藏（config.json hide_pro_locked）。</div>
     </div>
   </div>
 
@@ -314,10 +314,10 @@ td.num,th.num{text-align:right}
     <div id="usage-statview" class="hidden">
       <div id="usage-cache" class="usage-chart-grid"></div>
       <div class="card" style="margin-bottom:14px">
-        <h3>换算统计 <span class="sub">平台 × 模型 · 实扣口径：实测积分/千tok = 实扣积分 ÷ 总token × 1000；缓存命中会拉低实测值；「真实成本」仅 wb 上游提供</span></h3>
+        <h3>换算统计 <span class="sub">平台 × 模型 · 实扣口径：实测积分/千tok = 实扣积分 ÷ 总token × 1000；缓存命中会拉低实测值；「参考成本」仅 wb 上游提供</span></h3>
         <div class="tblwrap" style="margin-top:10px">
           <table><thead><tr>
-            <th>平台</th><th>模型</th><th class="num">请求</th><th class="num">总 tok</th><th class="num">实扣积分</th><th class="num">实测 积分/千tok</th><th class="num">目录倍率</th><th class="num">实测 ÷ 目录</th><th class="num">真实成本 ¥</th>
+            <th>平台</th><th>模型</th><th class="num">请求</th><th class="num">总 tok</th><th class="num">实扣积分</th><th class="num">实测 积分/千tok</th><th class="num">目录倍率</th><th class="num">倍率换算</th><th class="num">参考成本 ¥</th>
           </tr></thead><tbody id="usage-conv"><tr><td colspan="9" class="empty">—</td></tr></tbody></table>
         </div>
         <div class="sub" id="usage-conv-note" style="margin-top:8px"></div>
@@ -326,7 +326,7 @@ td.num,th.num{text-align:right}
         <h3>按模型汇总 <span class="sub">当前筛选范围</span></h3>
         <div class="tblwrap" style="margin-top:10px">
           <table><thead><tr>
-            <th>平台</th><th>模型</th><th class="num">次数</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">真实成本 ¥</th><th class="num">成功率</th>
+            <th>平台</th><th>模型</th><th class="num">次数</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">参考成本 ¥</th><th class="num">成功率</th>
           </tr></thead><tbody id="usage-permodel"><tr><td colspan="10" class="empty">—</td></tr></tbody></table>
         </div>
       </div>
@@ -513,8 +513,20 @@ function runOnce(key){
 function runDone(key){ RUNNING.delete(key); }
 /* 操作结果历史：全部自动化动作在这里留痕，可回看原始返回 */
 const TASK_HISTORY=[];
-function pushHistory(title, ok, brief, detail){
-  TASK_HISTORY.unshift({t:new Date().toLocaleTimeString('zh-CN',{hour12:false}), title, ok, brief, detail});
+function resultState(result){
+  if(result===true) return 'success';
+  if(result===false) return 'failed';
+  if(typeof result==='string') return result;
+  if(result?.partial) return 'partial';
+  if(result?.skipped||result?.result?.skipped) return 'skipped';
+  if(result?.ok===false||result?.error) return 'failed';
+  return result?.ok===true?'success':'unknown';
+}
+const RESULT_LABEL={success:'已执行',partial:'部分失败',failed:'失败',skipped:'已跳过',unknown:'结果未知'};
+const RESULT_COLOR={success:'green',partial:'orange',failed:'red',skipped:'gray',unknown:'gray'};
+function pushHistory(title, result, brief, detail){
+  const state=resultState(result);
+  TASK_HISTORY.unshift({t:new Date().toLocaleTimeString('zh-CN',{hour12:false}), title, state, brief, detail});
   if(TASK_HISTORY.length>40) TASK_HISTORY.pop();
   renderHistory();
 }
@@ -523,7 +535,7 @@ function renderHistory(){
   el.innerHTML=TASK_HISTORY.length?TASK_HISTORY.map(h=>`
     <div style="padding:8px 4px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
       <span class="sub-cell mono">${esc(h.t)}</span>
-      <span class="pill ${h.ok?'green':'red'}" style="flex-shrink:0">${h.ok?'成功':'失败'}</span>
+      <span class="pill ${RESULT_COLOR[h.state]||'gray'}" style="flex-shrink:0">${RESULT_LABEL[h.state]||'结果未知'}</span>
       <span style="font-weight:600">${esc(h.title)}</span>
       <span class="sub-cell" style="flex:1;min-width:220px;word-break:break-all">${esc(h.brief)}</span>
       ${h.detail?`<details style="flex-basis:100%"><summary class="sub-cell" style="cursor:pointer">原始返回</summary><pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;background:var(--panel2);border-radius:8px;padding:8px;margin-top:6px;max-height:220px;overflow:auto">${esc(h.detail)}</pre></details>`:''}
@@ -592,13 +604,35 @@ function intlPunched(a){
   if(a&&typeof a.daily_chatted_today==='boolean') return a.daily_chatted_today;
   return String((a&&a.last_daily_chat)||'').slice(0,10)===todayStr();
 }
+function requestPolicy(p,opt){
+  if((opt.method||'GET').toUpperCase()==='GET') return {read:true,views:[]};
+  if(p==='/api/engine'){
+    try{if(JSON.parse(opt.body||'{}').method==='GET') return {read:true,views:[]};}catch(e){}
+  }
+  const views=p.startsWith('/api/models/')?['models','overview','usage']
+    :p==='/api/gwconfig'?['settings','models','overview']
+    :['accounts','overview','auto','usage'];
+  return {read:false,views};
+}
+const API_PENDING=new Map();
 async function api(p, opt={}) {
-  // 合并而非覆盖：调用方传 Content-Type 时不能把 Authorization 冲掉
-  //（曾导致所有带 body 的写操作按钮统一 401）。
-  const headers = Object.assign({'Authorization': 'Bearer ' + KEY()}, opt.headers||{});
-  const r = await fetch(p, {...opt, headers});
-  if (r.status === 401) { localStorage.removeItem('gh_key'); const err = new Error('401 请重新输入控制台 Key'); err.status = 401; showGate(); throw err; }
-  return r.json();
+  const policy=requestPolicy(p,opt), read=policy.read;
+  const key=KEY();
+  const requestKey=key+' '+p+' '+(opt.body||'');
+  if(read&&API_PENDING.has(requestKey)) return API_PENDING.get(requestKey);
+  const request=(async()=>{
+    const headers=Object.assign({'Authorization':'Bearer '+key},opt.headers||{});
+    const r=await fetch(p,{...opt,headers});
+    if(r.status===401){localStorage.removeItem('gh_key');const err=new Error('401 请重新输入控制台 Key');err.status=401;showGate();throw err;}
+    const data=await r.json();
+    if(!r.ok){const err=new Error(errMsg(data)||'HTTP '+r.status);err.status=r.status;throw err;}
+    if(read&&(data?.ok===false||data?.error)) throw new Error(errMsg(data)||'读取失败');
+    if(!read&&data?.ok===true) policy.views.forEach(view=>VIEW_LOADED.delete(view));
+    return data;
+  })();
+  if(read) API_PENDING.set(requestKey,request);
+  try{return await request;}
+  finally{if(read&&API_PENDING.get(requestKey)===request) API_PENDING.delete(requestKey);}
 }
 
 /* ── 门禁 ── */
@@ -606,17 +640,61 @@ async function tryGate(){
   const v=document.getElementById('gate-input').value.trim(); if(!v) return;
   localStorage.setItem('gh_key', v);
   try{ const r=await api('/api/ping'); if(r.ok){document.getElementById('gate').classList.add('hidden');loadAll();} }
-  catch(e){ if(e.status!==401){document.getElementById('gate-err').style.display='block';localStorage.removeItem('gh_key');} }
+  catch(e){ document.getElementById('gate-err').style.display='block'; document.getElementById('gate-err').textContent=e.message; localStorage.removeItem('gh_key'); }
 }
 document.getElementById('gate-btn').onclick=tryGate;
 document.getElementById('gate-input').addEventListener('keydown',e=>{if(e.key==='Enter')tryGate();});
 
 /* ── 视图切换 ── */
 const LOADERS={overview:loadOverview, accounts:loadStatus, add:null, models:loadModels, usage:loadUsage, auto:autoView, settings:loadSettings, logs:loadLogs};
+const VIEW_LOADED=new Map(), VIEW_PENDING=new Map(), VIEW_STATE=new Map();
+let navigationVersion=0;
+function renderViewState(view){
+  const host=document.getElementById('view-'+view);
+  if(!host) return;
+  let row=document.getElementById('load-state-'+view);
+  if(!row){row=document.createElement('div');row.id='load-state-'+view;row.className='sub';row.setAttribute('role','status');row.style.marginBottom='10px';host.prepend(row);}
+  const state=VIEW_STATE.get(view)||{};
+  const last=VIEW_LOADED.get(view);
+  row.innerHTML=(state.loading?'加载中…':state.error?'加载失败：'+esc(state.error):'已更新')
+    +(last?' · 上次成功 '+new Date(last).toLocaleTimeString():' · 尚无成功更新')
+    +(state.error?' <button class="btn sec mini" data-retry>重试</button>':'');
+  const retry=row.querySelector('[data-retry]');
+  if(retry) retry.onclick=()=>refreshView(view,true);
+}
+function viewFailure(view,error){
+  const state=VIEW_STATE.get(view)||{};
+  VIEW_STATE.set(view,{...state,error:error.message||String(error)});
+  renderViewState(view);
+  return false;
+}
+function refreshView(view, force=false){
+  const fn=LOADERS[view];
+  if(!fn) return Promise.resolve(true);
+  if(VIEW_PENDING.has(view)) return VIEW_PENDING.get(view);
+  if(!force&&!VIEW_STATE.get(view)?.error&&Date.now()-(VIEW_LOADED.get(view)||0)<15000) return Promise.resolve(true);
+  VIEW_STATE.set(view,{loading:true,error:null});renderViewState(view);
+  const request=Promise.resolve().then(fn).then(result=>{
+    if(result===false) throw new Error(VIEW_STATE.get(view)?.error||'部分数据加载失败，请重试');
+    VIEW_LOADED.set(view,Date.now());return true;
+  }).catch(error=>viewFailure(view,error)).finally(()=>{
+    VIEW_PENDING.delete(view);
+    VIEW_STATE.set(view,{...VIEW_STATE.get(view),loading:false});renderViewState(view);
+  });
+  VIEW_PENDING.set(view,request);
+  return request;
+}
 document.querySelectorAll('.nav').forEach(b=>b.onclick=()=>{
+  if(b.classList.contains('active')) return;
+  const view=b.dataset.view, version=++navigationVersion;
   document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x===b));
-  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active', v.id==='view-'+b.dataset.view));
-  const fn=LOADERS[b.dataset.view]; if(fn) fn();
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+view));
+  // 先绘制切页，再更新内容；快速切换时取消尚未开始的旧页面加载。
+  requestAnimationFrame(()=>setTimeout(()=>{
+    if(version!==navigationVersion) return;
+    if(view==='accounts'&&LAST_STATUS) renderPlatforms(LAST_STATUS.platforms);
+    refreshView(view).catch(e=>{if(e.status!==401) toast('加载失败: '+e.message);});
+  },0));
 });
 
 /* ── 模型可见性 ── */
@@ -626,7 +704,7 @@ async function loadModels(){
   try{
     CATALOG=await api('/api/catalog');
     renderModels();
-  }catch(e){ if(e.status!==401) toast('模型目录加载失败: '+e.message); }
+  }catch(e){ return viewFailure('models',e); }
 }
 async function setModelVisible(payload, btn){
   if(btn){btn.disabled=true;}
@@ -693,7 +771,7 @@ function renderModels(){
   items.forEach(m=>{ (groups[m.platform]=groups[m.platform]||[]).push(m); });
   function fmtMult(mult){
     if(!mult) return '<span class="sub-cell">—</span>';
-    const tag=mult.source==='manual'?' <span class="pill purple">手记</span>':(mult.source==='auto'?` <span class="pill indigo">自动</span>`:'');
+    const tag=mult.source==='manual'?' <span class="pill purple">手记</span>':'';
     if(mult.valley!==undefined) return `<span class="mono">x${mult.factor}</span><div class="sub-cell">谷 x${mult.valley}</div>${tag}`;
     return `<span class="mono">x${mult.factor}</span>${tag}`;
   }
@@ -729,18 +807,8 @@ function renderModels(){
       if(caps.tools) spec.push('工具');
       const specHtml=spec.length?`<div class="sub-cell mono" style="color:var(--dim)">▣ ${spec.join(' · ')}</div>`:'';
       const manual=m.multiplier&&m.multiplier.source==='manual';
-      const isAuto=m.multiplier&&m.multiplier.source==='auto';
       let rateCell;
-      if(isAuto){
-        // 千问办公的自动值是绝对单价（分/token），倍率列只留「相对倍率 + 实测单价」两行
-        const mt=m.multiplier;
-        const rateK=(mt.rate_per_ktok!=null)?Number(mt.rate_per_ktok):(Number(mt.factor||0)*1000);
-        const rel=(mt.rel_factor!=null)?('x'+Number(mt.rel_factor).toFixed(2)):'—';
-        const tip=mt.note||`自动实测 ${mt.samples||0} 窗口 · 累计 ${Number(mt.credit||0).toFixed(2)} 分 / ${Number(mt.tokens||0).toLocaleString()} tok`;
-        const suffix=mt.note?'估算':`${mt.samples||0} 窗口`;
-        rateCell=`<span class="mono" style="font-weight:600">${rel}</span> <span class="sub-cell">相对</span>
-          <div class="sub-cell" title="${esc(tip)}">${rateK.toFixed(4)} 分/千tok · ${suffix}</div>`;
-      } else if(pf2==='qwenwork'&&(!m.multiplier||manual)){
+      if(pf2==='qwenwork'&&(!m.multiplier||manual)){
         rateCell=`<div class="toolbar" style="gap:4px;margin:0">
              <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc(manual&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:64px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
              <button class="btn mini" data-ratesave="${esc(m.id)}">存</button>
@@ -815,12 +883,12 @@ async function loadStatus(){
   try{
     const d=await api('/api/status'); LAST_STATUS=d;
     if(EST_CACHE.rows) renderEstimate();   // 余额到货后刷新预估（用量数据 5 分钟缓存）
-    if(document.getElementById('view-overview').classList.contains('active')) loadOverview();
+    if(document.getElementById('view-overview').classList.contains('active')) renderOverview(d);
     // 有签到在跑时不重绘账号表：重绘会把「签到中…」的禁用按钮换回可用状态，
     // 用户容易再点一次造成重复执行
     if(document.getElementById('view-accounts').classList.contains('active')
        && ![...RUNNING].some(k=>k.startsWith('checkin/'))) renderPlatforms(d.platforms);
-  }catch(e){ if(e.status!==401) toast('加载失败: '+e.message); }
+  }catch(e){ return viewFailure('accounts',e); }
 }
 function renderExpiring(rows){
   const el=document.getElementById('expiring-list');
@@ -838,11 +906,18 @@ function renderExpiring(rows){
   }).join('')+`</tbody></table></div>`;
 }
 
+function knownNumber(value){
+  return value===null||value===undefined||value===''||typeof value==='boolean'||!Number.isFinite(Number(value))?null:Number(value);
+}
+function balanceSummary(accounts){
+  const active=accounts.filter(a=>a.enabled), known=active.map(a=>knownNumber(a.remain)).filter(v=>v!==null);
+  return {value:known.length?known.reduce((a,b)=>a+b,0):null,known:known.length,total:active.length};
+}
 function renderOverview(d){
   renderExpiring(d.expiring||[]);
   const cards=d.platforms.map(p=>{
     // 只算启用账号：停用账号不参与调度，且千问的两个账号可能读同一钱包
-    const rem=p.accounts.reduce((s,a)=>s+(a.enabled?(a.remain||0):0),0);
+    const balance=balanceSummary(p.accounts), rem=balance.value;
     const n=p.accounts.length;
     const mism=p.accounts.filter(a=>a.identity_mismatch).length;
     const meta=mism
@@ -854,7 +929,7 @@ function renderOverview(d){
         <span class="realmurl mono">${esc(p.base_url)}</span>
         <span class="pill ${p.health?'green':'red'}" style="margin-left:auto">${p.health?'在线':'离线'}</span>
       </div>
-      <div class="realmnum" style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${fmt(rem)} <span class="of">剩余积分</span></div>
+      <div class="realmnum" style="color:${p.name==='qwenwork'?'var(--orange)':'var(--green)'}">${rem===null?'未知':fmt(rem)} <span class="of">剩余积分 · 已知 ${balance.known}/${balance.total} 启用账号</span></div>
       <div class="realmmeta">${n} 个账号 · ${meta}</div>
     </div>`;
   }).join('');
@@ -862,7 +937,7 @@ function renderOverview(d){
   document.getElementById('kpis').innerHTML=`
     <div class="kpi"><div class="label">平台在线</div><div class="num indigo">${d.kpi.platforms_ok}<span style="font-size:14px;color:var(--dim2)">/${d.kpi.platforms_total}</span></div><div class="note">引擎健康检查</div></div>
     <div class="kpi"><div class="label">账号总数</div><div class="num">${d.kpi.accounts}</div><div class="note">三平台合计</div></div>
-    <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">国内签到 + 国际打卡</div></div>`;
+    <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">国内签到 + 国际执行记录</div></div>`;
 }
 let ACC_PLATFORMS=null;                 // 账号页最近一次数据：切换区域筛选时复用，不重新请求
 const REALM_LABEL={cn:'国内版',intl:'国际版'};
@@ -886,14 +961,14 @@ function renderPlatforms(platforms){
     const pcn=full.filter(a=>a.realm==='cn').length, pintl=full.filter(a=>a.realm==='intl').length;
     const accs=rf?full.filter(a=>a.realm===rf):full;
     const rows=accs.map(a=>{
-      const unknown=a.remain===null;
+      const unknown=knownNumber(a.remain)===null;
       const pct=!unknown&&a.size?Math.min(100,a.remain/a.size*100):0;
       // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡
       const punched=intlPunched(a);
       const ck=(a.realm==='intl')
         ?(punched
-          ?(a.daily_chat_verified===false
-            ?'<span class="pill orange" title="引擎已记今日完成，但今天没有跑完网页通道；每日活跃积分未确认到账">已打卡未计费</span>'
+          ?(a.daily_chat_verified!==true
+            ?'<span class="pill orange" title="引擎已记录今日执行；上游未提供奖励到账凭据">已执行·到账待确认</span>'
             :'<span class="pill green" title="'+esc(a.last_daily_chat||'')+'">今日已打卡</span>')
           :(a.daily_chat_error
             ?'<span class="pill red" title="'+esc(a.daily_chat_error)+'">打卡失败</span>'
@@ -926,12 +1001,12 @@ function renderPlatforms(platforms){
         <td>${realmPill(a)}</td>
         <td class="num">${creditCell}</td>
         <td>${barCell}</td>
-        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?(a.daily_chat_verified===false
-          ?`<div class="sub-cell">网页通道未完成，积分未确认</div>`
+        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?(a.daily_chat_verified!==true
+          ?`<div class="sub-cell">奖励到账状态未知</div>`
           :`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`):''}${(a.realm==='intl'&&!punched&&a.daily_chat_error)?`<div class="sub-cell" title="${esc(a.daily_chat_error)}">${esc(String(a.daily_chat_error).slice(0,46))}${String(a.daily_chat_error).length>46?'…':''}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
     }).join('');
-    const rem=full.reduce((s,a)=>s+(a.enabled?(a.remain||0):0),0);
-    const allUnknown=full.length>0&&full.every(a=>a.remain===null);
+    const balance=balanceSummary(full), rem=balance.value;
+    const allUnknown=rem===null;
     return `<div class="card">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
         <span class="name-cell" style="font-size:14px">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
@@ -939,7 +1014,7 @@ function renderPlatforms(platforms){
         <span class="pill ${p.inflight?'indigo':'gray'}" title="经网关的当前在飞推理请求（流式算到流写完）；直连引擎的请求不计入">并发 ${p.inflight||0}</span>
         <span class="sub-cell mono">${esc(p.base_url)}</span>
         <span style="flex:1"></span>
-        <span class="sub-cell">${full.length} 账号 · 国内 ${pcn} / 国际 ${pintl}${rf?` · 筛选中 ${accs.length}`:''} · ${allUnknown?'余额以官方客户端为准':fmt(rem)+' 分'}</span>
+        <span class="sub-cell">${full.length} 账号 · 国内 ${pcn} / 国际 ${pintl}${rf?` · 筛选中 ${accs.length}`:''} · ${allUnknown?'余额未知':fmt(rem)+' 分'} · 已知 ${balance.known}/${balance.total} 启用账号</span>
         ${p.name==='qwenwork'
           ? '<span class="pill gray" title="千问办公每日积分由上游自动发放，没有签到动作">无需签到</span>'
           : `<button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>`}
@@ -952,36 +1027,32 @@ function renderPlatforms(platforms){
 }
 
 /* ── 用量 ── */
-let USAGE={rows:[],usd_cny:null}, UPAGE=1;
+let USAGE={rows:[],usd_cny:null}, UPAGE=1, USAGE_REQUEST=0;
 let USAGE_RATE={}; // "平台/模型" -> {factor, source}（目录倍率，供换算统计比对）
-let AUTO_RATE={};  // 千问办公自动实测：id -> {rateK:分/千tok, samples, credit, tokens, rel, base, model}
-function buildRateMaps(cat){
-  const usageRate={}, autoRate={};
+function buildRateMap(cat){
+  const usageRate={};
   if(cat && Array.isArray(cat.items)){
     for(const it of cat.items){
       if(it.multiplier && it.multiplier.factor) usageRate[it.id]={factor:Number(it.multiplier.factor), source:it.multiplier.source||''};
-      if(it.platform==='qwenwork' && it.multiplier && it.multiplier.source==='auto'){
-        const f=Number(it.multiplier.factor)||0;
-        autoRate[it.id]={rateK:(it.multiplier.rate_per_ktok!=null?Number(it.multiplier.rate_per_ktok):f*1000),
-          samples:it.multiplier.samples||0, credit:Number(it.multiplier.credit)||0,
-          tokens:Number(it.multiplier.tokens)||0, rel:it.multiplier.rel_factor,
-          base:it.multiplier.rel_base, model:it.model};
-      }
     }
   }
-  return {usageRate, autoRate};
+  return usageRate;
 }
 async function loadUsage(){
+  const request=++USAGE_REQUEST;
+  let catalogError=null;
   try{
     const [d, cat] = await Promise.all([
       api('/api/usage?limit=500'),
-      api('/api/catalog').catch(()=>null),
+      api('/api/catalog').catch(error=>{catalogError=error;return null;}),
     ]);
-    USAGE=d; UPAGE=1;
-    const maps=buildRateMaps(cat);
-    USAGE_RATE=maps.usageRate; AUTO_RATE=maps.autoRate;
+    if(request!==USAGE_REQUEST) return;
+    USAGE=d;
+    USAGE_RATE=buildRateMap(cat);
     renderUsage();
-  }catch(e){ if(e.status!==401) toast('用量加载失败: '+e.message); }
+    if(catalogError){ viewFailure('usage',new Error('倍率目录加载失败: '+catalogError.message)); return false; }
+    return true;
+  }catch(e){ return viewFailure('usage',e); }
 }
 function usageFiltered(){
   const q=document.getElementById('usage-search').value.trim().toLowerCase();
@@ -1008,17 +1079,20 @@ function fillUsageOptions(id, values){
 function renderUsageStats(rows){
   const sum=k=>rows.reduce((s,r)=>s+(Number(r[k])||0),0);
   const okN=rows.filter(r=>!isBad(r.outcome)).length;
-  const credit=rows.reduce((s,r)=>s+((r.credit==null||isNaN(Number(r.credit)))?0:Number(r.credit)),0);
+  const creditRows=rows.filter(r=>knownNumber(r.credit)!==null);
+  const credit=creditRows.reduce((s,r)=>s+knownNumber(r.credit),0);
   const bypf={};
   for(const r of rows){ const c=(r.credit==null||isNaN(Number(r.credit)))?0:Number(r.credit); if(c) bypf[r.platform]=(bypf[r.platform]||0)+c; }
   const pfNote=Object.entries(bypf).map(([p,v])=>`${PLATFORM_LABEL[p]||p} ${v.toFixed(1)}`).join(' · ')||'当前筛选范围';
   const prompt=sum('prompt'), completion=sum('completion'), cached=sum('cached'), total=sum('total');
-  const hit=prompt>0?Math.round(cached/prompt*100):null;
+  const knownPrompt=rows.filter(r=>r.cached!=null).reduce((n,r)=>n+(r.prompt||0),0);
+  const hit=knownPrompt>0?Math.round(cached/knownPrompt*100):null;
+  const cacheCoverage=prompt>0?Math.round(knownPrompt/prompt*100):0;
   const avg=rows.length?rows.reduce((s,r)=>s+(Number(r.elapsed_ms)||0),0)/rows.length:0;
   document.getElementById('usage-stats').innerHTML=`
     <div class="kpi"><div class="label">请求数</div><div class="num indigo">${rows.length}</div><div class="note">成功 ${okN} · 成功率 ${rows.length?Math.round(okN/rows.length*100)+'%':'—'}</div></div>
-    <div class="kpi"><div class="label">总 Token</div><div class="num">${fmtTok(total)}</div><div class="note">↓ ${fmtTok(prompt)} · ↑ ${fmtTok(completion)} · 缓存 ${fmtTok(cached)}${hit!==null?`（${hit}%）`:''}</div></div>
-    <div class="kpi"><div class="label">积分消耗</div><div class="num orange">${credit?credit.toFixed(2):'—'}</div><div class="note">${esc(pfNote)}</div></div>
+    <div class="kpi"><div class="label">总 Token</div><div class="num">${fmtTok(total)}</div><div class="note">↓ ${fmtTok(prompt)} · ↑ ${fmtTok(completion)} · 缓存 ${fmtTok(cached)}${hit!==null?`（已知样本 ${hit}%）`:'（未知）'} · 缓存数据覆盖 ${cacheCoverage}%</div></div>
+    <div class="kpi"><div class="label">积分消耗</div><div class="num orange">${creditRows.length?credit.toFixed(2):'未知'}</div><div class="note">${esc(pfNote)} · 已知 ${creditRows.length}/${rows.length}</div></div>
     <div class="kpi"><div class="label">平均耗时</div><div class="num">${avg?(avg/1000).toFixed(2)+' s':'—'}</div><div class="note">${rows.length} 条请求</div></div>`;
 }
 /* 用量曲线（多平台）：时间分桶的 token 堆叠柱（桶内按平台分段）+ 各平台缓存命中率折线 */
@@ -1038,8 +1112,8 @@ function renderUsageCharts(rows){
   for(const r of pts){
     const bi=Math.min(nB-1, Math.max(0, Math.floor((r.at-t0)/step)));
     const b=B[bi];
-    const pf=(b.pf[r.platform]=b.pf[r.platform]||{tin:0,tout:0,tca:0,n:0});
-    b.n++; pf.n++; pf.tin+=r.prompt||0; pf.tout+=r.completion||0; pf.tca+=r.cached||0;
+    const pf=(b.pf[r.platform]=b.pf[r.platform]||{tin:0,tout:0,tca:0,knownTin:0,n:0});
+    b.n++; pf.n++; pf.tin+=r.prompt||0; pf.tout+=r.completion||0; pf.tca+=r.cached||0; if(r.cached!=null) pf.knownTin+=r.prompt||0;
   }
   const PF_ORDER=['workbuddy','qoder','qwenwork'];
   const present=PF_ORDER.filter(p=>B.some(b=>(b.pf[p]||{}).n>0));
@@ -1078,11 +1152,11 @@ function renderUsageCharts(rows){
   const grid2=[0,25,50,75,100].map(v=>`<line x1="${padL}" y1="${yH(v)}" x2="${W-padR}" y2="${yH(v)}" stroke="var(--line)" stroke-dasharray="3 3"/><text x="${padL-6}" y="${yH(v)+4}" text-anchor="end" font-size="10" fill="var(--dim2)">${v}%</text>`).join('');
   let lines='', dots='', hitLegend=[], noCache=[];
   for(const p of present){
-    const totalCa=B.reduce((s,b)=>s+pfSum(b,p,'tca'),0);
+    const totalCa=B.reduce((s,b)=>s+pfSum(b,p,'knownTin'),0);
     if(totalCa<=0){ noCache.push(PLATFORM_LABEL[p]||p); continue; }
     const series=[];
     B.forEach((b,i)=>{
-      const tin=pfSum(b,p,'tin');
+      const tin=pfSum(b,p,'knownTin');
       if(tin>0){
         const hit=Math.min(100, pfSum(b,p,'tca')/tin*100);
         series.push([padL+i*bw+bw/2, yH(hit), hit, b.s, b.pf[p]]);
@@ -1091,7 +1165,7 @@ function renderUsageCharts(rows){
     if(series.length>1){
       lines+=`<polyline points="${series.map(s=>s[0]+','+s[1]).join(' ')}" fill="none" stroke="${PF_COLOR[p]}" stroke-width="2" stroke-linejoin="round"/>`;
     }
-    dots+=series.map(s=>`<circle cx="${s[0]}" cy="${s[1]}" r="2.4" fill="${PF_COLOR[p]}"><title>${hhmm(s[3])} ${PLATFORM_LABEL[p]||p} 缓存命中率 ${s[2].toFixed(1)}%（缓存 ${fmtTok(s[4].tca)} / 输入 ${fmtTok(s[4].tin)} tok）</title></circle>`).join('');
+    dots+=series.map(s=>`<circle cx="${s[0]}" cy="${s[1]}" r="2.4" fill="${PF_COLOR[p]}"><title>${hhmm(s[3])} ${PLATFORM_LABEL[p]||p} 缓存命中率 ${s[2].toFixed(1)}%（缓存 ${fmtTok(s[4].tca)} / 输入 ${fmtTok(s[4].knownTin)} tok）</title></circle>`).join('');
     hitLegend.push(`<span class="pill" style="color:${PF_COLOR[p]};background:var(--panel2);border-color:var(--line)">— ${PLATFORM_LABEL[p]||p}</span>`);
   }
   const chart2=`<svg viewBox="0 0 ${W} ${Hp}" style="width:100%;display:block" role="img" aria-label="各平台缓存命中率曲线">
@@ -1112,7 +1186,7 @@ function renderUsageCharts(rows){
   if(cacheEl) cacheEl.innerHTML=`
     <div class="card" style="margin-bottom:12px">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
-        <h3 style="margin:0">缓存命中率 <span class="sub">各平台 缓存 tok ÷ 输入 tok</span></h3>
+        <h3 style="margin:0">缓存命中率 <span class="sub">已知缓存样本：缓存 tok ÷ 输入 tok</span></h3>
         <span style="flex:1"></span>
         ${hitLegend}
         ${noCache.length?`<span class="sub-cell">${esc(noCache.join('/'))} 上游不回传缓存，无曲线</span>`:''}
@@ -1123,23 +1197,23 @@ function renderUsageCharts(rows){
 function renderUsagePerModel(rows){
   const agg={};
   for(const r of rows){
-    const cr=(r.credit==null||isNaN(Number(r.credit)))?0:Number(r.credit);
     const k=(r.platform||'?')+'|'+(r.model||'?');
-    const e=agg[k]||(agg[k]={platform:r.platform,model:r.model,count:0,prompt:0,completion:0,cached:0,total:0,credit:0,cny:0,ok:0});
-    e.count++; e.prompt+=r.prompt||0; e.completion+=r.completion||0; e.cached+=r.cached||0;
-    e.total+=r.total||0; e.credit+=cr;
-    const cny=(r.cost_cny==null||isNaN(Number(r.cost_cny)))?0:Number(r.cost_cny); e.cny+=cny;
+    const e=agg[k]||(agg[k]={platform:r.platform,model:r.model,count:0,prompt:0,completion:0,cached:0,cacheKnown:0,total:0,credit:0,cny:0,creditN:0,cnyN:0,ok:0});
+    e.count++; e.prompt+=r.prompt||0; e.completion+=r.completion||0; e.cached+=r.cached||0; if(r.cached!=null) e.cacheKnown++;
+    e.total+=r.total||0;
+    if(knownNumber(r.credit)!==null){e.credit+=knownNumber(r.credit);e.creditN++;}
+    if(knownNumber(r.cost_cny)!==null){e.cny+=knownNumber(r.cost_cny);e.cnyN++;}
     if(!isBad(r.outcome)) e.ok++;
   }
   const list=Object.values(agg).sort((a,b)=>b.count-a.count);
   document.getElementById('usage-permodel').innerHTML=list.length?list.map(e=>{
     const rate=e.count?Math.round(e.ok/e.count*100)+'%':'—';
-    const price=e.cny>0?'¥'+e.cny.toFixed(4):'—';
+    const price=e.cnyN?'¥'+e.cny.toFixed(4):'未知';
     return `<tr><td><span class="pill indigo">${esc(PLATFORM_LABEL[e.platform]||e.platform)}</span></td>
       <td class="mono">${esc(e.model)}</td><td class="num">${e.count}</td>
-      <td class="num">${fmtTok(e.prompt)}</td><td class="num">${fmtTok(e.completion)}</td><td class="num">${fmtTok(e.cached)}</td>
+      <td class="num">${fmtTok(e.prompt)}</td><td class="num">${fmtTok(e.completion)}</td><td class="num">${e.cacheKnown?fmtTok(e.cached)+(e.cacheKnown<e.count?'（部分）':''):'未知'}</td>
       <td class="num" style="font-weight:700">${fmtTok(e.total)}</td>
-      <td class="num" style="color:${e.credit?'var(--orange)':'inherit'}">${e.credit?e.credit.toFixed(2):'—'}</td>
+      <td class="num" style="color:${e.credit?'var(--orange)':'inherit'}">${e.creditN?e.credit.toFixed(2):'未知'}</td>
       <td class="num">${price}</td><td class="num">${rate}</td></tr>`;
   }).join(''):'<tr><td colspan="10" class="empty">—</td></tr>';
 }
@@ -1150,13 +1224,13 @@ function renderUsage(){
   document.getElementById('usage-body').innerHTML = slice.length? slice.map(r=>{
     const bad=isBad(r.outcome);
     const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
-    const cachedPct=r.prompt?Math.round((r.cached||0)/r.prompt*100):0;
+    const cachedPct=r.cached!=null&&r.prompt?Math.round(r.cached/r.prompt*100):null;
     const cny=(r.cost_cny==null||isNaN(Number(r.cost_cny)))?null:Number(r.cost_cny);
     const price=(cny!=null&&cny>0)?'成本 ¥'+cny.toFixed(4):null;
     const tokSub=[];
     if(r.prompt) tokSub.push('↓ '+fmtTok(r.prompt));
     if(r.completion) tokSub.push('↑ '+fmtTok(r.completion));
-    if(r.cached) tokSub.push('缓存 '+cachedPct+'%');
+    tokSub.push(cachedPct==null?'缓存未知':'缓存 '+cachedPct+'%');
     const meta=[];
     if(r.reasoning_effort) meta.push(`<span class="pill purple">${esc(r.reasoning_effort)}</span>`);
     if(r.stream!==null) meta.push(r.stream?'流式':'非流式');
@@ -1184,65 +1258,66 @@ function renderUsage(){
   fillUsageOptions('usage-account',[...new Set(USAGE.rows.map(r=>r.account||''))].filter(Boolean));
   fillUsageOptions('usage-key',[...new Set(USAGE.rows.map(r=>r.key_name||''))].filter(Boolean));
   renderUsageStats(rows);
-  renderUsageCharts(rows);
-  renderUsageConversion(rows);
-  renderUsagePerModel(rows);
+  if(!document.getElementById('usage-statview').classList.contains('hidden')){
+    renderUsageCharts(rows);
+    renderUsageConversion(rows);
+    renderUsagePerModel(rows);
+  }
 }
-/* 换算统计：平台×模型的实扣积分 vs token，对照目录倍率；wb 另有真实成本锚点 */
+/* 换算统计：平台×模型的实扣积分 vs token，对照目录倍率；wb 另有参考成本锚点 */
+function costSamples(rows){
+  const agg={};
+  for(const r of rows){
+    const credit=knownNumber(r.credit), cny=knownNumber(r.cost_cny), tok=knownNumber(r.total);
+    const k=(r.platform||'?')+'|'+(r.model||'?');
+    const e=agg[k]||(agg[k]={platform:r.platform,model:r.model,n:0,tok:0,credit:0,cny:0,creditN:0,cnyN:0,creditTok:0,cnyTok:0});
+    e.n++; e.tok+=tok||0;
+    if(credit!==null){e.credit+=credit;e.creditN++;e.creditTok+=tok||0;}
+    if(cny!==null){e.cny+=cny;e.cnyN++;e.cnyTok+=tok||0;}
+  }
+  return Object.values(agg);
+}
 function renderUsageConversion(rows){
   const tb=document.getElementById('usage-conv');
   const note=document.getElementById('usage-conv-note');
-  const agg={};
-  for(const r of rows){
-    const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
-    const cny=(r.cost_cny==null||isNaN(Number(r.cost_cny)))?null:Number(r.cost_cny);
-    if(cr===null && cny===null) continue; // 没有任何计费数据的行不进统计
-    const k=(r.platform||'?')+'|'+(r.model||'?');
-    const e=agg[k]||(agg[k]={platform:r.platform,model:r.model,n:0,tok:0,credit:0,hasCredit:false,cny:0,hasCny:false});
-    e.n++;
-    e.tok+=(r.total||0);
-    if(cr!==null){ e.credit+=cr; e.hasCredit=true; }
-    if(cny!==null){ e.cny+=cny; e.hasCny=true; }
-  }
-  const list=Object.values(agg).sort((a,b)=>b.credit-a.credit);
+  const list=costSamples(rows).filter(e=>e.creditN||e.cnyN).sort((a,b)=>b.credit-a.credit);
   if(!list.length){
     tb.innerHTML='<tr><td colspan="9" class="empty">当前筛选范围没有带计费数据的请求</td></tr>';
     note.textContent=''; return;
   }
   tb.innerHTML=list.map(e=>{
-    const rate=e.tok>0&&e.hasCredit?e.credit/e.tok*1000:null;
+    const rate=e.creditTok>0&&e.creditN?e.credit/e.creditTok*1000:null;
     const key=e.platform+'/'+e.model;
     const cat=USAGE_RATE[key];
     const factor=cat?cat.factor:null;
-    const ratio=(rate!==null&&factor>0)?rate/factor:null;
+    const ratio=null; // 相对倍率与积分/千tok量纲不同，不相除。
     const pfColor={workbuddy:'var(--accent)',qoder:'#0891b2',qwenwork:'var(--orange)'}[e.platform]||'var(--accent)';
     return `<tr>
       <td><span class="pill" style="color:${pfColor};background:var(--panel2);border-color:var(--line)">${esc(PLATFORM_LABEL[e.platform]||e.platform)}</span></td>
       <td class="mono">${esc(e.model)}</td>
       <td class="num">${e.n}</td>
       <td class="num">${fmtTok(e.tok)}</td>
-      <td class="num" style="color:${e.hasCredit&&e.credit?'var(--orange)':'inherit'}">${e.hasCredit?e.credit.toFixed(3):'—'}</td>
-      <td class="num" style="font-weight:600">${rate!==null?rate.toFixed(4):'—'}</td>
+      <td class="num" style="color:${e.creditN&&e.credit?'var(--orange)':'inherit'}">${e.creditN?e.credit.toFixed(3):'—'}</td>
+      <td class="num" style="font-weight:600">${rate!==null?rate.toFixed(4):'—'}<div class="sub-cell">积分覆盖 ${e.creditN}/${e.n} · ${fmtTok(e.creditTok)} tok</div></td>
       <td class="num">${factor!=null?('x'+factor+(cat.source?` <span class="sub-cell">${esc(cat.source)}</span>`:'')):'—'}</td>
       <td class="num" style="color:${ratio!=null?(ratio>1.15?'var(--red)':(ratio<0.85?'var(--green)':'inherit')):'inherit'}">${ratio!=null?ratio.toFixed(2):'—'}</td>
-      <td class="num">${e.hasCny?'¥'+e.cny.toFixed(4):'—'}</td></tr>`;
+      <td class="num">${e.cnyN?'¥'+e.cny.toFixed(4):'—'}<div class="sub-cell">成本覆盖 ${e.cnyN}/${e.n} · ${fmtTok(e.cnyTok)} tok</div></td></tr>`;
   }).join('');
   // 平台级汇总行
   const bypf={};
   for(const e of list){
-    const p=bypf[e.platform]||(bypf[e.platform]={n:0,tok:0,credit:0,cny:0});
-    p.n+=e.n; p.tok+=e.tok; p.credit+=e.credit; p.cny+=e.cny;
+    const p=bypf[e.platform]||(bypf[e.platform]={n:0,tok:0,credit:0,cny:0,creditN:0,cnyN:0,creditTok:0,cnyTok:0});
+    for(const key of ['n','tok','credit','cny','creditN','cnyN','creditTok','cnyTok']) p[key]+=e[key];
   }
   const summary=Object.entries(bypf).map(([p,v])=>{
-    const rate=v.tok>0?v.credit/v.tok*1000:null;
-    return `${PLATFORM_LABEL[p]||p}: ${v.n} 次 · ${fmtTok(v.tok)} tok · ${v.credit.toFixed(2)} 分（${rate!==null?rate.toFixed(4):'—'}/千tok）${v.cny?` · 真实 ¥${v.cny.toFixed(2)}`:''}`;
+    const rate=v.creditTok>0&&v.creditN?v.credit/v.creditTok*1000:null;
+    return `${PLATFORM_LABEL[p]||p}: ${v.n} 次 · ${fmtTok(v.tok)} tok · ${v.creditN?v.credit.toFixed(2):'未知'} 分（${rate!==null?rate.toFixed(4):'—'}/千tok，积分覆盖 ${v.creditN}/${v.n}）${v.cnyN?` · 参考 ¥${v.cny.toFixed(2)}，成本覆盖 ${v.cnyN}/${v.n}`:''}`;
   }).join('　|　');
   note.textContent='平台汇总（当前筛选）→ '+summary;
 }
 /* 额度可用量预估（总览页）：余额 ÷ 近期有效单价 → 预计可用 token。
-   单价 = Σ(模型实扣积分) ÷ Σ(token)；千问办公用量行没有积分，用
-   「余额差 ÷ token」的实测单价（config.auto_multipliers）。混合单价按
-   近期 token 量加权，避免用量少的模型把均值带偏。 */
+   单价 = Σ(模型实扣积分) ÷ Σ(token) 的实测值，或上游目录/短样本参考价；
+   余额未知（引擎没返回 remain）时显示待测，不按 0 估算。 */
 let EST_CACHE={ts:0,data:null};
 async function loadEstimate(force){
   if(!force && EST_CACHE.data && Date.now()-EST_CACHE.ts < 300000){ renderEstimate(); return; }
@@ -1250,7 +1325,7 @@ async function loadEstimate(force){
     const d=await api('/api/estimate'+(force?'?force=1':''));
     EST_CACHE={ts:Date.now(),data:d};
     renderEstimate();
-  }catch(e){ /* 静默：总览其他块照常 */ }
+  }catch(e){ return viewFailure('overview',e); }
 }
 function renderEstimate(){
   const tb=document.getElementById('overview-estimate');
@@ -1263,21 +1338,23 @@ function renderEstimate(){
   let html='';
   for(const p of d.platforms){
     const label=`<span class="pill indigo">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>`;
-    const bal=p.balance!=null?fmt(p.balance)+' 分':'—';
+    const known=p.known??p.enabled??0, total=p.total??p.enabled??0;
+    const coverage=`<div class="sub-cell">已知 ${known}/${total} 个启用账号</div>`;
+    const bal=p.balance!=null?fmt(p.balance)+' 分'+coverage:`待测${coverage}`;
     const models=(p.models||[]);
     if(!models.length){
       html+=`<tr><td>${label}</td><td class="num">${bal}</td><td class="sub-cell">暂无实测单价</td><td class="num">—</td></tr>`;
       continue;
     }
     models.forEach((m,i)=>{
-      const scope=(m.balance_scope&&m.model_balance!=null)
-        ?`<div class="sub-cell">${esc(m.balance_scope)} · 可用 ${fmt(m.model_balance)} 分</div>`:'';
-      const range=(m.est_tokens_nocache!=null&&m.est_tokens!=null&&m.est_tokens_nocache!==m.est_tokens)
-        ?`<div class="sub-cell">0% 缓存下限 ${fmtTok(m.est_tokens_nocache)}</div>`
-        :(m.cache_assumed?`<div class="sub-cell">按 ${Math.round((m.cache_hit_rate||0)*100)}% 缓存命中估算</div>`:'');
+      const scope=m.balance_scope
+        ?`<div class="sub-cell">${esc(m.balance_scope)}${m.model_balance!=null?` · 可用 ${fmt(m.model_balance)} 分`:' · 余额待测'}</div>`:'';
+      const range=`<div class="sub-cell">${esc(m.note||'样本估算')} · ${m.samples||0} 条样本</div>`;
+      const noCache=(m.est_tokens_nocache!=null && m.est_tokens_nocache!==m.est_tokens)
+        ? `<div class="sub-cell">0% 缓存下限 ${fmtTok(m.est_tokens_nocache)}</div>`:'';
       html+=`<tr>${i===0
         ? `<td rowspan="${models.length}" style="vertical-align:top">${label}</td><td rowspan="${models.length}" class="num" style="vertical-align:top">${bal}</td>`
-        : ''}<td class="mono">${esc(m.model)}${scope}${range}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'—'}</td></tr>`;
+        : ''}<td class="mono">${esc(m.model)}${scope}${range}${noCache}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'待测'}</td></tr>`;
     });
   }
   tb.innerHTML=html||'<tr><td colspan="4" class="empty">暂无数据</td></tr>';
@@ -1288,6 +1365,7 @@ document.querySelectorAll('.usage-tab').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.usage-tab').forEach(x=>x.classList.toggle('active',x===b));
   document.getElementById('usage-records').classList.toggle('hidden',b.dataset.utab!=='records');
   document.getElementById('usage-statview').classList.toggle('hidden',b.dataset.utab!=='stats');
+  if(b.dataset.utab==='stats') renderUsage();
 });
 /* 导出当前筛选结果为 CSV（与表格同口径） */
 document.getElementById('btn-usage-export').onclick=()=>{
@@ -1299,7 +1377,7 @@ document.getElementById('btn-usage-export').onclick=()=>{
   for(const r of rows){
     lines.push([r.iso||'',r.platform||'',r.model||'',r.account||'',r.reasoning_effort||'',
       r.stream==null?'':(r.stream?'stream':'non-stream'),r.outcome||'',
-      r.prompt||0,r.completion||0,r.cached||0,r.total||0,
+      r.prompt||0,r.completion||0,r.cached??'',r.total||0,
       r.credit==null?'':r.credit,r.cost_cny==null?'':r.cost_cny,
       r.elapsed_ms||'',r.ttft_ms||'',r.speed==null?'':r.speed,r.key_name||''].map(cell).join(','));
   }
@@ -1326,7 +1404,10 @@ document.getElementById('usage-prev').onclick=()=>{if(UPAGE>1){UPAGE--;renderUsa
 document.getElementById('usage-next').onclick=()=>{UPAGE++;renderUsage();};
 
 /* ── 自动化 ── */
-async function autoView(){ await loadAuto(); loadTasksStatus(); loadExpiringWindow(); }
+async function autoView(){
+  const results=await Promise.all([loadAuto(),loadTasksStatus(),loadExpiringWindow()]);
+  return results.every(result=>result!==false);
+}
 async function loadExpiringWindow(){
   const info=document.getElementById('wb-expiring-info');
   const input=document.getElementById('wb-expiring-days');
@@ -1341,7 +1422,7 @@ async function loadExpiringWindow(){
     if(ew.intl!==null&&ew.intl!==undefined) parts.push('国际版 '+ew.intl+' 天');
     if(ew.cn!==null&&ew.cn!==undefined) parts.push('国内版 '+ew.cn+' 天');
     info.textContent=parts.length?('当前: '+parts.join(' · ')):'当前: 引擎默认';
-  }catch(e){ info.textContent='读取失败: '+e.message; }
+  }catch(e){ info.textContent='读取失败: '+e.message; return viewFailure('auto',e); }
 }
 document.getElementById('btn-expiring-save').onclick=async function(){
   this.disabled=true;
@@ -1403,12 +1484,12 @@ function renderAutoCards(){
     const intlAccs=accs.filter(a=>a.realm==='intl'&&a.enabled);
     const signed=accs.filter(a=>a.checked_in).length;
     const cnSigned=cnAccs.filter(a=>a.checked_in).length;
-    const intlDone=intlAccs.filter(a=>intlPunched(a)&&a.daily_chat_verified!==false).length;
-    const intlUnverified=intlAccs.filter(a=>intlPunched(a)&&a.daily_chat_verified===false).length;
+    const intlDone=intlAccs.filter(a=>intlPunched(a)&&a.daily_chat_verified===true).length;
+    const intlUnverified=intlAccs.filter(a=>intlPunched(a)&&a.daily_chat_verified!==true).length;
     const punch=intlAccs.filter(a=>!intlPunched(a)).length;
     let foot;
-    if(p.name==='qwenwork') foot='每日积分由上游自动发放，无需签到；令牌续期被官方客户端绑定，保活失败属预期（11-29 到期后客户端重登 + 重新导入）。';
-    else if(p.name==='workbuddy') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际已打卡 ${intlDone}/${intlAccs.length}${intlUnverified?` · 未计费 ${intlUnverified}`:''}${punch?` · 待打卡 ${punch}`:''} · 定时调度器每天自动执行，按钮用于立即补做。`;
+    if(p.name==='qwenwork') foot='每日积分由上游发放；保活执行结果与奖励到账分别确认。凭证或余额状态异常时，请检查官方客户端及账号状态。';
+    else if(p.name==='workbuddy') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际已确认 ${intlDone}/${intlAccs.length}${intlUnverified?` · 到账待确认 ${intlUnverified}`:''}${punch?` · 待打卡 ${punch}`:''} · 定时调度器每天自动执行，按钮用于立即补做。`;
     else foot=`已签 ${signed}/${accs.length} · 定时 09:00 / 10:05 / 21:00 自动签到，按钮用于补做。`;
     const groups=(AUTO_BUTTONS[p.name]||[]).map((g,gi)=>
       `<div class="auto-group">
@@ -1444,7 +1525,7 @@ function relTime(t){
   return `（${Math.floor(s/86400)} 天前）`;
 }
 async function loadAuto(){
-  let summary=[];
+  let summary=[], failed=false;
   try{
     const d=await api('/api/status'); LAST_STATUS=d;
     renderAutoCards();
@@ -1453,24 +1534,25 @@ async function loadAuto(){
       const cn=p.accounts.filter(a=>a.realm==='cn');
       const intl=p.accounts.filter(a=>a.realm==='intl'&&a.enabled);
       const cnSigned=cn.filter(a=>a.checked_in).length;
-      const intlDone=intl.filter(a=>intlPunched(a)&&a.daily_chat_verified!==false).length;
-      const intlUnverified=intl.filter(a=>intlPunched(a)&&a.daily_chat_verified===false).length;
+      const intlDone=intl.filter(a=>intlPunched(a)&&a.daily_chat_verified===true).length;
+      const intlUnverified=intl.filter(a=>intlPunched(a)&&a.daily_chat_verified!==true).length;
       const intlFail=intl.filter(a=>!intlPunched(a)&&a.daily_chat_error).length;
       let line=`${PLATFORM_LABEL[p.name]||p.name}: ${p.health?'在线':'离线'} · ${p.accounts.length} 账号`;
       if(p.name==='qwenwork') line+=' · 上游自动发放';
-      else if(p.name==='workbuddy') line+=` · 国内已签 ${cnSigned}/${cn.length} · 国际打卡 ${intlDone}/${intl.length}`+(intlUnverified?`（${intlUnverified} 未计费）`:'')+(intlFail?`（${intlFail} 失败）`:'');
+      else if(p.name==='workbuddy') line+=` · 国内已签 ${cnSigned}/${cn.length} · 国际打卡 ${intlDone}/${intl.length}`+(intlUnverified?`（${intlUnverified} 到账待确认）`:'')+(intlFail?`（${intlFail} 失败）`:'');
       else line+=` · 已签 ${signed}`;
       return line;
     });
-  }catch(e){ summary=['状态加载失败: '+e.message]; }
+  }catch(e){ summary=['状态加载失败: '+e.message]; failed=true; viewFailure('auto',e); }
   // 调度器详情（wb 引擎）——与摘要合并渲染，不覆盖摘要
   let sched=null;
   try{
     const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({platform:'workbuddy',path:'scheduler',method:'GET',body:{}})});
     sched=r.result||{};
-  }catch(e){/* 调度器详情失败不影响主状态 */}
+  }catch(e){failed=true;viewFailure('auto',e);}
   renderAutoStatus(summary, sched);
+  return !failed;
 }
 function renderAutoStatus(summary, s){
   const el=document.getElementById('auto-status');
@@ -1505,7 +1587,7 @@ async function doCheckin(name,btn){
       // 无论整体成败都用明细：部分成功时只显示顶层 error 会把
       // 「国内已签、国际打卡失败」的实际情况吞掉，看起来像全失败。
       const brief=briefForCheckin(r)||errMsg(r);
-      pushHistory('签到 · '+(PLATFORM_LABEL[name]||name), !!r.ok, brief, JSON.stringify(r,null,1));
+      pushHistory('签到 · '+(PLATFORM_LABEL[name]||name), r, brief, JSON.stringify(r,null,1));
       toast(r.ok?`[${PLATFORM_LABEL[name]||name}] ${brief}`
         :(r.partial?'部分成功: ':'签到失败: ')+brief, r.ok?3600:6000);
     }catch(e){
@@ -1531,7 +1613,7 @@ document.getElementById('btn-checkin-all').onclick=async function(){
         const r=await api('/api/checkin/'+n,{method:'POST'});
         const brief=briefForCheckin(r)||errMsg(r);
         r.ok?okN++:failN++;
-        pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), !!r.ok, brief, JSON.stringify(r,null,1));
+        pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), r, brief, JSON.stringify(r,null,1));
       }catch(e){ failN++; pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), false, e.message,''); }
       runDone(key);
     }
@@ -1565,7 +1647,7 @@ document.getElementById('btn-daily-all').onclick=async function(){
         : (s.kind==='task' ? `task/${s.action}/${s.platform}` : `engine/${s.platform}/${s.path}`);
       if(RUNNING.has(key)){
         skipN++;
-        pushHistory(s.label, true, '跳过：该动作正在执行中','');
+        pushHistory(s.label, 'skipped', '跳过：该动作正在执行中','');
         continue;
       }
       RUNNING.add(key);
@@ -1581,7 +1663,7 @@ document.getElementById('btn-daily-all').onclick=async function(){
         const brief=s.kind==='checkin'
           ?(briefForCheckin(r)||errMsg(r)||'完成')
           :(ok?(firstBrief(r.result)||'完成'):(errMsg(r)||'失败'));
-        pushHistory(s.label, ok, brief, JSON.stringify(r,null,1));
+        pushHistory(s.label, r, brief, JSON.stringify(r,null,1));
       }catch(e){
         failN++;
         pushHistory(s.label, false, e.message||'请求失败','');
@@ -1598,13 +1680,15 @@ async function dailyChat(btn){
   if(!runOnce(key)) return;
   await withBtn(btn, async()=>{
     try{
-      await loadStatus();
-      const accs=((LAST_STATUS&&LAST_STATUS.platforms)||[]).find(p=>p.name==='workbuddy');
+      const status=await api('/api/status');
+      const accs=(status.platforms||[]).find(p=>p.name==='workbuddy');
+      if(!status.ok||!accs||!accs.health||accs.error) throw new Error('账号状态读取失败，未执行打卡');
+      LAST_STATUS=status;
       const pending=((accs&&accs.accounts)||[]).filter(a=>a.realm==='intl'&&a.enabled
         &&a.can_daily_chat!==false&&!intlPunched(a));
       if(!pending.length){
         toast('没有待打卡的国际版账号（全部已打或不可打）');
-        pushHistory('每日活跃打卡', true, '没有待打卡的国际版账号（全部已打或不可打）','');
+        pushHistory('每日活跃打卡', 'skipped', '没有待打卡的国际版账号（全部已打或不可打）','');
         return;
       }
       const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1622,11 +1706,11 @@ function showTaskResult(title, r, briefOverride){
   const out=document.getElementById('task-result');
   out.style.display='block';
   const brief=briefOverride||(r.ok?firstBrief(r.result):(errMsg(r)||'执行失败'));
-  const detail=JSON.stringify(r,null,1);
-  out.innerHTML=`<b>${esc(title)}</b> — <span style="color:${r.ok?'var(--green)':'var(--red)'}">${esc(r.ok?'成功':'失败: '+brief)}</span>
+  const detail=JSON.stringify(r,null,1), state=resultState(r);
+  out.innerHTML=`<b>${esc(title)}</b> — <span class="pill ${RESULT_COLOR[state]}">${RESULT_LABEL[state]}</span> ${esc(brief)}
     <details style="margin-top:6px"><summary class="sub-cell" style="cursor:pointer">原始返回</summary>
     <pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;margin-top:6px">${esc(detail.slice(0,3000))}</pre></details>`;
-  pushHistory(title, !!r.ok, brief, detail);
+  pushHistory(title, r, brief, detail);
 }
 function runEngine(payload, btn){
   const key='engine/'+payload.platform+'/'+payload.path;
@@ -1670,6 +1754,7 @@ async function loadTasksStatus(){
   const el=document.getElementById('tasks-detail');
   el.textContent='加载中…';
   const parts=[];
+  let failed=false;
   for(const p of ['workbuddy','qoder']){
     try{
       const d=await api('/api/tasks/'+p);
@@ -1682,9 +1767,10 @@ async function loadTasksStatus(){
         brief=ks.includes('accounts')?('账号 '+(res.accounts.length||ks.length)+' 个'):(ks.slice(0,4).join(', '));
       } else brief=JSON.stringify(res).slice(0,80);
       parts.push(`${PLATFORM_LABEL[p]}: ${brief}`);
-    }catch(e){parts.push(`${PLATFORM_LABEL[p]}: 状态获取失败（${e.message}）`);}
+    }catch(e){failed=true;parts.push(`${PLATFORM_LABEL[p]}: 状态获取失败（${e.message}）`);viewFailure('auto',e);}
   }
   el.textContent=parts.join('　|　')+'　|　千问办公: 上游自动';
+  return !failed;
 }
 document.getElementById('btn-tasks-status').onclick=loadTasksStatus;
 document.getElementById('btn-auto-clear').onclick=()=>{
@@ -1747,8 +1833,8 @@ async function loadSettings(){
     const line=x=>x?`最临期 ${fmtD(x.min_days_left)} / ${x.expiring_remain} 分`:'无临期包';
     document.getElementById('cfg-realms-info').textContent=
       `当前临期概况：国内版 ${line(r.cn)} · 国际版 ${line(r.intl)}`;
-  }catch(e){ document.getElementById('cfg-realms-info').textContent='路由偏好读取失败: '+e.message; }
-  loadUpdates();
+  }catch(e){ return viewFailure('settings',e); }
+  return loadUpdates();
 }
 /* 上游版本与更新：qoder/buddy 由网关直查 GitHub release tag；wb 走引擎 /updates */
 async function loadUpdates(force){
@@ -1773,7 +1859,7 @@ async function loadUpdates(force){
         ${r.error?`<span class="sub-cell" style="color:var(--orange)">${esc(r.error)}</span>`:''}
       </div>`;
     }).join('')||'<div class="empty">—</div>';
-  }catch(e){ el.textContent='版本检查失败: '+e.message; }
+  }catch(e){ el.textContent='版本检查失败: '+e.message; return viewFailure('settings',e); }
 }
 document.getElementById('btn-updates-refresh').onclick=async function(){
   await withBtn(this, async()=>{ await loadUpdates(true); toast('更新检查完成'); });
@@ -1824,30 +1910,21 @@ async function loadLogs(){
       return l;
     }).join('\n')||'<span style="color:#7c796f">暂无日志</span>';
     body.scrollTop=body.scrollHeight;
-  }catch(e){ if(e.status!==401) document.getElementById('logbody').textContent='日志加载失败: '+e.message; }
+  }catch(e){ return viewFailure('logs',e); }
 }
 
 /* ── 总览渲染 ── */
-function loadOverview(){
-  loadEstimate();   // 5 分钟缓存；强制刷新走顶部「刷新数据」按钮
-  if(LAST_STATUS){
-    renderOverview(LAST_STATUS);
-    const rows=(USAGE.rows||[]).slice(0,10);
-    document.getElementById('recent-body').innerHTML=rows.length?rows.map(r=>{
-      const bad=isBad(r.outcome);
-      const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
-      return `<tr><td class="mono">${esc(r.iso)}</td>
-        <td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
-        <td class="mono">${esc(r.model)}</td><td>${esc(r.account||'—')}</td>
-        <td class="num" style="font-weight:700">${fmtTok(r.total)}</td>
-        <td class="num" style="color:${cr?'var(--orange)':'inherit'}">${cr==null?'—':cr.toFixed(2)}</td>
-        <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}</td>
-        <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td></tr>`;
-    }).join(''):'<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
-  }
-  api('/api/usage?limit=100').then(d=>{
-    USAGE=d;
-    if(LAST_STATUS) renderOverview(LAST_STATUS);
+let RECENT_ROWS=[];
+async function loadOverview(){
+  if(LAST_STATUS) renderOverview(LAST_STATUS);
+  if(RECENT_ROWS.length) renderRecent({rows:RECENT_ROWS});
+  const results=await Promise.all([
+    loadStatus(), loadEstimate(),
+    api('/api/usage?limit=100').then(d=>{RECENT_ROWS=d.rows||[];renderRecent(d);}).catch(e=>viewFailure('overview',e))
+  ]);
+  return results.every(result=>result!==false);
+}
+function renderRecent(d){
     const rows=(d.rows||[]).slice(0,10);
     document.getElementById('recent-body').innerHTML=rows.length?rows.map(r=>{
       const bad=isBad(r.outcome);
@@ -1860,9 +1937,8 @@ function loadOverview(){
         <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}</td>
         <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td></tr>`;
     }).join(''):'<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
-  }).catch(()=>{});
 }
-document.getElementById('btn-refresh-top').onclick=()=>{loadStatus();loadOverview();loadEstimate(true);};
+document.getElementById('btn-refresh-top').onclick=()=>{refreshView('overview',true);loadEstimate(true);};
 
 /* ── 启动 ── */
 function gateHidden(){return document.getElementById('gate').classList.contains('hidden');}
@@ -1872,18 +1948,18 @@ function gateHidden(){return document.getElementById('gate').classList.contains(
   try{const r=await api('/api/ping');if(r.ok){loadAll();}else showGate();}
   catch(e){showGate();}
 })();
-function loadAll(){loadStatus();loadOverview();}
+function loadAll(){refreshView('overview',true);}
 /* 30 秒定时刷新只作用于当前视图：全量 loadAll 会重复请求 usage 并把
    用户没在看的数据也刷一遍；账号视图的签到执行期间不重绘（见 loadStatus 守卫） */
 setInterval(()=>{
-  if(!KEY()||!gateHidden()) return;
+  if(document.hidden||!KEY()||!gateHidden()) return;
   const active=(document.querySelector('.view.active')||{}).id||'';
-  if(active==='view-auto'){ if(!RUNNING.size) loadAuto(); return; }
-  if(active==='view-usage'){ loadUsage(); return; }
-  if(active==='view-logs'){ loadLogs(); return; }
+  if(active==='view-auto'){ if(!RUNNING.size) refreshView('auto',true); return; }
+  if(active==='view-usage'){ refreshView('usage',true); return; }
+  if(active==='view-logs'){ refreshView('logs',true); return; }
   if(active==='view-models') return; // 目录有 15s 缓存语义，静置即可
   if(active==='view-add'||active==='view-settings') return;
-  loadStatus(); // 总览/账号：loadStatus 内部按活跃视图分流渲染
+  refreshView(active==='view-accounts'?'accounts':'overview',true);
 },30000);
 </script>
 </body>

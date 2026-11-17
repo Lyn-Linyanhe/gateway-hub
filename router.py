@@ -28,6 +28,25 @@ DASHBOARD_PATH = os.path.join(HERE, "dashboard.html")
 
 _log_lock = threading.Lock()
 
+# 本机引擎始终直连；urllib 的默认 opener 会缓存进程启动时的系统代理。
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Internal API redirects must never forward panel or API credentials."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_local_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def _urlopen(request, timeout):
+    url = request.full_url if isinstance(request, urllib.request.Request) else request
+    host = (urlsplit(url).hostname or "").lower()
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return _local_opener.open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 # 网关视角的在飞推理请求数（/v1/*，流式算到流写完）：平台卡片「并发」展示用。
 # 这是"经过网关的"并发，直连引擎的请求不计入——与各引擎自己的账号级在飞数互补。
 _inflight_lock = threading.Lock()
@@ -77,9 +96,13 @@ def save_config():
     """
     with _config_lock:
         tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(CONFIG, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +135,7 @@ def upstream_rows(up):
                         up["base_url"].rstrip("/") + f"/v1/models?realm={realm}",
                         headers=_upstream_headers(up),
                     )
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with _urlopen(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     for m in (data.get("data") or []):
                         if m.get("id") and m["id"] not in merged:
@@ -131,7 +154,7 @@ def upstream_rows(up):
                 up["base_url"].rstrip("/") + "/v1/models",
                 headers=_upstream_headers(up),
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             rows = [m for m in (data.get("data") or []) if m.get("id")]
     except Exception as exc:
@@ -174,7 +197,7 @@ def _wb_realm_fetch(up):
                 req = urllib.request.Request(
                     up["base_url"].rstrip("/") + f"/v1/models?realm={realm}",
                     headers=_upstream_headers(up))
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with _urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 ok_any = True
                 for m in (data.get("data") or []):
@@ -289,14 +312,23 @@ def _wb_paid_any():
     return bool(_wb_pool_state().get("paid_any"))
 
 
+def _wb_usable_realms(upstream_id):
+    meta = _wb_realm_meta().get(upstream_id) or {}
+    pool = _wb_pool_state().get("realms") or {}
+    pro = set(meta.get("pro") or [])
+    return [realm for realm in meta.get("realms") or []
+            if realm not in pro or (pool.get(realm) or {}).get("paid")]
+
+
 def _wb_entry_locked(entry):
-    """目录条目是否「PRO 锁定」：requires_pro 标注 + 池里无付费账号
-    + 用户没关自动隐藏开关（config.json hide_pro_locked，默认开）。"""
-    if not entry.get("requires_pro"):
+    if entry.get("platform") != "workbuddy":
         return False
     if not CONFIG.get("hide_pro_locked", True):
         return False
-    return not _wb_paid_any()
+    meta = _wb_realm_meta().get(entry.get("upstream"))
+    if meta:
+        return not _wb_usable_realms(entry["upstream"])
+    return bool(entry.get("requires_pro")) and not _wb_paid_any()
 
 
 def _wb_model_realm(upstream_id):
@@ -336,15 +368,11 @@ def _wb_route_realm(upstream_id):
     meta = _wb_realm_meta().get(upstream_id)
     if not meta or not meta.get("realms"):
         return None
-    realms = set(meta["realms"])
-    if len(realms) == 1:
-        return next(iter(realms))
+    available = _wb_usable_realms(upstream_id)
     pref = _wb_dual_prefer()
-    if pref in realms and pref in set(meta["pro"]) and not _wb_paid_any():
-        other = realms - {pref}
-        if other:
-            return next(iter(other))
-    return pref
+    if pref in available:
+        return pref
+    return next(iter(sorted(available or meta["realms"])), None)
 
 
 def _upstream_headers(up, extra=None):
@@ -677,8 +705,12 @@ def forward(up, method, path, body, client_headers, stream):
         try:
             headers = _upstream_headers(up)
             for k, v in (client_headers or {}).items():
-                if k.lower() in ("accept", "user-agent") or k.lower().startswith("x-"):
-                    headers.setdefault(k, v)
+                lower = k.lower()
+                if lower in ("x-api-key", "x-panel-token"):
+                    continue
+                if lower in ("accept", "user-agent", "anthropic-version", "anthropic-beta") or lower.startswith("x-"):
+                    if not any(key.lower() == lower for key in headers):
+                        headers[k] = v
             if stream:
                 headers["Accept"] = "text/event-stream"
             payload = body if body else None
@@ -686,13 +718,13 @@ def forward(up, method, path, body, client_headers, stream):
                 headers["Content-Length"] = str(len(payload))
             conn.request(method, _upstream_path(up, path), body=payload, headers=headers)
             resp = conn.getresponse()
-            resp_headers = {k: v for k, v in resp.getheaders() if k.lower() not in HOP_HEADERS}
+            resp_headers = {k.title(): v for k, v in resp.getheaders() if k.lower() not in HOP_HEADERS}
         except Exception:
             conn.close()  # 上游连接失败/超时时显式关闭，不留 socket 等 GC
             raise
         # 客户端要流式、但上游回了非流式响应（如 400/401 错误 JSON）时退回缓冲发送：
         # 否则响应无 Content-Length 也无分帧，客户端会挂到自己超时。
-        if stream and "event-stream" not in (resp_headers.get("Content-Type") or ""):
+        if stream and "event-stream" not in (resp_headers.get("Content-Type") or "").lower():
             data = resp.read()
             return resp.status, resp_headers, data
         if stream:
@@ -743,7 +775,7 @@ def _panel_login(up):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with _urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     token = data.get("token") or data.get("panel_token") or ""
     if not token:
@@ -783,7 +815,7 @@ def engine_request(up, method, path, body=None, auth="auto", timeout=15):
             method=method,
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             try:
@@ -805,6 +837,19 @@ def _num(v):
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _known_num(v):
+    """None/invalid means unknown; a real 0 stays 0."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    if n != n or n in (float("inf"), float("-inf")):
+        return None
+    return n
 
 
 def normalize_wb(a):
@@ -941,7 +986,7 @@ def _github_latest(repo):
     req = urllib.request.Request(
         f"https://github.com/{repo}/releases/latest", method="HEAD",
         headers={"User-Agent": "gateway-hub-update-check"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with _urlopen(req, timeout=15) as resp:
         final = resp.geturl()
     m = re.search(r"/releases/tag/([^/?#]+)", final)
     if not m:
@@ -952,7 +997,7 @@ def _github_latest(repo):
 def _engine_version(up):
     """引擎当前版本：/health JSON 的 version 字段，或 Server 头里的 x.y.z。"""
     req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with _urlopen(req, timeout=8) as resp:
         raw = resp.read().decode("utf-8", "ignore") or "{}"
         data = json.loads(raw)
         ver = data.get("version")
@@ -1020,7 +1065,7 @@ def platform_status(up):
            "inflight": _inflight.get(name, 0), "error": ""}
     try:
         req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         # 各引擎 health 形状不同：hub 系 {"ok": true}，Buddy2api {"status": "ok"}。
         if "ok" in body:
@@ -1067,17 +1112,7 @@ def platform_status(up):
                             pass
                 except Exception:
                     pass
-            # 自动倍率观测：余额差 ÷ 期间请求 token，累计进 auto_multipliers
-            try:
-                logs = engine_request(up, "GET", "/admin/logs?limit=100", auth="none")
-                rows_all = logs if isinstance(logs, list) else logs.get("items") or []
-                for a in items:
-                    balance = (a.get("_resources") or {}).get("remaining")
-                    obs = observe_qwenwork_account(up, a.get("id"), balance, rows_all)
-                    if obs and obs.get("updates"):
-                        log(f"自动倍率[{a.get('nickname')}]: {json.dumps(obs.get('updates'), ensure_ascii=False)[:200]}")
-            except Exception:
-                pass
+
         else:
             # hub 系 /accounts 默认只返回当前区域视图，realm=all 才是全池
             data = engine_request(up, "GET", "/accounts?realm=all")
@@ -1101,38 +1136,27 @@ def platform_status(up):
                 row["concurrency_limit"] = limit
                 row["inflight"] = (int(snap.get(row.get("uid")) or 0)
                                    if limit is not None else None)
-            # 国际版账号：区分「真跑了网页通道」和「只有桌面腿/旧标记」。
-            # 网页通道才是每日活跃积分认可的那一步，只凭 lastDailyChat 会
-            # 把「已盖章但没计费」显示成绿色的「今日已打卡」。
+            # 执行记录与奖励到账是两种状态；历史文案不能证明到账。
             intl_rows = [r for r in out["accounts"] if r.get("realm") == "intl"]
             if intl_rows:
                 try:
                     hist = engine_request(
                         up, "GET", "/activity/history?range=today&task=daily_chat&limit=100",
                         timeout=8)
-                    rows = hist.get("rows") if isinstance(hist, dict) else []
+                    rows = (hist.get("rows") or []) if isinstance(hist, dict) else []
                 except Exception:
                     rows = []
-                latest_ok, latest_bad = {}, {}
-                for hr in rows:  # 引擎按最新在前返回
-                    if not isinstance(hr, dict):
-                        continue
-                    uid = str(hr.get("uid") or "")
-                    if not uid:
-                        continue
-                    target = latest_ok if hr.get("ok") else latest_bad
-                    target.setdefault(uid, hr)
+                latest = {}
+                for hr in rows:
+                    if isinstance(hr, dict) and hr.get("uid"):
+                        latest.setdefault(str(hr["uid"]), hr)
                 for row in intl_rows:
-                    uid = str(row.get("uid") or "")
-                    if row.get("daily_chatted_today"):
-                        okrow = latest_ok.get(uid)
-                        row["daily_chat_verified"] = bool(
-                            okrow and "网页通道" in str(okrow.get("message") or ""))
-                    else:
-                        bad = latest_bad.get(uid)
-                        if bad:
-                            row["daily_chat_error"] = str(bad.get("message") or "")[:240]
-                            row["daily_chat_error_at"] = bad.get("ts")
+                    row["daily_chat_verified"] = None
+                    row["daily_chat_reward_status"] = "unknown"
+                    hit = latest.get(str(row.get("uid") or ""))
+                    if hit and hit.get("ok") is False and not row.get("daily_chatted_today"):
+                        row["daily_chat_error"] = str(hit.get("message") or "")[:240]
+                        row["daily_chat_error_at"] = hit.get("ts")
         elif name == "qwenwork":
             try:
                 st = engine_request(up, "GET", "/admin/settings", auth="none")
@@ -1213,28 +1237,27 @@ _estimate_lock = threading.Lock()
 _estimate_cache = {"ts": 0.0, "data": None}
 ESTIMATE_TTL = 120.0
 
-# qwenwork 各模型的实测单价（2026-11-16，柳业宏号，2k prompt 冷/热各一次）。
-# 千问的用量日志不带 cached_tokens，auto_multipliers 的 factor 是余额差÷token
-# 的混合均值，样本一小就会被冷请求和余额差噪声抬到几十倍（曾出现 ling 833 分/1M、
-# flash 554 分/1M）。这里按实测值固定下来，缓存命中用 hit_rate 假设，估算同时
-# 给出 0% 缓存下限。单位：分/千 token。
+# 千问短样本参考单价（2026-11-16，柳业宏号；冷/热各一次）。
+# 这不是官方价，也不保证对任意输入/输出构成成立；只作选型参考，界面必须标注。
 QWEN_MODEL_RATES = {
-    "qwork-auto":      {"public": "flash",             "hit_per_ktok": 0.00159, "miss_per_ktok": 0.01562, "hit_rate": 0.90},
-    "ling-3.1-flash":  {"public": "ling-3.1-flash",    "hit_per_ktok": 0.004115,"miss_per_ktok": 0.004115,"hit_rate": 0.0},
-    "glm-5.3-flash":   {"public": "glm-5.3-flash",     "hit_per_ktok": 0.010425,"miss_per_ktok": 0.010425,"hit_rate": 0.0},
-    "deepseek-flash":  {"public": "deepseek-flash",    "hit_per_ktok": 0.02057, "miss_per_ktok": 0.02057, "hit_rate": 0.0},
-    "qwen3.8-flash":   {"public": "qwen3.8-flash",     "hit_per_ktok": 0.00444, "miss_per_ktok": 0.01521, "hit_rate": 0.90},
-    "qwen4-max":       {"public": "qwen4-max",         "hit_per_ktok": 0.00317, "miss_per_ktok": 0.05102, "hit_rate": 0.90},
-    "step-5-preview":  {"public": "step-5-preview",    "hit_per_ktok": 0.03197, "miss_per_ktok": 0.1009,  "hit_rate": 0.90},
-    "qwen3.8-max-preview": {"public": "qwen3.8-max-preview", "hit_per_ktok": 0.51554, "miss_per_ktok": 0.51554, "hit_rate": 0.0},
+    "qwork-auto":          {"public": "flash",              "hit_per_ktok": 0.00159, "miss_per_ktok": 0.01562, "hit_rate": 0.90},
+    "ling-3.1-flash":      {"public": "ling-3.1-flash",     "hit_per_ktok": 0.004115, "miss_per_ktok": 0.004115, "hit_rate": 0.0},
+    "glm-5.3-flash":       {"public": "glm-5.3-flash",      "hit_per_ktok": 0.010425, "miss_per_ktok": 0.010425, "hit_rate": 0.0},
+    "deepseek-flash":      {"public": "deepseek-flash",     "hit_per_ktok": 0.02057, "miss_per_ktok": 0.02057, "hit_rate": 0.0},
+    "qwen3.8-flash":       {"public": "qwen3.8-flash",      "hit_per_ktok": 0.00444, "miss_per_ktok": 0.01521, "hit_rate": 0.90},
+    "qwen4-max":           {"public": "qwen4-max",          "hit_per_ktok": 0.00317, "miss_per_ktok": 0.05102, "hit_rate": 0.90},
+    "step-5-preview":      {"public": "step-5-preview",     "hit_per_ktok": 0.03197, "miss_per_ktok": 0.1009, "hit_rate": 0.90},
+    "qwen3.8-max-preview": {"public": "qwen3.8-max-preview","hit_per_ktok": 0.51554, "miss_per_ktok": 0.51554, "hit_rate": 0.0},
 }
-QWEN_RATE_BY_PUBLIC = {spec["public"]: spec for spec in QWEN_MODEL_RATES.values()}
 
 
 def _estimate_public_model(platform, model):
     """引擎内部模型名 -> 网关公开 id，用于可见性过滤和展示。"""
+    model = str(model or "")
+    while model.startswith(platform + "/"):
+        model = model[len(platform + "/"):]
     if platform == "qwenwork":
-        spec = QWEN_MODEL_RATES.get(model)
+        spec = _qwen_rate_spec(model, "")
         if spec:
             return spec["public"]
         if model == "qwork-advanced":
@@ -1242,12 +1265,26 @@ def _estimate_public_model(platform, model):
     return model
 
 
-def _estimate_rows(up):
-    """各平台最近的用量行（每引擎最多 1000 条；wb 双区合并）。
+def _qwen_rate_spec(upstream, public):
+    """Match upstream ids with or without extra platform prefixes, then public name."""
+    candidates = [upstream, public]
+    for raw in (upstream, public):
+        text = str(raw or "").strip()
+        while text.startswith("qwenwork/"):
+            text = text[len("qwenwork/"):]
+        candidates.append(text)
+    for key in candidates:
+        spec = QWEN_MODEL_RATES.get(key)
+        if spec:
+            return spec
+    for spec in QWEN_MODEL_RATES.values():
+        if spec.get("public") == public:
+            return spec
+    return None
 
-    用量页的 limit 上限是 500，按当前重度使用只覆盖几小时，外推一天的
-    波动太大；这里直接取引擎允许的最大值（wb 单区 1000 条 ≈ 26h）。
-    """
+
+def _estimate_rows(up):
+    """各平台最近的用量行（每引擎最多 1000 条；wb 双区合并）。"""
     name = up["name"]
     limit = 1000
     if name == "qwenwork":
@@ -1275,192 +1312,136 @@ def _estimate_at(row):
 
 
 def estimate_snapshot(force=False):
-    """{platforms:[{balance,burn_day,days,effective_days,pool_days,reset_days,...}]}
-
-    口径：
-    - 余额只算启用账号（停用账号不参与调度）；
-    - 消耗速度 = 最近 24h 实扣 ÷ 样本覆盖时长 × 24（样本 <2h 或 <10 条不估）；
-    - wb/qoder 实扣来自用量行的 credit；千问没有 credit，用 token×实测单价；
-    - 若某平台 ≥80% 余额在同一日期到期（qoder 整池），可用天数取到期时间；
-    - 千问「按月重置」不是作废，只提示重置日，不压缩天数。
-    """
+    """额度预估：目录单价优先，其次有扣费证据的样本；未知不冒充零。"""
     now = time.time()
     with _estimate_lock:
         hit = _estimate_cache["data"]
         if hit and not force and now - _estimate_cache["ts"] < ESTIMATE_TTL:
             return hit
-    auto = CONFIG.get("auto_multipliers") or {}
-    # 目录单价与分区：wb 的同一模型国内/国际是两个出口，余额也分池；
-    # 预估必须按模型可用分区取余额，不能一律用平台总额。
-    try:
-        cat_rows = public_catalog()
-    except Exception:
-        cat_rows = []
-    cat_info = {}
-    for x in cat_rows:
-        try:
-            mult = _row_multiplier(x["platform"], x["row"]) or {}
-        except Exception:
-            mult = {}
-        cat_info[(x["platform"], x["public"])] = {
-            "realms": list(x.get("realms") or []),
-            "factor": mult.get("factor"),
-            "valley": mult.get("valley"),
-        }
-    qw_credit = sum(float(v.get("credit") or 0) for k, v in auto.items() if k.startswith("qwenwork/"))
-    qw_tokens = sum(float(v.get("tokens") or 0) for k, v in auto.items() if k.startswith("qwenwork/"))
-    qw_fallback = (qw_credit / qw_tokens * 1000) if qw_tokens > 0 else None
+    catalog = public_catalog()
     out = []
     for up in CONFIG["upstreams"]:
         name = up["name"]
         st = platform_status(up)
-        accounts = st.get("accounts") or []
-        balance, enabled = 0.0, 0
+        accounts = [a for a in st.get("accounts", []) if a.get("enabled")]
+        known_balances = [v for v in (_known_num(a.get("remain")) for a in accounts) if v is not None]
+        balance = round(sum(known_balances), 2) if known_balances else None
+        realm_values, realm_totals = {}, {}
         for a in accounts:
-            if a.get("enabled") and a.get("remain") is not None:
-                balance += float(a["remain"])
-                enabled += 1
-        realm_bal = {}
-        for a in accounts:
-            if a.get("enabled") and a.get("remain") is not None:
-                rk = a.get("realm") or "cn"
-                realm_bal[rk] = realm_bal.get(rk, 0.0) + float(a["remain"])
-        item = {"name": name, "balance": round(balance, 2), "enabled": enabled,
-                "realm_balances": {k: round(v, 2) for k, v in realm_bal.items()},
-                "health": bool(st.get("health")), "error": st.get("error") or ""}
-        exp_remain, soon_remain, pool_days, reset_days = 0.0, 0.0, None, None
-        for x in (st.get("expiring") or []):
-            try:
-                d = float(x["days_left"]) if x.get("days_left") is not None else None
-            except (TypeError, ValueError):
-                d = None
-            if "重置" in str(x.get("name") or ""):
-                if d is not None:
-                    reset_days = d if reset_days is None else min(reset_days, d)
-            else:
-                exp_remain += float(x.get("remain") or 0)
-                if d is not None:
-                    pool_days = d if pool_days is None else min(pool_days, d)
-                    if d <= 14:
-                        soon_remain += float(x.get("remain") or 0)
-        item.update({"exp_remain": round(exp_remain, 2),
-                     "soon_remain": round(soon_remain, 2),
-                     "pool_days": pool_days, "reset_days": reset_days})
+            realm = a.get("realm") or "cn"
+            realm_totals[realm] = realm_totals.get(realm, 0) + 1
+            value = _known_num(a.get("remain"))
+            if value is not None:
+                realm_values.setdefault(realm, []).append(value)
+        realm_balances = {
+            realm: (round(sum(realm_values[realm]), 2) if realm_values.get(realm) else None)
+            for realm in realm_totals
+        }
+        realm_known = {
+            realm: {"known": len(realm_values.get(realm, [])), "total": realm_totals[realm]}
+            for realm in realm_totals
+        }
+        item = {"name": name, "balance": balance,
+                "known": len(known_balances), "total": len(accounts),
+                "enabled": len(accounts),
+                "health": st["health"], "error": st.get("error", ""),
+                "realm_balances": realm_balances, "realm_known": realm_known}
         try:
-            raw = _estimate_rows(up)
+            rows = _estimate_rows(up)
         except Exception as exc:
-            item["usage_error"] = f"{type(exc).__name__}: {exc}"
-            raw = []
-        ats, credit, tokens, priced = [], 0.0, 0.0, 0.0
-        by_model = {}
-        for r in raw:
+            rows = []
+            item["usage_error"] = type(exc).__name__
+        samples = {}
+        for r in rows:
             at = _estimate_at(r)
-            if not at or at < now - 86400:
+            if not now - 86400 <= at <= now:
                 continue
-            ats.append(at)
-            tok = _num(r.get("total_tokens") or r.get("total") or 0)
-            tokens += tok
-            mname = str(r.get("resolved_model") or r.get("model") or "?")
-            ms = by_model.setdefault(mname, {"tokens": 0.0, "credit": 0.0})
-            ms["tokens"] += tok
-            raw_credit = r.get("credit") if r.get("credit") is not None else r.get("cost")
-            try:
-                cr = None if raw_credit is None else float(raw_credit)
-            except (TypeError, ValueError):
-                cr = None
-            if cr is not None:
-                credit += cr
-                ms["credit"] += cr
-            elif name == "qwenwork":
-                model = str(r.get("resolved_model") or r.get("model") or "")
-                ent = auto.get(f"qwenwork/{model}")
-                rate = (float(ent.get("factor") or 0) * 1000) if ent else qw_fallback
-                if rate:
-                    credit += tok / 1000.0 * rate
-                    ms["credit"] += tok / 1000.0 * rate
-                    priced += tok
-        span_h = (max(ats) - min(ats)) / 3600.0 if len(ats) >= 2 else 0.0
-        burn = (credit / span_h * 24) if (span_h >= 2 and len(ats) >= 10) else None
-        days = (balance / burn) if (burn and balance > 0) else None
-        pool_all = bool(pool_days is not None and balance > 0 and exp_remain >= balance * 0.8)
-        eff = days
-        if pool_all and (eff is None or pool_days < eff):
-            eff = pool_days
+            model = _estimate_public_model(name, r.get("resolved_model") or r.get("model"))
+            sample = samples.setdefault(model, {"tokens": 0, "priced_tokens": 0, "credit": 0, "rows": 0})
+            tokens = _num(r.get("total_tokens") or r.get("total"))
+            sample["tokens"] += tokens
+            sample["rows"] += 1
+            credit = r.get("credit")
+            if credit is not None and tokens > 0:
+                try:
+                    credit = float(credit)
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= credit < float("inf"):
+                    sample["priced_tokens"] += tokens
+                    sample["credit"] += credit
         models = []
-        for mname, ms in by_model.items():
-            if ms["tokens"] < 1000 or ms["credit"] <= 0:
+        for entry in catalog:
+            if entry["platform"] != name or _model_hidden(name, entry["public"]):
                 continue
-            if name == "qwenwork" and mname not in QWEN_MODEL_RATES:
-                continue  # 没实测过的千问模型不给数字，避免把噪声当单价
-            public = _estimate_public_model(name, mname)
-            if _model_hidden(name, public):
-                continue  # 隐藏/不可选的模型不该出现在「额度预估」里
-            info = cat_info.get((name, public)) or {}
-            if not info:
-                # 上游会改名（如 Qwen4-Max-Preview → Qwen4-Max）：usage 里的
-                # 旧名匹配不到目录时按包含关系回退，避免退化成实测单价。
-                for (cp, cpub), ci in cat_info.items():
-                    if cp == name and cpub and (cpub in public or public in cpub):
-                        info = ci
-                        break
-            realms = info.get("realms") or []
-            model_balance, scope = balance, ""
-            if realms and realm_bal:
-                scoped = sum(realm_bal.get(r, 0.0) for r in realms)
-                if abs(scoped - balance) > 0.01:
-                    model_balance = scoped
-                    if len(realms) == 1:
-                        scope = "仅国际" if realms[0] == "intl" else "仅国内"
-                    else:
-                        scope = "双区合计"
-            spec = QWEN_MODEL_RATES.get(mname) if name == "qwenwork" else None
+            public = entry["public"]
+            model_balance = balance
+            scope = ""
+            if name == "workbuddy":
+                realms = _wb_usable_realms(entry["upstream"])
+                if not realms:
+                    continue
+                scoped_balances = [realm_balances.get(realm) for realm in realms]
+                model_balance = (None if any(v is None for v in scoped_balances)
+                                 else sum(scoped_balances))
+                scope = "双区合计" if len(realms) > 1 else ("仅国际" if realms[0] == "intl" else "仅国内")
+            sample = samples.get(public) or {}
+            priced = sample.get("priced_tokens", 0)
+            credit = sample.get("credit", 0)
+            measured = credit / priced * 1000 if priced >= 1000 and credit > 0 else None
+            spec = _qwen_rate_spec(entry["upstream"], entry["public"]) if name == "qwenwork" else None
+            rate = None
+            rate_src = "unknown"
+            note = "缺少可靠单价，暂不估算"
             extra = {}
-            rate_src = "measured"
             if spec:
-                rate_k = (spec["hit_rate"] * spec["hit_per_ktok"]
-                          + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
-                miss_k = spec["miss_per_ktok"]
+                rate = (spec["hit_rate"] * spec["hit_per_ktok"]
+                        + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
                 rate_src = "cache_assumed"
-                extra = {"cache_hit_rate": spec["hit_rate"],
-                         "cache_assumed": True,
-                         "rate_nocache_per_ktok": round(miss_k, 6),
-                         "est_tokens_nocache": (int(model_balance / miss_k * 1000)
-                                                if (model_balance > 0 and miss_k > 0) else None)}
-            elif name in ("workbuddy", "qoder") and info.get("factor"):
-                # 用官方目录单价（分/千tok，wb 的 credits / qoder 的 price_factor）：
-                # 不随最近 24h 的缓存命中率漂移，是保守的「全价」口径。
-                rate_k = float(info["factor"])
-                rate_src = "catalog"
-            else:
-                rate_k = ms["credit"] / ms["tokens"] * 1000
-            est_tok = (model_balance / rate_k * 1000) if (model_balance > 0 and rate_k > 0) else None
-            row = {"model": public, "tokens": int(ms["tokens"]),
-                   "rate_per_ktok": round(rate_k, 6),
-                   "est_tokens": int(est_tok) if est_tok else None,
-                   "rate_source": rate_src,
-                   "model_balance": round(model_balance, 2) if scope else None,
-                   "balance_scope": scope}
+                hit_pct = int(spec["hit_rate"] * 100)
+                extra = {"cache_hit_rate": spec["hit_rate"], "cache_assumed": True,
+                         "rate_nocache_per_ktok": round(spec["miss_per_ktok"], 6),
+                         "est_tokens_nocache": (int(model_balance / spec["miss_per_ktok"] * 1000)
+                                                if model_balance is not None and model_balance > 0
+                                                else None)}
+                note = f"短样本参考：按 {hit_pct}% 缓存假设，非保证容量"
+            elif name in ("workbuddy", "qoder"):
+                try:
+                    factor = (_row_multiplier(name, entry["row"]) or {}).get("factor")
+                except Exception:
+                    factor = None
+                if factor:
+                    rate = float(factor)
+                    rate_src = "catalog"
+                    note = "官方目录单价（未计缓存折扣）"
+            if rate is None and measured:
+                rate = measured
+                rate_src = "measured"
+                note = "按已记录扣费样本外推，非保证容量"
+            est = (int(model_balance / rate * 1000)
+                   if (rate and model_balance is not None and model_balance > 0) else None)
+            if model_balance is None:
+                note = "余额待测，暂不估算"
+            coverage = priced / sample["tokens"] if sample.get("tokens") else 0
+            row = {"model": public, "tokens": sample.get("tokens", 0),
+                   "samples": sample.get("rows", 0), "coverage": coverage,
+                   "rate_per_ktok": rate, "rate_source": rate_src,
+                   "est_tokens": est,
+                   "model_balance": (round(model_balance, 2)
+                                     if model_balance is not None else None),
+                   "balance_scope": scope,
+                   "balance_unknown": model_balance is None,
+                   "note": note}
             row.update(extra)
             models.append(row)
-        # 按「这个模型能跑多少 token」从多到少排：模型页是选型用的，
-        # 谁最耐用谁排前面；旧口径按采样 token 排会把刚测的小样本排到最后。
-        models.sort(key=lambda x: -(x.get("est_tokens") or 0))
-        item["models"] = models[:12]
-        item.update({
-            "rows": len(ats),
-            "sample_hours": round(span_h, 1),
-            "credit": round(credit, 2),
-            "coverage": round(priced / tokens, 3) if (name == "qwenwork" and tokens > 0) else None,
-            "burn_day": round(burn, 2) if burn else None,
-            "days": round(days, 1) if days is not None else None,
-            "pool_all": pool_all,
-            "effective_days": round(eff, 1) if eff is not None else None,
-        })
+        models.sort(key=lambda m: (m["est_tokens"] is None, -(m["est_tokens"] or 0), m["model"]))
+        item["models"] = models
+        # 不从分散到期的积分包推断整个池的寿命。
+        item.update(burn_day=None, days=None, effective_days=None, pool_all=False)
         out.append(item)
     data = {"ok": True, "generated_at": int(now), "window_hours": 24, "platforms": out}
     with _estimate_lock:
-        _estimate_cache["ts"] = now
-        _estimate_cache["data"] = data
+        _estimate_cache.update(ts=now, data=data)
     return data
 
 
@@ -1493,121 +1474,64 @@ def _checkin_tally(result):
     return sum(1 for row in rows if row.get("ok")), len(rows)
 
 
-def _rows_failure(result):
-    """引擎管理动作的 results 行里有失败时，返回第一条原因；否则 None。
+def _action_status(result):
+    """汇总已知业务结果容器；不把附带账号快照当成执行结果。
 
-    /api/engine 以前只看 HTTP 成败，账号级失败（如每日活跃网页通道 401）
-    也会回 ok=True，前端便显示「成功」而账号仍停在待打卡。
+    结果行（results/claimed 下的条目）缺少布尔 ok 时按未知处理：既不算成功，
+    也不会让顶层 ok=true。engine/tasks 的显式 ok/error 语义保持不变。
     """
-    if not isinstance(result, dict):
-        return None
-    rows = result.get("results")
-    if not isinstance(rows, list):
-        return None
-    bad = [r for r in rows if isinstance(r, dict) and r.get("ok") is False]
-    if not bad:
-        return None
-    for row in bad:
-        msg = str(row.get("msg") or row.get("error") or "")
-        if msg:
-            return msg
-    return "部分操作未成功"
+    successes, failures, unknown = 0, 0, 0
+    errors = []
+
+    def visit(value, is_result_row=False):
+        nonlocal successes, failures, unknown
+        if isinstance(value, list):
+            for child in value:
+                visit(child, is_result_row)
+            return
+        if not isinstance(value, dict):
+            return
+        result_keys = ("results", "claimed", "result", "cn_checkin", "intl_daily_chat")
+        before = successes + failures + unknown
+        for key in result_keys:
+            if isinstance(value.get(key), (dict, list)):
+                visit(value[key], key in ("results", "claimed"))
+        failed = value.get("ok") is False or bool(value.get("error"))
+        if failed:
+            failures += 1
+            errors.append(str(value.get("error") or value.get("msg")
+                              or value.get("message") or "上游业务失败"))
+        elif before != successes + failures + unknown:
+            return  # 容器：结果已由子节点记账
+        elif value.get("ok") is True or value.get("skipped"):
+            successes += 1
+        elif is_result_row:
+            unknown += 1
+            errors.append(str(value.get("msg") or value.get("message")
+                              or "结果缺少 ok 判定"))
+
+    visit(result)
+    status = {"ok": failures == 0 and unknown == 0,
+              "partial": successes > 0 and (failures > 0 or unknown > 0)}
+    if unknown:
+        status["unknown"] = unknown
+    if errors:
+        status["error"] = errors[0][:240]
+    return status
 
 
 def tail_log(lines=120):
     try:
         with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            return f.readlines()[-lines:]
+            return [re.sub(r"API Key:.*", "API Key: [redacted]", line) for line in f.readlines()[-lines:]]
     except OSError:
         return []
 
 
 # ---------------------------------------------------------------------------
-# 千问办公自动倍率：余额快照差 ÷ 期间 token 消耗 → 每模型实测倍率。
-# 状态存 qwenwork_tracker.json（每账号的上次余额 / 上次日志 id），倍率累计
-# 进 config.json 的 auto_multipliers，重启不丢。
-# ---------------------------------------------------------------------------
+# 钱包历史写入锁；历史仅作余额观测，不自动推算模型单价。
+_wallet_lock = threading.Lock()
 
-_qwen_tracker_lock = threading.Lock()
-_wallet_lock = threading.Lock()  # 钱包历史 jsonl 的追加+轮转专用锁
-TRACKER_PATH = os.path.join(HERE, "qwenwork_tracker.json")
-
-
-def _tracker_load():
-    try:
-        with open(TRACKER_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _tracker_save(st):
-    try:
-        with open(TRACKER_PATH, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=1)
-    except OSError:
-        pass
-
-
-def observe_qwenwork_account(up, aid, balance, rows_all):
-    """对一个 qwenwork 账号做一次余额观测：差值按 token 占比分摊到期间请求的
-    模型上，累计进 auto_multipliers。返回观测摘要（写日志用）。"""
-    # public_catalog 缓存过期时会串行打上游（每个 10s 超时），不能在锁内做网络 I/O
-    pub_map = {x["upstream"]: x["public"] for x in public_catalog()
-               if x["platform"] == "qwenwork"}
-    with _qwen_tracker_lock:
-        st = _tracker_load()
-        accts = st.setdefault("accounts", {})
-        astate = accts.setdefault(str(aid), {"last_balance": None, "last_log_id": 0})
-
-        def _rid(r):  # 日志 id 统一转 int：上游回字符串 id 时混比会 TypeError，静默停摆
-            try:
-                return int(r.get("id") or 0)
-            except (TypeError, ValueError):
-                return 0
-        last_id = astate.get("last_log_id", 0)
-        new_rows = [r for r in rows_all
-                    if isinstance(r, dict) and str(r.get("account_id")) == str(aid)
-                    and _rid(r) > last_id
-                    and r.get("status_code") == 200]
-        max_id = max([_rid(r) for r in rows_all if isinstance(r, dict)] + [last_id])
-        astate["last_log_id"] = max_id
-        tokens_by_model = {}
-        for r in new_rows:
-            m = r.get("resolved_model") or r.get("model") or "?"
-            tokens_by_model[m] = tokens_by_model.get(m, 0) + _num(r.get("total_tokens"))
-        delta = None
-        if balance is not None and astate.get("last_balance") is not None:
-            delta = round(astate["last_balance"] - balance, 6)
-        result = {"delta": delta, "tokens_by_model": tokens_by_model, "updates": {}}
-        total_tokens = sum(tokens_by_model.values())
-        auto = CONFIG.get("auto_multipliers") or {}
-        if delta and delta > 0 and total_tokens > 0:
-            # total_tokens>0 守卫：200 状态但 token 为 0/缺失的行会把分母打成 0
-            for m, tok in tokens_by_model.items():
-                public = pub_map.get(m, m)
-                key = "qwenwork/" + public
-                ent = auto.get(key) or {"credit": 0.0, "tokens": 0.0, "samples": 0}
-                share = delta * tok / total_tokens
-                ent["credit"] = round(ent.get("credit", 0.0) + share, 6)
-                ent["tokens"] = round(ent.get("tokens", 0.0) + tok, 1)
-                ent["samples"] = ent.get("samples", 0) + 1
-                ent["factor"] = round(ent["credit"] / ent["tokens"], 8) if ent["tokens"] else None
-                auto[key] = ent
-                result["updates"][key] = {"share_credit": round(share, 6),
-                                          "tokens": tok, "factor": ent["factor"]}
-            CONFIG["auto_multipliers"] = auto
-            save_config()
-        elif delta and delta > 0:
-            result["unattributed"] = delta  # 期间没有 qwenwork 请求记录的余额减少
-        astate["last_balance"] = balance
-        _tracker_save(st)
-        return result
-
-
-# ---------------------------------------------------------------------------
-# HTTP 服务。
-# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -1623,17 +1547,52 @@ class Handler(BaseHTTPRequestHandler):
         if not want:
             return True
         got = self.headers.get("Authorization", "")
-        return got == "Bearer " + want or got == want
+        api_key = self.headers.get("x-api-key", "")
+        return (secrets.compare_digest(got.encode(), ("Bearer " + want).encode())
+                or secrets.compare_digest(got.encode(), want.encode())
+                or secrets.compare_digest(api_key.encode(), want.encode()))
 
-    def _safe_content_length(self):
-        """Content-Length 头非法（如手工构造的 "abc"）时返回 -1，调用方回 400。
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
 
-        直接 int() 会在 try 外抛 ValueError，handler 崩溃成 0 字节响应。
-        """
+    def _read_post_object(self):
+        """Consume one framed object before dispatching any operation."""
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) > 1 or self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._deny(400, "不支持的请求体长度或传输编码")
+            return None
+        raw_length = lengths[0].strip() if lengths else "0"
+        if not re.fullmatch(r"[0-9]+", raw_length):
+            self.close_connection = True
+            self._deny(400, "Content-Length 非法")
+            return None
         try:
-            return int(self.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            return -1
+            length = int(raw_length)
+        except ValueError:
+            length = 32 * 1024 * 1024 + 1
+        if length > 32 * 1024 * 1024:
+            self.close_connection = True
+            self._deny(413, "请求体过大（上限 32MB）")
+            return None
+        try:
+            raw = self.rfile.read(length) if length else b""
+            if len(raw) != length:
+                raise ValueError("请求体未完整接收")
+        except (OSError, ValueError):
+            self.close_connection = True
+            self._deny(400, "请求体未完整接收")
+            return None
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, RecursionError):
+            self._deny(400, "请求体不是合法 JSON")
+            return None
+        if not isinstance(body, dict):
+            self._deny(400, "请求体必须是 JSON 对象")
+            return None
+        return body
 
     def _deny(self, code, message, err_type="invalid_request_error"):
         self._send_json(code, {"error": {"message": message, "type": err_type}})
@@ -1705,44 +1664,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"lines": "".join(tail_log())})
         return self._deny(404, "未知路径")
 
-    def _drain_body(self):
-        """keep-alive 下被拒请求的 body 必须排干，否则残留字节会被当成下一个
-        请求行解析（连接失步 400/挂死）。超过 1MB 或排不干就断开连接。"""
-        try:
-            length = self._safe_content_length()
-        except Exception:
-            length = -1
-        if length <= 0:
-            if length < 0:
-                self.close_connection = True
-            return
-        remaining = min(length, 1024 * 1024)
-        try:
-            while remaining > 0:
-                chunk = self.rfile.read(min(remaining, 65536))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-        except OSError:
-            remaining = 1  # 读取中断，无法保证边界干净
-        if remaining > 0 or length > 1024 * 1024:
-            self.close_connection = True
-
     def do_POST(self):
         t0 = time.time()
         path = self.path.split("?")[0]
         if not self._authorized():
-            self._drain_body()
+            self.close_connection = True
             return self._deny(401, "API Key 缺失或不正确")
+        self._post_body = self._read_post_object()
+        if self._post_body is None:
+            return
         if path.startswith("/api/checkin/"):
-            self._drain_body()
             return self._api_checkin(path.rsplit("/", 1)[-1])
         if path.startswith("/api/tasks/"):
             # /api/tasks/{action}/{platform}
             parts = path.strip("/").split("/")
             if len(parts) == 4:
                 return self._api_tasks_post(parts[2], parts[3])
-            self._drain_body()
             return self._deny(404, "任务操作格式: /api/tasks/{action}/{platform}")
         if path == "/api/models/visibility":
             return self._api_visibility()
@@ -1753,33 +1690,19 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/login/start/"):
             return self._api_login_start(path.rsplit("/", 1)[-1])
         if path.startswith("/api/qwenwork/reimport"):
-            self._drain_body()
             return self._api_qwenwork_reimport()
         if path == "/api/engine":
             return self._api_engine()
         if path == "/api/gwconfig":
             return self._api_gwconfig()
         if path not in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
-            self._drain_body()
             return self._deny(404, "仅支持 /v1/* 与 /api/*")
 
-        length = self._safe_content_length()
-        if length < 0:
-            self.close_connection = True  # 边界无法定位，keep-alive 必须断连
-            return self._deny(400, "Content-Length 非法")
-        if length > 32 * 1024 * 1024:
-            self._drain_body()
-            return self._deny(413, "请求体过大（上限 32MB）")
-        body = self.rfile.read(length) if length else b""
-        try:
-            req = json.loads(body.decode("utf-8")) if body else {}
-        except (ValueError, RecursionError):
-            return self._deny(400, "请求体不是合法 JSON")
+        req = self._post_body
         t_parse = time.time()
-        if not isinstance(req, dict):
-            return self._deny(400, "请求体必须是 JSON 对象")
-
-        model = req.get("model") or ""
+        model = req.get("model", "")
+        if not isinstance(model, str):
+            return self._deny(400, "model 必须是字符串")
         up, upstream_model, client_facing, reason = resolve_model(model)
         if up is None:
             return self._deny(400, reason)
@@ -1798,7 +1721,7 @@ class Handler(BaseHTTPRequestHandler):
             # wb_dual_prefer（默认 auto：临期积分包更紧急的区优先消耗）。
             realm = _wb_model_realm(upstream_model) or _wb_route_realm(upstream_model)
             if realm:
-                client_h.pop("X-Realm", None)  # 客户端误带的区域头不覆盖路由判定
+                client_h = {k: v for k, v in client_h.items() if k.lower() != "x-realm"}  # 客户端误带的区域头不覆盖路由判定
                 client_h["X-Realm"] = realm
                 log(f"wb 分区路由: {upstream_model} -> {realm}")
 
@@ -1837,43 +1760,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.close_connection = True
         self.end_headers()
-        first = True
-        buf = b""
-        # 首字计时：只认带 data: 的 SSE 数据块（引擎会先发 ": ping" 注释心跳）
         first_data_at = None
         try:
-            for chunk in chunks:
+            for chunk in _rewrite_sse_chunks(chunks, client_facing):
                 if first_data_at is None and b"data:" in chunk:
                     first_data_at = time.time()
-                if first and client_facing:
-                    # 8192 字节块可能把首个 `data:` 行拦腰截断，直接改写会静默失败。
-                    # 缓冲到首个完整 SSE 事件（\n\n 边界）再改写；超过 64KB 放弃改写原样透传。
-                    buf += chunk
-                    idx = buf.find(b"\n\n")
-                    if idx < 0:
-                        if len(buf) > 65536:
-                            first = False
-                            self.wfile.write(buf)
-                            self.wfile.flush()
-                            buf = b""
-                        continue
-                    first = False
-                    head = _rewrite_sse_model(buf[:idx + 2], client_facing)
-                    rest = buf[idx + 2:]
-                    self.wfile.write(head)
-                    if rest:
-                        self.wfile.write(rest)
-                    self.wfile.flush()
-                    buf = b""
-                    continue
                 self.wfile.write(chunk)
                 self.wfile.flush()
-            if buf:  # 流结束仍没凑齐事件边界（极短响应）：尽力改写
-                self.wfile.write(_rewrite_sse_model(buf, client_facing) if first and client_facing else buf)
-                self.wfile.flush()
         except (ConnectionError, TimeoutError, HTTPException) as exc:
-            # Windows 客户端中止常见 ConnectionAbortedError；上游读侧超时/重置也在这里收口
             log(f"连接中断（{up['name']}）: {type(exc).__name__}")
+        finally:
+            close = getattr(chunks, "close", None)
+            if close:
+                close()
         log(f"stream 完成 -> {client_facing}")
         if t0:
             total_ms = int((time.time() - t0) * 1000)
@@ -2004,52 +1903,19 @@ class Handler(BaseHTTPRequestHandler):
                 intl_part = {"error": f"{type(exc).__name__}: {exc}"}
         if intl_part is not None:
             result = {"cn_checkin": result, "intl_daily_chat": intl_part}
-        # 顶层 ok 必须反映账号级成败：部分账号失败也不能回「签到成功」，
-        # 否则页面一边弹成功、一边把失败账号显示成「待打卡」，看起来就是
-        # 签到显示有问题。ok 只在全部账号都成功时为 true。
+        status = _action_status(result)
         tally = _checkin_tally(result)
-        nested_error = isinstance(result, dict) and any(
-            isinstance(v, dict) and v.get("error") for v in result.values())
-        failed = isinstance(result, dict) and (bool(result.get("error")) or nested_error)
-        if tally:
-            ok_n, total = tally
-            ok = ok_n == total and not failed
-            partial = 0 < ok_n < total
-        else:
-            ok_n = total = None
-            ok = not failed
-            partial = False
-        log(f"checkin[{name}] -> {json.dumps(result, ensure_ascii=False)[:200]}")
-        payload = {"ok": ok, "platform": name, "result": result}
-        if tally:
+        if tally is not None:
+            checked, total = tally
+            if checked < total:
+                status["ok"] = False
+                status["partial"] = checked > 0
+                if not status.get("error"):
+                    status["error"] = f"{checked}/{total} 个账号成功"
+        payload = {"platform": name, "result": result, **status}
+        if tally is not None:
             payload["checked"], payload["total"] = tally
-        if partial:
-            payload["partial"] = True
-        if not ok:
-            # 取第一条账号级 / 步骤级失败原因：前端与一键全自动只看 error 字段
-            reason = ""
-            if isinstance(result, dict):
-                for value in result.values():
-                    if not isinstance(value, dict):
-                        continue
-                    if value.get("error"):
-                        reason = str(value["error"])
-                        break
-                    for row in value.get("results") or []:
-                        if isinstance(row, dict) and not row.get("ok"):
-                            reason = str(row.get("msg") or row.get("error") or "")
-                            break
-                    if reason:
-                        break
-            suffix = f"：{reason[:120]}" if reason else ""
-            if tally and ok_n and ok_n < total:
-                payload["error"] = f"部分账号未成功（{ok_n}/{total}）{suffix}"
-            elif tally and ok_n == total:
-                payload["error"] = f"签到步骤失败{suffix}"
-            elif tally:
-                payload["error"] = f"签到失败：所有账号均未成功{suffix}"
-            else:
-                payload["error"] = f"签到失败{suffix}"
+        log(f"checkin[{name}] ok={status['ok']} partial={status['partial']}")
         self._send_json(200, payload)
 
     # ---- 任务中心（成长任务 / 猫猫旅行 / 福利领取，代理到各引擎） ----
@@ -2086,15 +1952,7 @@ class Handler(BaseHTTPRequestHandler):
         if not spec:
             return self._deny(400, f"平台 `{name}` 不支持任务操作 `{action}`")
         engine_path, label = spec
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        body = {}
-        if length:
-            try:
-                body = json.loads(self.rfile.read(length).decode("utf-8")) or {}
-            except (ValueError, RecursionError):
-                return self._deny(400, "请求体不是合法 JSON")
+        body = self._post_body
         # wb 的 /tasks/claim 必须指定 {uid, code}；控制台调用没带 code 时自动
         # 拉 /tasks 找出「已完成未领奖」的任务逐个领取。
         if action == "claim" and name == "workbuddy":
@@ -2127,8 +1985,9 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception as exc:
                             results.append({"code": code, "error": str(exc)})
                     log(f"tasks/claim[{name}] auto -> {len(results)} 项: {json.dumps(results, ensure_ascii=False)[:150]}")
-                    return self._send_json(200, {"ok": True, "platform": name, "action": action,
-                                                 "result": {"uid": uid, "claimed": results}})
+                    return self._send_json(200, {"platform": name, "action": action,
+                                                 "result": {"uid": uid, "claimed": results},
+                                                 **_action_status({"claimed": results})})
                 body["uid"] = uid
             except Exception as exc:
                 log(f"tasks/claim[{name}] 预备阶段失败（继续按原 body 执行）: {type(exc).__name__}: {exc}")
@@ -2136,9 +1995,9 @@ class Handler(BaseHTTPRequestHandler):
             # run/claim/travel 在引擎里跑真实会话，分钟级耗时；默认 15s 会 502 而
             # 引擎仍在跑，用户重复点击造成重复执行
             result = engine_request(up, "POST", engine_path, body, timeout=300)
-            log(f"tasks/{action}[{name}] -> {json.dumps(result, ensure_ascii=False)[:200]}")
-            self._send_json(200, {"ok": True, "platform": name, "action": action,
-                                  "label": label, "result": result})
+            log(f"tasks/{action}[{name}] completed")
+            self._send_json(200, {"platform": name, "action": action,
+                                  "label": label, "result": result, **_action_status(result)})
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:300]
             self._send_json(502, {"ok": False, "platform": name, "action": action,
@@ -2166,13 +2025,7 @@ class Handler(BaseHTTPRequestHandler):
         """POST /api/engine  {platform, path, method?, body?}
         代理调用引擎面板接口（仅白名单路径），供自动化页的保活/积分/活跃按钮使用。
         """
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        try:
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except (ValueError, RecursionError):
-            return self._deny(400, "请求体不是合法 JSON")
+        body = self._post_body
         name = str(body.get("platform") or "").strip()
         path = str(body.get("path") or "").strip().strip("/")
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
@@ -2188,15 +2041,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             auth = "none" if name == "qwenwork" else "panel"
             result = engine_request(up, method, "/" + path, payload, auth=auth, timeout=timeout)
-            log(f"engine[{name}] {method} /{path} -> {json.dumps(result, ensure_ascii=False)[:150]}")
-            # 账号级失败要反映到顶层 ok：否则「每日活跃打卡」明明 0/2 成功，
-            # 前端仍显示绿色「成功」，与账号页的「待打卡」自相矛盾。
-            failure = _rows_failure(result)
-            if failure:
-                self._send_json(200, {"ok": False, "platform": name, "path": path,
-                                      "result": result, "error": failure[:240]})
-            else:
-                self._send_json(200, {"ok": True, "platform": name, "path": path, "result": result})
+            log(f"engine[{name}] {method} /{path} completed")
+            self._send_json(200, {"platform": name, "path": path,
+                                  "result": result, **_action_status(result)})
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:300]
             self._send_json(502, {"ok": False, "platform": name, "path": path,
@@ -2218,15 +2065,7 @@ class Handler(BaseHTTPRequestHandler):
                 "hide_pro_locked": bool(CONFIG.get("hide_pro_locked", True)),
                 "wb_dual_prefer": (CONFIG.get("wb_dual_prefer") or "auto").lower(),
                 "wb_realms": (_wb_pool_state().get("realms") or {})})
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        try:
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except (ValueError, RecursionError):
-            return self._deny(400, "请求体不是合法 JSON")
-        if not isinstance(body, dict):
-            return self._deny(400, "请求体必须是 JSON 对象")
+        body = self._post_body
         updates = {}
         if "hide_pro_locked" in body:
             updates["hide_pro_locked"] = bool(body.get("hide_pro_locked"))
@@ -2266,12 +2105,12 @@ class Handler(BaseHTTPRequestHandler):
         except ZeroDivisionError:
             speed = None
         # credit 数值化：上游若回字符串会让前端聚合变字符串拼接、toFixed 崩溃
-        raw_credit = row.get("credit") if row.get("credit") is not None else row.get("cost")
+        raw_credit = row.get("credit")
         try:
             credit = None if raw_credit is None else float(raw_credit)
         except (TypeError, ValueError):
             credit = None
-        # wb 用量行带真实成本（上游官方价折算的人民币/美元）——跨平台换算的统一锚点
+        # 引擎的货币成本是参考估价，与平台实际积分结算区分。
         raw_cny = row.get("cost_cny")
         try:
             cost_cny = None if raw_cny is None else float(raw_cny)
@@ -2294,7 +2133,7 @@ class Handler(BaseHTTPRequestHandler):
             "stream": bool(row.get("stream")) if row.get("stream") is not None else None,
             "prompt": _num(row.get("prompt_tokens")),
             "completion": _num(row.get("completion_tokens")),
-            "cached": _num(row.get("cached_tokens")),
+            "cached": (_num(row["cached_tokens"]) if row.get("cached_tokens") is not None else None),
             "reasoning": _num(row.get("reasoning_tokens")),
             "total": _num(row.get("total_tokens")) or (_num(row.get("prompt_tokens")) + _num(row.get("completion_tokens"))),
             "credit": credit,
@@ -2366,15 +2205,7 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up or name == "qwenwork":
             return self._deny(400, "千问办公没有 OAuth 流程：在官方客户端登录后点「重新检测并导入」")
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        body = {}
-        if length:
-            try:
-                body = json.loads(self.rfile.read(length).decode("utf-8")) or {}
-            except (ValueError, RecursionError):
-                return self._deny(400, "请求体不是合法 JSON")
+        body = self._post_body
         spec = self.LOGIN_START.get(name)
         if spec is None:  # 配置了上游但没配 OAuth 流程的平台名，别 KeyError 崩线程；
             # 注意不能用 not spec——qoder 的配置是空字典 {}，falsy 但合法
@@ -2455,7 +2286,6 @@ class Handler(BaseHTTPRequestHandler):
         手工记录的实测倍率（观察官方「用量明细」后填入），没有则 None。
         """
         custom = CONFIG.get("custom_multipliers") or {}
-        auto = CONFIG.get("auto_multipliers") or {}
         favorites = set(CONFIG.get("favorite_models") or [])
         qwen_names = None
         items = []
@@ -2467,37 +2297,7 @@ class Handler(BaseHTTPRequestHandler):
                 mult = {"factor": custom[full].get("factor"), "source": "manual",
                         "note": custom[full].get("note", ""),
                         "recorded_at": custom[full].get("recorded_at", "")}
-            # 千问办公的公开 id `flash` 在引擎里实际路由到 qwork-auto，
-            # 自动倍率按引擎内部名记录；不做这层映射，模型页会把最便宜的
-            # 档位显示成「无单价」。
-            auto_key = ("qwenwork/qwork-auto"
-                        if x["platform"] == "qwenwork" and x["public"] == "flash"
-                        else full)
-            if mult is None and auto_key in auto:
-                ent = auto[auto_key]
-                mult = {"factor": ent.get("factor"), "source": "auto",
-                        "samples": ent.get("samples"),
-                        "credit": ent.get("credit"), "tokens": ent.get("tokens")}
-            # 千问的 auto 均值会被「冷请求 + 余额差噪声」抬高（实测出现过
-            # ling 833 分/1M、flash 554 分/1M）。有实测值的模型统一用实测
-            # 单价覆盖；没有实测值的模型不给 auto 数字，避免把噪声当单价。
-            if x["platform"] == "qwenwork":
-                spec = QWEN_RATE_BY_PUBLIC.get(x["public"])
-                if spec:
-                    rate_k = (spec["hit_rate"] * spec["hit_per_ktok"]
-                              + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
-                    miss_1m = spec["miss_per_ktok"] * 1000
-                    if spec["hit_rate"] > 0:
-                        note = (f"按 {int(spec['hit_rate'] * 100)}% 缓存命中实测估算；"
-                                f"0% 缓存 {miss_1m:.2f} 分/1M")
-                    else:
-                        note = f"实测无缓存 {miss_1m:.2f} 分/1M"
-                    mult = {"factor": rate_k / 1000.0, "source": "auto",
-                            "samples": 0, "credit": 0, "tokens": 0,
-                            "note": note}
-                else:
-                    if not (mult and mult.get("source") == "manual"):
-                        mult = None
+            # 无可靠逐请求价格的渠道保留手工倍率，不展示余额差推导值。
             # 千问办公：把官方套餐名（标准/高级/Qwen4-Max 预览版…）并进展示名
             if x["platform"] == "qwenwork":
                 if qwen_names is None:
@@ -2532,19 +2332,6 @@ class Handler(BaseHTTPRequestHandler):
                     item["alias_of"] = alias_of  # 本 id 是某逻辑模型在国际版出口的改名
             items.append(item)
         items.sort(key=lambda i: (i["platform"], i["model"]))
-        # 千问办公 auto_multipliers.factor 是「分/token」绝对值（实测 ~0.0000622），
-        # 直接当倍率展示像乱码。改成同平台相对最便宜模型的倍率（x1.00 / x2.57…），
-        # 绝对单价另给 rate_per_ktok（分/千tok），供「额度可用量预估」用。
-        auto_rows = [(i, i["multiplier"].get("factor")) for i in items
-                     if i["platform"] == "qwenwork" and i.get("multiplier")
-                     and i["multiplier"].get("source") == "auto"
-                     and i["multiplier"].get("factor")]
-        if auto_rows:
-            base_item, base_factor = min(auto_rows, key=lambda pair: pair[1])
-            for item, factor in auto_rows:
-                item["multiplier"]["rel_factor"] = round(factor / base_factor, 3)
-                item["multiplier"]["rel_base"] = base_item["model"]
-                item["multiplier"]["rate_per_ktok"] = round(factor * 1000, 6)
         hidden = _hidden_set()
         # hidden 数组是前端实时同步行状态的依据：只回 hidden_count 会让
         # 已隐藏模型在每次加载模型页时被错误覆写成「显示中」
@@ -2554,13 +2341,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_model_favorite(self):
         """POST /api/models/favorite {id, fav} — 标记常用模型（置顶展示）。"""
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        try:
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except (ValueError, RecursionError):
-            return self._deny(400, "请求体不是合法 JSON")
+        body = self._post_body
         mid = str(body.get("id") or "").strip()
         if not mid:
             return self._deny(400, "需要 id（平台/模型 全名）")
@@ -2580,13 +2361,7 @@ class Handler(BaseHTTPRequestHandler):
         主要给千问办公用（目录不暴露单价）：观察官方用量明细后把「积分/请求」
         折算成倍率记进来。factor 传 0 或空表示清除记录。
         """
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        try:
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except (ValueError, RecursionError):
-            return self._deny(400, "请求体不是合法 JSON")
+        body = self._post_body
         mid = str(body.get("id") or "").strip()
         if not mid:
             return self._deny(400, "需要 id（平台/模型 全名）")
@@ -2619,13 +2394,7 @@ class Handler(BaseHTTPRequestHandler):
         {"platform": "qoder", "visible": bool}   整平台
         {"visible": true}                         全部恢复显示
         """
-        length = self._safe_content_length()
-        if length < 0:
-            return self._deny(400, "Content-Length 非法")
-        try:
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except (ValueError, RecursionError):
-            return self._deny(400, "请求体不是合法 JSON")
+        body = self._post_body
         with _config_lock:
             hidden = _hidden_set()
             if "ids" in body:
@@ -2674,7 +2443,7 @@ class Handler(BaseHTTPRequestHandler):
         for up in CONFIG["upstreams"]:
             try:
                 req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _urlopen(req, timeout=5) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                 # 各引擎 health 形状不同：hub 系 {"ok": true}，Buddy2api {"status": "ok"}。
                 if "ok" in body:
@@ -2689,21 +2458,52 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _rewrite_sse_model(chunk, model):
-    """首块 SSE 里把 upstream 模型名改写为客户端请求名；失败原样返回。"""
+    """只改协议中的模型字段，保留事件名、心跳与换行格式。"""
+    if not model:
+        return chunk
     try:
         text = chunk.decode("utf-8")
-        out = []
-        for line in text.split("\n"):
-            if line.startswith("data:") and '"model"' in line:
-                body = line[5:].strip()
-                if body and body != "[DONE]":
-                    obj = json.loads(body)
-                    obj["model"] = model
-                    line = "data: " + json.dumps(obj, ensure_ascii=False)
-            out.append(line)
-        return "\n".join(out).encode("utf-8")
-    except Exception:
-        return chunk
+        ending = text[len(text.rstrip("\r\n")):]
+        line = text.rstrip("\r\n")
+        if not line.startswith("data:"):
+            return chunk
+        obj = json.loads(line[5:].strip())
+        if not isinstance(obj, dict):
+            return chunk
+        changed = False
+        for target in (obj, obj.get("message"), obj.get("response")):
+            if isinstance(target, dict) and "model" in target:
+                target["model"] = model
+                changed = True
+        if changed:
+            return ("data: " + json.dumps(obj, ensure_ascii=False) + ending).encode("utf-8")
+    except (ValueError, UnicodeError):
+        pass
+    return chunk
+
+
+def _rewrite_sse_chunks(chunks, model):
+    """按 SSE 行增量处理；大行直接透传，避免无限缓存。"""
+    buf = b""
+    passthrough = False
+    for chunk in chunks:
+        buf += chunk
+        while True:
+            boundary = re.search(rb"\r\n|\n|\r(?!$)", buf)
+            if boundary is None:
+                break
+            end = boundary.end()
+            line, buf = buf[:end], buf[end:]
+            yield line if passthrough else _rewrite_sse_model(line, model)
+            passthrough = False
+        if len(buf) > 65536:
+            # 保留尾部 CR，以免将跨块 CRLF 拆成两个换行。
+            keep = 1 if buf.endswith(b"\r") else 0
+            yield buf[:-keep] if keep else buf
+            buf = buf[-keep:] if keep else b""
+            passthrough = True
+    if buf:
+        yield buf if passthrough else _rewrite_sse_model(buf, model)
 
 
 def ensure_api_key():
@@ -2736,7 +2536,7 @@ def main():
     key = ensure_api_key()
     names = ", ".join(u["name"] + ":" + u["base_url"] for u in CONFIG["upstreams"])
     log(f"gateway-hub v{VERSION} 启动 port={port} upstreams=[{names}]")
-    log(f"API Key: {key}")
+    log("API Key 已配置（请在本机 config.json 中查看）")
     try:
         server = Server(("127.0.0.1", port), Handler)
     except OSError as exc:

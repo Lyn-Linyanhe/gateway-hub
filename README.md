@@ -28,7 +28,7 @@
 - **统一带平台前缀**：`/v1/models` 只发 `平台/模型`（如 `workbuddy/glm-5.3`），一眼看出归属；裸名调用仍兼容（全网关唯一时）。
 - **双区临期调度（WorkBuddy）**：同名模型国内版/国际版都有时，按两区「最临期积分包」的紧迫度自动选择出口（`wb_dual_prefer: auto/cn/intl`）；选中区域对该模型有会员门槛且无付费账号时自动换区。
 - **PRO 会员锁定**：上游目录标注的付费专属模型，在账号池没有付费账号时自动从 `/v1/models` 隐藏并给出明确拒绝话术；会员账号入池后自动恢复。
-- **用量分析**：三平台请求合并明细（含输入/输出/缓存/推理强度/耗时/速度）；按平台分段的 token 时间曲线；各平台缓存命中率曲线；按模型汇总；**换算统计**（实测积分/千tok vs 目录倍率，WorkBuddy 附真实成本锚点）。
+- **用量分析**：三平台请求合并明细（含输入/输出/缓存/推理强度/耗时/速度）；按平台分段的 token 时间曲线；各平台缓存命中率曲线；按模型汇总；**换算统计**（实测积分/千tok vs 目录倍率，WorkBuddy 附引擎参考成本）。
 - **自动化操作代理**：签到（WorkBuddy 国内签到+国际打卡合并）、成长任务/领奖/猫猫旅行/夜猫子、Token 保活、积分刷新、调度器触发/详情——白名单代理到各引擎。
 - **上游版本检测**：Qoder / Buddy2api 直查 GitHub Release tag（HEAD 302，不吃 API 配额），WorkBuddy 走引擎自带更新检查。
 - **零依赖**：router.py 仅用 Python 标准库（3.10+），单文件 5k 行以内；dashboard 是单文件静态页（无构建、无 CDN）。
@@ -60,7 +60,7 @@
    ```
    Base URL : http://127.0.0.1:8787/v1
    API Key  : config.json 的 api_key（agg- 开头）
-   Model    : 平台/模型，如 workbuddy/glm-5.3-flash、qoder/Qwen3.8-Flash、qwenwork/frontier-1
+   Model    : 平台/模型，如 workbuddy/glm-5.3-flash、qoder/Qwen3.8-Flash、qwenwork/qwen4-max
    思考强度 : 按 OpenAI 规范传 reasoning_effort（low/medium/high/max/xhigh，见模型页规格行）
    ```
 
@@ -71,12 +71,13 @@
 | `listen_port` | 监听端口，默认 8787（仅本机可访问） |
 | `api_key` | 聚合入口 Key，`agg-` 开头；留空启动时自动生成 |
 | `upstreams[]` | 上游引擎列表：`name` / `base_url` / `api_key` / `panel_password` / `repo`（更新检测用，可选） |
+| `upstreams[].base_url` | **仅支持本机回环地址**（`127.0.0.1` / `localhost` / `::1`）。网关对回环上游禁代理并禁止跟随重定向，避免面板凭证跨源；远程引擎地址未经该保护验证，当前不受支持。 |
 | `hidden_models` | 已隐藏模型（`平台/模型` 全名），由控制台维护 |
 | `favorite_models` | 收藏模型（置顶展示） |
 | `hide_pro_locked` | PRO 专属模型在无付费账号时自动隐藏，默认 `true` |
 | `wb_dual_prefer` | 双区模型出口偏好：`auto`（按临期紧迫度）/ `cn` / `intl` |
-| `custom_multipliers` / `auto_multipliers` | 手工/实测倍率记录（控制台维护） |
-| `model_caps` | 实测能力补充表：`{"qwenwork/frontier-1": {"vision": true}}`。上游目录不声明多模态/工具能力时（如 qwenwork 供应商列表），把实测结论写在这里；`/api/catalog` 与 `/v1/models` 的 `capabilities` 都会带上 |
+| `custom_multipliers` / `auto_multipliers` | 手工倍率由控制台维护；旧 `auto_multipliers` 仅保留历史，不再自动更新或用作价格 |
+| `model_caps` | 实测能力补充表：`{"qwenwork/qwen4-max": {"vision": true}}`。上游目录不声明多模态/工具能力时（如 qwenwork 供应商列表），把实测结论写在这里；`/api/catalog` 与 `/v1/models` 的 `capabilities` 都会带上 |
 
 ## 常用接口
 
@@ -97,11 +98,19 @@
 
 ## 回归测试
 
-`audit_platform.py` 是 48 项断言的全链路回归脚本（路由/可见性/PRO 锁定/分区路由/签到/任务/引擎代理/网关配置），依赖运行中的网关与真实上游：
+离线回归不读取凭证、不访问网络，覆盖流式边界、工具结果、鉴权与统计缺失值：
+
+```bash
+python test_regressions.py
+```
+
+`audit_platform.py` 是只读在线巡检，检查健康、鉴权和目录，不调用模型、不签到、不导入账号或修改配置；失败返回非零退出码：
 
 ```bash
 python audit_platform.py
 ```
+
+额度预估优先使用官方目录倍率（WorkBuddy/Qoder），千问办公使用带明确标注的短样本参考价与缓存假设；未知余额或缺少可靠单价显示“待测”，缓存字段缺失显示“未知”。国际活跃的执行记录与奖励到账状态分开展示。
 
 ## 免责声明
 
