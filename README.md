@@ -25,11 +25,12 @@
 
 - **一个 URL、一个 Key 聚合三平台**：`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 按模型名路由，SSE 流式透传；非流式响应回显客户端请求的模型名。
 - **模型可见性管理**：控制哪些模型对外可见——隐藏的模型从 `/v1/models` 消失、调用被拒绝；支持批量勾选、整平台开关、收藏置顶。
+- **WorkBuddy 媒体生成**：生图 `/v1/images/generations`、改图 `/v1/images/edits`、异步生视频 `/v1/videos`（提交/状态/取消/产物直链），媒体模型清单 `/v1/media/models`（`workbuddy/hunyuan-image-alpha`、`kling-video-v3` 等）。媒体模型刻意不混入 `/v1/models`，避免聊天客户端误用；可见性与聊天模型共用隐藏表，控制台「媒体」页可直接试生成。
 - **统一带平台前缀**：`/v1/models` 只发 `平台/模型`（如 `workbuddy/glm-5.3`），一眼看出归属；裸名调用仍兼容（全网关唯一时）。
 - **双区临期调度（WorkBuddy）**：同名模型国内版/国际版都有时，按两区「最临期积分包」的紧迫度自动选择出口（`wb_dual_prefer: auto/cn/intl`）；选中区域对该模型有会员门槛且无付费账号时自动换区。
 - **PRO 会员锁定**：上游目录标注的付费专属模型，在账号池没有付费账号时自动从 `/v1/models` 隐藏并给出明确拒绝话术；会员账号入池后自动恢复。
 - **用量分析**：三平台请求合并明细（含输入/输出/缓存/推理强度/耗时/速度）；按平台分段的 token 时间曲线；各平台缓存命中率曲线；按模型汇总；**换算统计**（实测积分/千tok vs 目录倍率，WorkBuddy 附引擎参考成本）。
-- **自动化操作代理**：签到（WorkBuddy 国内签到+国际打卡合并）、成长任务/领奖/猫猫旅行/夜猫子、Token 保活、积分刷新、调度器触发/详情——白名单代理到各引擎。
+- **自动化操作代理**：签到（WorkBuddy 国内签到+国际打卡合并）、国际网页通道补打卡、成长任务/全账号领奖/猫猫旅行/夜猫子/连登、Token 保活、积分刷新、额度窗口刷新、调度器触发/详情——白名单代理到各引擎。
 - **上游版本检测**：Qoder / Buddy2api 直查 GitHub Release tag（HEAD 302，不吃 API 配额），WorkBuddy 走引擎自带更新检查。
 - **零依赖**：router.py 仅用 Python 标准库（3.10+），单文件 5k 行以内；dashboard 是单文件静态页（无构建、无 CDN）。
 
@@ -88,6 +89,7 @@
 | `favorite_models` | 收藏模型（置顶展示） |
 | `hide_pro_locked` | PRO 专属模型在无付费账号时自动隐藏，默认 `true` |
 | `wb_dual_prefer` | 双区模型出口偏好：`auto`（按临期紧迫度）/ `cn` / `intl` |
+| `wb_update_mirror` | 可选。WorkBuddy 官方 GitHub 仓库已下线时，用这个 `owner/repo` 镜像的 release tag 做版本参照；默认 `niyouqianma/workbuddy2api-hub`。镜像可能滞后，页面会标注“镜像参照” |
 | `custom_multipliers` / `auto_multipliers` | 手工倍率由控制台维护；旧 `auto_multipliers` 仅保留历史，不再自动更新或用作价格 |
 | `model_caps` | 实测能力补充表：`{"qwenwork/qwen4-max": {"vision": true}}`。上游目录不声明多模态/工具能力时（如 qwenwork 供应商列表），把实测结论写在这里；`/api/catalog` 与 `/v1/models` 的 `capabilities` 都会带上 |
 
@@ -97,16 +99,27 @@
 |---|---|
 | `GET /v1/models` | 聚合模型列表（已隐藏/PRO 锁定除外，均带平台前缀） |
 | `POST /v1/chat/completions` 等 | 按模型名路由到对应引擎 |
+| `POST /v1/images/generations` · `/v1/images/edits` | 生图/改图（WorkBuddy，同步；`model` 可写 `workbuddy/<id>` 或裸名，省略则用默认图片模型） |
+| `POST /v1/videos` | 提交异步生视频任务（返回 202 + 任务 id；支持 `wait=1` 阻塞到完成） |
+| `GET /v1/videos/{id}` | 查询视频任务状态（queued / in_progress / completed / failed） |
+| `GET /v1/videos/{id}/content` | 下载 MP4 产物（签名直链，不经网关 Key） |
+| `POST /v1/videos/{id}/cancel` | 取消仍在排队的视频任务 |
+| `GET /v1/media/models` | 媒体模型清单（`?tag=` / `?realm=cn|intl` 过滤；不进 `/v1/models`） |
+| `GET /api/media/models` | 控制台媒体目录（含隐藏标记与媒体价格） |
 | `GET /api/status` | 三平台健康、账号池、积分、即将过期积分 |
-| `GET /api/catalog` | 模型管理页数据（含可见性/倍率/规格/出口） |
+| `GET /api/catalog` | 模型管理页数据（含可见性/倍率/规格/出口/媒体标记） |
 | `POST /api/models/visibility` | 隐藏/显示模型（`{id}`、`{ids}`、`{platform}`、`{visible:true}`） |
 | `GET /api/usage?limit=500` | 三平台用量合并（WorkBuddy 含国内+国际双区） |
 | `POST /api/checkin/{platform}` | 签到（WorkBuddy = 国内签到 + 国际打卡合并） |
-| `POST /api/tasks/{action}/{platform}` | 任务：run / claim / travel / night / streak-bonus |
+| `POST /api/tasks/{action}/{platform}` | 任务：run / claim（按全部国内账号领奖）/ travel / night / streak-bonus / daily-web |
 | `POST /api/engine` | 白名单引擎代理（保活/积分刷新/调度器/每日打卡） |
 | `GET /api/gwconfig` · `POST` | 网关自身开关（`hide_pro_locked`、`wb_dual_prefer`） |
 | `GET /api/updates?force=1` | 上游版本检测 |
 | `GET /health` | 健康检查（无鉴权） |
+
+媒体出口沿用 WorkBuddy 引擎的媒体号池和 Key 区域绑定；网关会标注当前出口可用性，不自动改引擎区域或账号归属。控制台生成表单提供文生图、文生视频；图生图通过 JSON `/v1/images/edits`（`image` 为图片 URL 或 data URL）调用，不支持 multipart 文件上传。省略 `model` 时只选当前出口可见且支持目标操作的模型。视频下载直链带独立签名，有效期最多一小时，网关重启后需重新查询任务获取链接。
+
+WorkBuddy 的“运行成长任务”包含上游支持的成长、小程序和运营活动流水线；定时巡检另管国内活跃上报、Buddy 盲盒、签到、旅行、连登、夜猫子和国际打卡。一键补做会在同步步骤之后提交一次补充巡检，提交成功不代表后台任务全部完成。手机 App 对话需在官方 App 完成；夜猫子受时间窗口限制。网关不伪造这些任务的完成状态。
 
 ## 回归测试
 
@@ -122,7 +135,7 @@ python test_regressions.py
 python audit_platform.py
 ```
 
-额度预估优先使用官方目录倍率（WorkBuddy/Qoder），千问办公使用带明确标注的短样本参考价与缓存假设；未知余额或缺少可靠单价显示“待测”，缓存字段缺失显示“未知”。国际活跃的执行记录与奖励到账状态分开展示。
+额度预估以实测扣费为准：优先用「Σ实扣积分 ÷ Σtoken」计算有效单价（天然包含缓存折扣），并给出「全未命中下限」（扣费 ÷ 非缓存计费 token，或目录全价）。没有扣费样本时不编数字——WorkBuddy/Qoder 的目录价只作零缓存下限并标注"未经本机校准"，千问办公用短样本全价作保守下限、缓存假设只作乐观参考。余额未知或单价缺失显示"待测"。国际活跃的执行记录与奖励到账状态分开展示。
 
 ## 免责声明
 

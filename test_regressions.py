@@ -38,8 +38,12 @@ class GatewayTests(unittest.TestCase):
         self.ns = isolated(ROOT / "router.py", {
             "_rewrite_sse_model", "_rewrite_sse_chunks", "forward", "_action_status", "Handler",
             "_num", "_known_num", "_checkin_tally", "_wb_route_realm", "_wb_usable_realms",
-            "_estimate_public_model", "_qwen_rate_spec", "estimate_snapshot"},
-            {"QWEN_MODEL_RATES": {}})
+            "_estimate_public_model", "_qwen_rate_spec", "estimate_snapshot",
+            "_row_multiplier",
+            "_media_link_signature", "_media_download_allowed"},
+            {"QWEN_MODEL_RATES": {}, "hashlib": __import__('hashlib'),
+             "hmac": __import__('hmac'), "_media_link_secret": b'offline-test-only',
+             "MEDIA_POST_PATHS": constant(ROOT / "router.py", "MEDIA_POST_PATHS")})
 
     def test_loopback_bypasses_proxy(self):
         import urllib.request
@@ -146,7 +150,8 @@ class GatewayTests(unittest.TestCase):
         model=item['models'][0]
         self.assertIsNone(model['model_balance'])
         self.assertIsNone(model['est_tokens'])
-        self.assertIsNone(model['est_tokens_nocache'])
+        self.assertIsNone(model['est_tokens_opt'])
+        self.assertIsNone(model['est_tokens_floor'])
         self.assertTrue(model['balance_unknown'])
         self.assertIn('待测', model['note'])
         item=self.estimate([{'enabled':True,'remain':0}], rates=rates)
@@ -159,24 +164,51 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(item['balance'],5.0)
         self.assertEqual((item['known'],item['total']),(1,2))
 
-    def test_prefixed_qwen_upstream_uses_real_rate_table(self):
+    def test_qwen_estimate_uses_full_price_as_headline(self):
         rates = constant(ROOT / 'router.py', 'QWEN_MODEL_RATES')
         self.assertIn('qwork-auto', rates)
+        rates={'qwork-auto':{'public':'flash','hit_per_ktok':0.001,'miss_per_ktok':0.01,
+                             'hit_rate':0.9}}
         for upstream in ('qwork-auto', 'flash', 'qwenwork/flash',
                          'qwenwork/qwork-auto', 'qwenwork/qwenwork/flash'):
             with self.subTest(upstream=upstream):
-                item = self.estimate(
-                    [{'enabled': True, 'remain': 100}],
-                    catalog=[{'platform':'qwenwork','public':'flash',
-                              'upstream':upstream,'row':{}}],
-                    rates=rates)
-                model = item['models'][0]
+                item=self.estimate([{'enabled':True,'remain':100}],
+                                   catalog=[{'platform':'qwenwork','public':'flash',
+                                             'upstream':upstream,'row':{}}],
+                                   rates=rates)
+                model=item['models'][0]
                 self.assertEqual(model['rate_source'], 'cache_assumed')
                 self.assertTrue(model['cache_assumed'])
                 self.assertEqual(model['cache_hit_rate'], 0.9)
-                self.assertIsNotNone(model['est_tokens'])
-                self.assertIsNotNone(model['est_tokens_nocache'])
-                self.assertGreater(model['est_tokens'], model['est_tokens_nocache'])
+                # headline = 全价（零缓存）保守下限；缓存假设只作乐观参考
+                self.assertEqual(model['est_tokens'], 10_000_000)
+                self.assertIsNone(model['est_tokens_floor'])
+                self.assertGreater(model['est_tokens_opt'], model['est_tokens'])
+
+    def test_measured_rate_beats_catalog_and_carries_floor(self):
+        rows=[]
+        for _ in range(4):
+            rows.append({'created_at':time.time(),'model':'ds','total_tokens':10000,
+                         'prompt_tokens':9000,'completion_tokens':1000,
+                         'cached_tokens':8800,'credit':0.02})
+        self.ns.update(
+            _estimate_lock=threading.Lock(), _estimate_cache={'data':None}, ESTIMATE_TTL=120,
+            CONFIG={'upstreams':[{'name':'workbuddy'}]},
+            public_catalog=lambda:[{'platform':'workbuddy','public':'ds',
+                                    'upstream':'ds','row':{'credits':'x0.5'}}],
+            platform_status=lambda _: {'health':True,'accounts':[{'enabled':True,'remain':100}]},
+            _estimate_rows=lambda _: list(rows), _estimate_at=lambda r:r['created_at'],
+            _model_hidden=lambda *_:False, _wb_usable_realms=lambda _:['cn'],
+            _wb_realm_meta=lambda:{}, WB_INTL_ALIAS={})
+        item=self.ns['estimate_snapshot'](True)['platforms'][0]
+        model=item['models'][0]
+        self.assertEqual(model['rate_source'],'measured')
+        # 有效单价 0.08/40000*1000*... = 0.002/ktok → 100 分 ≈ 5000 万 token
+        self.assertEqual(model['est_tokens'], 50_000_000)
+        # 全价 = 0.08 / (4×1200 billed) = 0.0167/ktok → 下限 600 万
+        self.assertEqual(model['est_tokens_floor'], 6_000_000)
+        self.assertGreater(model['est_tokens'], model['est_tokens_floor'])
+        self.assertIn('扣费样本', model['note'])
 
     def test_missing_result_ok_is_not_success(self):
         status=self.ns['_action_status']
@@ -354,6 +386,200 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler) for h in default.handlers))
         self.assertTrue(any(isinstance(h, scope['_NoRedirect']) for h in opener.handlers))
 
+    def test_raw_media_download_does_not_require_sse(self):
+        class Response:
+            status = 200
+            def getheaders(self): return [('content-type', 'video/mp4')]
+            def read(self): raise AssertionError('video must not be buffered')
+            def read1(self, size):
+                if getattr(self, 'sent', False): return b''
+                self.sent = True
+                return b'video-bytes'
+        class Connection:
+            def request(self, *args, **kwargs):
+                self.headers = kwargs['headers']
+            def getresponse(self): return Response()
+            def close(self): self.closed = True
+        conn = Connection()
+        self.ns.update(_connect=lambda _: conn, _upstream_headers=lambda _: {},
+                       _upstream_path=lambda _, p:p, HOP_HEADERS=set())
+        status, headers, chunks = self.ns['forward']({}, 'GET', '/', None, {}, 'raw')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['Content-Type'], 'video/mp4')
+        self.assertNotEqual(conn.headers.get('Accept'), 'text/event-stream')
+        self.assertEqual(b''.join(chunks), b'video-bytes')
+        self.assertTrue(conn.closed)
+
+    def test_media_model_resolution(self):
+        scope = isolated(ROOT / "router.py", {"resolve_media_model"}, {
+            "CONFIG": {"upstreams": [{"name": "workbuddy"}]},
+            "public_media_catalog": lambda force=False: [
+                {"public": "kling-video-v3", "id": "kling-video-v3",
+                 "tags": ["text-to-video"], "kind": "video", "available": True},
+                {"public": "hy-image-3.5", "id": "hy-image-3.5",
+                 "tags": ["text-to-image"], "kind": "image", "available": False}],
+            "_model_hidden": lambda platform, model: model == "hy-image-3.5"})
+        fn = scope["resolve_media_model"]
+        self.assertEqual(fn("workbuddy/kling-video-v3")[1], "kling-video-v3")
+        self.assertEqual(fn("kling-video-v3")[2], "kling-video-v3")
+        self.assertIn("隐藏", fn("workbuddy/hy-image-3.5")[3])
+        self.assertIn("只由 workbuddy", fn("qoder/kling-video-v3")[3])
+        self.assertIn("未知媒体模型", fn("not-a-media-model")[3])
+        up, upstream, facing, err = fn("")
+        self.assertIs(up, scope["CONFIG"]["upstreams"][0])
+        self.assertEqual((upstream, facing, err), ("kling-video-v3", "workbuddy/kling-video-v3", None))
+        self.assertIsNone(fn("", "text-to-image")[0])
+        scope["_model_hidden"] = lambda platform, model: False
+        self.assertIn("当前媒体出口", fn("hy-image-3.5")[3])
+        self.assertIn("不支持", fn("kling-video-v3", "text-to-image")[3])
+        scope["_model_hidden"] = lambda platform, model: True
+        self.assertIsNone(fn("")[0])
+
+    def test_media_catalog_merges_realms(self):
+        payloads = {
+            "cn": {"models": [
+                {"id": "kling-video-v3", "name": "Kling", "tags": ["text-to-video"],
+                 "videoGeneration": {"maxSeconds": 15}, "creditPerSecondCeiling": 26.0},
+                {"id": "hunyuan-image-alpha", "tags": ["text-to-image"],
+                 "creditPerImage": 6.0}]},
+            "intl": {"models": [
+                {"id": "kling-video-v3", "name": "Kling", "tags": ["image-to-video"]},
+                {"id": "hy-image-3.5", "tags": ["text-to-image"],
+                 "creditPerImage": 6.0, "creditPerImageMeasured": True}]},
+        }
+
+        class Resp:
+            def __init__(self, data): self.data = data
+            def read(self): return json.dumps(self.data).encode()
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        def fake_urlopen(req, timeout):
+            realm = "intl" if "realm=intl" in req.full_url else "cn"
+            return Resp(dict(payloads[realm], realm=realm))
+
+        scope = isolated(ROOT / "router.py", {"_wb_media_fetch"}, {
+            "CONFIG": {"upstreams": [{"name": "workbuddy",
+                                      "base_url": "http://127.0.0.1:8788"}]},
+            "WB_MEDIA_REALMS": ("cn", "intl"), "WB_MEDIA_TTL": 30.0,
+            "_wb_media_lock": threading.Lock(),
+            "_wb_media_cache": {"ts": 0.0, "models": [], "errors": {}},
+            "_upstream_headers": lambda up, extra=None: {},
+            "_urlopen": fake_urlopen,
+            "urllib": __import__("urllib"),
+            "_known_num": self.ns["_known_num"]})
+        models, errors = scope["_wb_media_fetch"](force=True)
+        by_id = {m["id"]: m for m in models}
+        self.assertEqual(errors, {})
+        self.assertEqual(by_id["kling-video-v3"]["realms"], ["cn", "intl"])
+        self.assertEqual(by_id["kling-video-v3"]["kind"], "video")
+        self.assertEqual(by_id["hunyuan-image-alpha"]["realms"], ["cn"])
+        self.assertEqual(by_id["hy-image-3.5"]["realms"], ["intl"])
+        self.assertEqual(by_id["hy-image-3.5"]["kind"], "image")
+
+    def test_media_urls_are_absolute(self):
+        self.ns["CONFIG"] = {"listen_port": 8787}
+        obj = object.__new__(self.ns["Handler"])
+        out = obj._media_rewrite(
+            {"model": "kling-video-v3", "url": "/v1/videos/a/content?t=1",
+             "tasks": [{"url": "/v1/videos/b/content?t=2"}]},
+            "workbuddy/kling-video-v3")
+        self.assertEqual(out["model"], "workbuddy/kling-video-v3")
+        from urllib.parse import urlsplit
+        target = urlsplit(out["url"])
+        self.assertEqual(target.netloc, "127.0.0.1:8787")
+        self.assertTrue(self.ns["_media_download_allowed"](target.path + '?' + target.query))
+        self.assertFalse(self.ns["_media_download_allowed"](
+            (target.path + '?' + target.query).replace('/a/content', '/other/content')))
+        self.assertFalse(self.ns["_media_download_allowed"]('/v1/videos/a/content?t=1'))
+        self.assertIn('gw_sig=', out["tasks"][0]["url"])
+        obj.path = target.path + '?' + target.query
+        obj._authorized = lambda: False
+        calls = []
+        obj._media_video_get = lambda: calls.append('download')
+        obj.do_GET()
+        self.assertEqual(calls, ['download'])
+
+    def test_claim_scans_all_active_accounts(self):
+        accounts = [
+            {"uid": "a", "nickname": "A", "realm": "cn", "enabled": True, "tasksEnabled": True},
+            {"uid": "b", "nickname": "B", "realm": "cn", "enabled": True},
+            {"uid": "c", "nickname": "C", "realm": "intl", "enabled": True},
+        ]
+        tasks = {
+            "a": [{"task_code": "daily", "status": "accepted", "current": 1, "target": 1}],
+            "b": [{"task_code": "later", "status": "accepted", "current": 0, "target": 1}],
+        }
+        claims, queried = [], []
+
+        def fake_engine(up, method, path, body=None, **kwargs):
+            if path.startswith("/accounts"):
+                return {"accounts": accounts}
+            if path.startswith("/tasks?uid="):
+                uid = path.split("uid=")[-1]
+                queried.append(uid)
+                return {"tasks": tasks.get(uid, [])}
+            if path == "/tasks/claim":
+                claims.append(body)
+                return {"ok": True, "credit": 5}
+            raise AssertionError(path)
+
+        scope = isolated(ROOT / "router.py", {"Handler", "_num"}, {
+            "engine_request": fake_engine, "json": json, "log": lambda *_: None})
+        obj = object.__new__(scope["Handler"])
+        result = scope["Handler"]._wb_claim_all(obj, {"name": "workbuddy"}, {})
+        self.assertEqual(queried, ["a", "b"])
+        self.assertEqual(claims, [{"uid": "a", "code": "daily"}])
+        self.assertEqual(result["claimed"][0]["uid"], "a")
+        self.assertTrue(any(row.get("skipped") for row in result["accounts"]))
+        self.assertTrue(self.ns["_action_status"](result)["ok"])
+        tasks["b"] = None
+        original_engine = scope["engine_request"]
+        def failing_engine(up, method, path, body=None, **kwargs):
+            if path == '/tasks?uid=b':
+                raise TimeoutError('task snapshot unavailable')
+            return original_engine(up, method, path, body, **kwargs)
+        scope["engine_request"] = failing_engine
+        result = obj._wb_claim_all({"name": "workbuddy"}, {})
+        status = self.ns["_action_status"](result)
+        self.assertFalse(status['ok'])
+        self.assertTrue(status['partial'])
+        self.assertIn('unavailable', status['error'])
+
+    def test_workbuddy_mirror_fallback(self):
+        seen = []
+        scope = isolated(ROOT / "router.py", {"_wb_mirror_update", "_ver_tuple"}, {
+            "CONFIG": {"wb_update_mirror": "custom/mirror"},
+            "WB_UPDATE_MIRRORS": ("default/mirror",),
+            "_REPO_RE": re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"),
+            "_github_latest": lambda repo: seen.append(repo) or "v2.1.3"})
+        row = {"current": "2.1.3", "latest": None, "source": "engine",
+               "error": "引擎更新检测失败: HTTP 404"}
+        self.assertTrue(scope["_wb_mirror_update"](row))
+        self.assertEqual(seen, ["custom/mirror"])
+        self.assertEqual(row["latest"], "v2.1.3")
+        self.assertFalse(row["has_update"])
+        self.assertTrue(row["mirror"])
+        self.assertEqual(row["source"], "mirror:custom/mirror")
+
+    def test_tail_log_reads_only_tail(self):
+        import os
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as fh:
+            for i in range(5000):
+                fh.write(f"line {i} API Key: secret\n")
+            path = fh.name
+        try:
+            scope = isolated(ROOT / "router.py", {"tail_log"},
+                             {"LOG_PATH": path, "os": os})
+            rows = scope["tail_log"](3)
+            self.assertEqual(len(rows), 3)
+            self.assertIn("line 4999", rows[-1])
+            self.assertIn("[redacted]", rows[-1])
+            self.assertNotIn("secret", rows[-1])
+        finally:
+            os.unlink(path)
+
     def test_dashboard_offline(self):
         import subprocess
         # Run the actual inline script with a synthetic DOM, transport and clock.
@@ -371,19 +597,37 @@ function element(id=''){
 function el(id){if(!elements.has(id))elements.set(id,element(id));return elements.get(id);}
 const navs=['overview','models'].map(v=>{const e=element();e.dataset.view=v;return e;});
 const views=['overview','models'].map(v=>el('view-'+v));
+const copyButtons=[...html.matchAll(/data-media-copy="([^"]+)"/g)].map(m=>{
+ const button=element();button.dataset.mediaCopy=m[1];
+ const pre=html.match(new RegExp('<pre id="'+m[1]+'">([\\s\\S]*?)</pre>'));
+ assert.ok(pre,'copy target must exist');
+ el(m[1]).textContent=pre[1].replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+ return button;
+});
+let copiedText='';
 navs[0].classList.add('active');views[0].classList.add('active');
 const store=new Map();
 let fetchImpl=async()=>({ok:true,status:200,json:async()=>({})});
 const context=vm.createContext({console,Map,Set,Date,Promise,JSON,Number,String,Math,Array,Object,Error,
- document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:[],querySelector:()=>null},
+ document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:s==='[data-media-copy]'?copyButtons:[],querySelector:()=>null},
  localStorage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)},
  fetch:(...a)=>fetchImpl(...a),setInterval:()=>1,clearInterval(){},setTimeout:()=>1,clearTimeout(){},
- requestAnimationFrame(){},navigator:{},CSS:{escape:x=>x}});
+ requestAnimationFrame(){},navigator:{clipboard:{writeText:async text=>{copiedText=text;}}},CSS:{escape:x=>x}});
 vm.runInContext(source,context);
 const run=s=>vm.runInContext(s,context);
 const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=>data});
 (async()=>{
  await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(copyButtons.length,4);
+ let copyRequests=0;
+ fetchImpl=async()=>{copyRequests++;throw new Error('copy must not submit a request');};
+ for(const button of copyButtons){
+   assert.equal(typeof button.onclick,'function');
+   await button.onclick();await new Promise(resolve=>setImmediate(resolve));
+   assert.match(copiedText,/<GATEWAY_KEY>/);
+   assert.equal(button.textContent,'已复制 ✓');
+ }
+ assert.equal(copyRequests,0);
  store.set('gh_key','synthetic');
  fetchImpl=async()=>reply({error:{message:'unavailable'}},503);
  assert.equal(await run("refreshView('models',true)"),false);
@@ -426,12 +670,14 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.doesNotMatch(el('overview-estimate').innerHTML,/0 分/);
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:0,known:1,total:1,models:[{model:'flash',balance_scope:'',model_balance:0,est_tokens:null,note:'',samples:0}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/0 分/);
- run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'flash',balance_scope:'',model_balance:100,est_tokens:1000,est_tokens_nocache:800,note:'短样本参考',samples:2}]}]}};renderEstimate()");
- assert.match(el('overview-estimate').innerHTML,/0% 缓存下限/);
+ run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'flash',balance_scope:'',model_balance:100,est_tokens:1000,est_tokens_opt:1500,cache_assumed:true,cache_hit_rate:0.9,est_tokens_floor:800,note:'短样本全价下限',samples:2}]}]}};renderEstimate()");
+ assert.match(el('overview-estimate').innerHTML,/全未命中下限/);
  assert.match(el('overview-estimate').innerHTML,/800/);
- assert.match(el('overview-estimate').innerHTML,/短样本参考/);
- run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'flash',est_tokens:1000,est_tokens_nocache:1000,note:'',samples:2}]}]}};renderEstimate()");
- assert.doesNotMatch(el('overview-estimate').innerHTML,/0% 缓存下限/);
+ assert.match(el('overview-estimate').innerHTML,/乐观（90% 缓存假设）/);
+ assert.match(el('overview-estimate').innerHTML,/1\.5k/);
+ assert.match(el('overview-estimate').innerHTML,/短样本全价下限/);
+ run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'flash',est_tokens:1000,note:'',samples:2}]}]}};renderEstimate()");
+ assert.doesNotMatch(el('overview-estimate').innerHTML,/全未命中下限/);
  run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
  fetchImpl=async()=>reply({ok:false,platform:'qoder',checked:0,total:2,
    error:'0/2 个账号成功',result:{results:[{uid:'a'},{uid:'b'}]}});
@@ -448,6 +694,18 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  run("pushHistory('partial',{ok:false,partial:true},'detail','');pushHistory('skip','skipped','detail','')");
  assert.match(el('task-history').innerHTML,/部分失败/);assert.match(el('task-history').innerHTML,/已跳过/);
  assert.equal(run('TASK_HISTORY[0].state'),'skipped');assert.equal(run('TASK_HISTORY[1].state'),'partial');
+ // Media page renders both kinds and switches the form between image/video.
+ run("MEDIA={items:[{id:'workbuddy/hunyuan-image-v3.0-art',model:'hunyuan-image-v3.0-art',name:'Hunyuan',kind:'image',tags:['text-to-image'],realms:['cn'],credit_per_image:6,image_measured:false,hidden:false},{id:'workbuddy/kling-video-v3',model:'kling-video-v3',name:'Kling',kind:'video',tags:['text-to-video'],realms:['cn','intl'],credits_per_second:{'720P':10},hidden:false}],errors:{}};renderMedia()");
+ assert.match(el('media-models').innerHTML,/hunyuan-image-v3\.0-art/);
+ assert.match(el('media-models').innerHTML,/积分\/张/);
+ assert.match(el('media-models').innerHTML,/积分\/秒/);
+ run("document.getElementById('media-model').value='workbuddy/hunyuan-image-v3.0-art';updateMediaForm()");
+ assert.equal(run("currentMediaModel().kind"),'image');
+ assert.equal(el('media-video-opts').style.display,'none');
+ run("document.getElementById('media-model').value='workbuddy/kling-video-v3';updateMediaForm()");
+ assert.equal(el('media-video-opts').style.display,'flex');
+ assert.equal(run("DAILY_STEPS.some(s=>s.platform==='workbuddy'&&s.path==='scheduler/trigger')"),true);
+ assert.equal(run("mediaPrice({media:'image',credit_per_image:6})"),'6 积分/张（估）');
  // Navigation paints immediately even when requests never settle.
  fetchImpl=()=>new Promise(()=>{});navs[1].onclick();
  assert.equal(views[1].classList.contains('active'),true);

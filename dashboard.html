@@ -114,6 +114,19 @@ td.num,th.num{text-align:right}
 .toolbar input[type=text]{flex:1;min-width:180px;min-height:34px;border:1px solid var(--line2);border-radius:10px;padding:0 12px;background:var(--panel)}
 .toolbar input:focus,.toolbar select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .toolbar select{min-height:34px;border:1px solid var(--line2);border-radius:10px;background:var(--panel);padding:0 10px}
+.media-prompt{width:100%;min-height:88px;border:1px solid var(--line2);border-radius:10px;padding:10px 12px;background:var(--panel);font:inherit;color:var(--fg);resize:vertical;margin:4px 0 10px}
+.media-preview img,.media-preview video{max-width:100%;max-height:520px;border-radius:12px;border:1px solid var(--line);background:#000}
+.media-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}
+.media-row:last-child{border-bottom:none}
+.media-help{font-size:12.5px;line-height:1.8}
+.media-help details{border-top:1px solid var(--line);padding:12px 0}
+.media-help summary{cursor:pointer;font-weight:600;font-size:13px}
+.media-help p{margin:10px 0;color:var(--dim)}
+.media-help .tblwrap{margin:10px 0;max-height:none}
+.media-help td{white-space:normal;vertical-align:top;min-width:110px}
+.media-help code{font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
+.media-help pre{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;white-space:pre;font:12px/1.7 ui-monospace,Consolas,monospace;margin:8px 0 14px}
+.media-help summary:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:4px}
 .pager{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
 .pagebtn{min-width:28px;height:28px;border-radius:8px;border:1px solid var(--line2);background:var(--panel);color:var(--fg);font-size:12px}
 .pagebtn.cur{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -155,6 +168,7 @@ td.num,th.num{text-align:right}
   <button class="nav" data-view="accounts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.2 3.4-5 6.5-5s5.7 1.8 6.5 5"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 15.2c2.8.3 5.3 1.9 6 4.8"/></svg>账号</button>
   <button class="nav" data-view="add"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6M11 8v6"/></svg>添加账号</button>
   <button class="nav" data-view="models"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>模型</button>
+  <button class="nav" data-view="media"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 15l-5-5L5 20"/></svg>媒体</button>
   <div class="navlabel">统计</div>
   <button class="nav" data-view="usage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 20h18M6 16v-5M11 16V8M16 16v-8M21 16v-3"/></svg>用量</button>
   <div class="navlabel">运维</div>
@@ -177,7 +191,7 @@ td.num,th.num{text-align:right}
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
-      <h3>额度可用量预估 <span class="sub">目录单价或已记录扣费样本估算；缓存假设与未知值会标注，非保证容量</span></h3>
+      <h3>额度可用量预估 <span class="sub">实测扣费优先（含缓存表现）；无样本时目录/短样本价只给保守下限，未知不估算</span></h3>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr>
           <th>平台</th><th class="num">余额</th><th>模型</th><th class="num">预计 token 数量</th>
@@ -268,6 +282,158 @@ td.num,th.num{text-align:right}
     </div>
   </div>
 
+  <div id="view-media" class="view">
+    <div class="pagetitle">媒体</div>
+    <div class="pagesub">WorkBuddy 生图 / 生视频。媒体模型不混入 /v1/models，避免聊天客户端误用；可见性与聊天模型共用隐藏表，隐藏后网关也会拒绝调用。</div>
+    <div class="card">
+      <div class="toolbar">
+        <span class="pill indigo" id="media-count">—</span>
+        <span class="sub" id="media-realm-note"></span>
+        <span style="flex:1"></span>
+        <button class="btn sec mini" id="btn-media-refresh">刷新目录</button>
+      </div>
+      <div id="media-models"><div class="empty">加载中…</div></div>
+      <div class="sub" style="margin-top:10px">区域：媒体出口由引擎按媒体号池自动选择（Key 绑定区域优先）。区域专属模型若不在当前出口，引擎会拒绝；国内/国际都有账号时以引擎当前区域为准。</div>
+    </div>
+    <div class="card">
+      <h3>生成</h3>
+      <div class="toolbar">
+        <select id="media-model"></select>
+        <select id="media-size" title="图片尺寸">
+          <option value="1024x1024">1024×1024</option>
+          <option value="1280x720">1280×720</option>
+          <option value="720x1280">720×1280</option>
+          <option value="1024x1536">1024×1536</option>
+          <option value="1536x1024">1536×1024</option>
+        </select>
+        <span id="media-video-opts" class="toolbar" style="margin:0;display:none;gap:6px">
+          <input type="number" id="media-seconds" min="1" max="15" value="5" title="视频秒数" style="width:76px;min-height:34px;border:1px solid var(--line2);border-radius:10px;padding:0 8px;background:var(--panel)">
+          <span class="sub">秒</span>
+        </span>
+        <button class="btn" id="btn-media-gen">生成</button>
+        <span class="sub" id="media-hint">生图约 6 积分/张；视频按秒计费，实际以引擎扣费为准</span>
+      </div>
+      <textarea id="media-prompt" class="media-prompt" placeholder="描述要生成的画面…（生图走 /v1/images/generations，生视频走 /v1/videos 异步任务）"></textarea>
+      <div id="media-result" class="media-preview"></div>
+    </div>
+    <div class="card media-help" id="media-help">
+      <h3>使用说明 · 扣费、Agent 接入与参数</h3>
+      <p>网页和自己的 Agent 使用同一套媒体 API、账号池与积分。下面的示例不会自动执行，也不会包含你的真实 Key；模型名、可用区域及规格以本页实时目录为准。</p>
+      <details open>
+        <summary>扣费怎么算？</summary>
+        <div class="tblwrap"><table>
+          <thead><tr><th>类型</th><th>当前预算参考</th><th>如何确认实际扣费</th></tr></thead>
+          <tbody>
+            <tr><td>生图 / 改图</td><td>未有实测记录时约 6 积分/张</td><td>目录标为「估」时不是官方固定价；有实测后会标为「实测」。</td></tr>
+            <tr><td>生视频</td><td>缺少实测价时按 26 积分/秒预留预算，例如 5 秒约 130 积分</td><td>这是引擎保守预算参考，不保证实际扣费上限。模型、分辨率、参考素材可能影响花费。</td></tr>
+          </tbody>
+        </table></div>
+        <p>优先看上方目录的最新价格。生成响应或完成的视频任务若带 <code>credit</code>，可记录为本次扣费；没返回时记为未知，不按 0 计算。图片签名 URL 约 24 小时失效，请及时保存。视频签名下载链接最多一小时有效，网关重启后需重新查询任务获取链接。</p>
+      </details>
+      <details>
+        <summary>在自己的 Agent 中使用</summary>
+        <p>HTTP 入口：<code>http://127.0.0.1:8787</code>。请求头：<code>Authorization: Bearer &lt;聚合网关 Key&gt;</code> 和 <code>Content-Type: application/json</code>，使用设置页的同一个 Key。</p>
+        <div class="tblwrap"><table>
+          <thead><tr><th>建议封装的工具</th><th>接口</th><th>返回与处理</th></tr></thead>
+          <tbody>
+            <tr><td>generate_image</td><td><code>POST /v1/images/generations</code></td><td>同步返回图片，读取 <code>data[0].url</code> 或 <code>data[0].b64_json</code>。</td></tr>
+            <tr><td>edit_image</td><td><code>POST /v1/images/edits</code></td><td>JSON 携带输入图片，返回修改后的图片。</td></tr>
+            <tr><td>generate_video</td><td><code>POST /v1/videos</code></td><td>HTTP 202 返回任务 <code>id</code>，保存后轮询。</td></tr>
+            <tr><td>get_video_status</td><td><code>GET /v1/videos/{id}</code></td><td><code>queued → in_progress → completed / failed</code>；完成取 <code>url</code>，失败读 <code>error.message</code>。</td></tr>
+            <tr><td>cancel_video</td><td><code>POST /v1/videos/{id}/cancel</code></td><td>用于仍可取消的排队任务。上游已提交任务可能继续生成并计费，以响应为准。</td></tr>
+            <tr><td>list_media_models</td><td><code>GET /v1/media/models</code></td><td>读取 <code>data[]</code> 中的模型、tags、价格与 videoGeneration；支持 <code>?tag=</code> / <code>?realm=cn|intl</code> 过滤。</td></tr>
+          </tbody>
+        </table></div>
+        <p>媒体模型通过独立接口调用，不进入聊天目录 <code>/v1/models</code>。只修改聊天 Base URL 不会自动让 Agent 获得媒体工具；需要 Agent 支持 HTTP 工具、自定义工具或对应的 MCP 适配。隐藏模型会被拒绝；省略 <code>model</code> 时只选当前出口可见且支持目标操作的模型。</p>
+        <p>默认入口仅限本机。Docker 内的 <code>127.0.0.1</code> 是容器自身，远程 Agent 也无法直接访问本机回环地址；当前示例适用于运行在宿主机的 Agent。视频返回的签名下载 <code>url</code> 可直接使用，无需把网关 Key 放入 URL。</p>
+      </details>
+      <details>
+        <summary>生图 / 改图：可用参数</summary>
+        <div class="tblwrap"><table>
+          <thead><tr><th>参数</th><th>是否必填</th><th>取值与约束</th></tr></thead>
+          <tbody>
+            <tr><td><code>model</code></td><td>建议指定</td><td>如 <code>workbuddy/hunyuan-image-alpha</code>；改图用支持 <code>image-to-image</code> 的模型，如 <code>workbuddy/hunyuan-image-alpha-edit</code>。</td></tr>
+            <tr><td><code>prompt</code></td><td>必填</td><td>非空提示词。</td></tr>
+            <tr><td><code>size</code></td><td>可选</td><td>默认 <code>1024x1024</code>；格式「宽x高」，如 <code>1536x1024</code>。宽高至少 16，总像素最多 4,194,304（约 4.19 MP），仍受模型上游限制。</td></tr>
+            <tr><td><code>n</code></td><td>可选</td><td>一次只支持 1 张，默认 1。</td></tr>
+            <tr><td><code>response_format</code></td><td>可选</td><td><code>url</code>（默认）或 <code>b64_json</code>。转码失败时可能退回 URL，请检查实际返回字段。</td></tr>
+            <tr><td><code>image</code></td><td>改图必填</td><td>公网图片 URL、<code>data:image/...;base64,...</code>，或这些字符串组成的数组。只在 <code>/v1/images/edits</code> 使用。</td></tr>
+          </tbody>
+        </table></div>
+        <p>改图当前使用 JSON，不支持 multipart 文件上传或本地文件路径。图片比例由 <code>size</code> 控制；<code>quality</code>、<code>style</code>、<code>seed</code>、<code>negative_prompt</code>、<code>input_fidelity</code> 等图片参数当前未实现，不应依赖其生效。</p>
+      </details>
+      <details>
+        <summary>生视频：可用参数与模型限制</summary>
+        <div class="tblwrap"><table>
+          <thead><tr><th>参数</th><th>是否必填</th><th>取值与约束</th></tr></thead>
+          <tbody>
+            <tr><td><code>model</code></td><td>建议指定</td><td>如 <code>workbuddy/minimax-video-h3</code>。模型需在当前媒体出口可用且未隐藏。</td></tr>
+            <tr><td><code>prompt</code></td><td>必填</td><td>非空；当前 Kling 最多 2500 字符，MiniMax 最多 2000 字符。</td></tr>
+            <tr><td><code>seconds</code></td><td>可选</td><td>整数秒，默认 5。当前 Kling 为 3–15 秒，MiniMax 为 4–15 秒；引擎设置可进一步限制。</td></tr>
+            <tr><td><code>resolution</code></td><td>可选</td><td>Kling：<code>720P / 1080P / 4K</code>，默认 720P；MiniMax：<code>768P / 2K</code>，默认 768P。</td></tr>
+            <tr><td><code>aspect_ratio</code></td><td>可选</td><td>仅文生视频生效，图生视频由输入图决定比例。Kling：16:9 / 9:16 / 1:1；MiniMax 还支持 adaptive / 21:9 / 4:3 / 3:4。</td></tr>
+            <tr><td><code>size</code></td><td>可选</td><td>如 <code>1280x720</code>，推导分辨率及文生视频比例；显式 <code>resolution</code>、<code>aspect_ratio</code> 优先。不支持的分辨率/比例可能回落默认值。</td></tr>
+            <tr><td><code>negative_prompt</code></td><td>可选</td><td>负面提示词，长度上限同 prompt。</td></tr>
+            <tr><td><code>enable_audio</code></td><td>可选</td><td>布尔值；当前默认 true。Kling 可开关，MiniMax 音频常开，false 无法关闭。</td></tr>
+            <tr><td><code>image</code> / <code>input_reference</code></td><td>可选</td><td>首帧，传单个公网图片 URL 或 data URL 字符串。<code>input_reference</code> 是别名，不使用数组/文件对象。</td></tr>
+            <tr><td><code>last_image</code></td><td>可选</td><td>尾帧，与首帧配合使用。当前首尾帧由 Kling / MiniMax 模型声明支持。</td></tr>
+            <tr><td><code>reference_images</code></td><td>可选</td><td>参考图数组，别名 <code>images</code>。可用字符串数组，或 <code>{"image_url":"..."}</code> / <code>{"url":"..."}</code> 对象数组。</td></tr>
+            <tr><td><code>reference_videos</code></td><td>可选</td><td>参考视频数组，字符串或 <code>{"video_url":"..."}</code> 对象。</td></tr>
+            <tr><td><code>reference_audios</code></td><td>可选</td><td>参考音频数组，字符串或 <code>{"audio_url":"..."}</code> 对象。</td></tr>
+            <tr><td><code>wait</code></td><td>可选</td><td>使用 <code>?wait=1</code> 或 JSON <code>"wait":"1"</code> 等待，完成后仍可能返回 202；排队或超时会返回当前状态。Agent 建议提交后轮询。</td></tr>
+          </tbody>
+        </table></div>
+        <p>Kling 不支持参考素材数组，首尾帧另算。MiniMax 参考图最多 9、视频最多 3、音频最多 3，合计最多 12；首尾帧与参考素材不能混用。参考音频需同时有视觉素材，最终以目录和上游校验为准。参考素材用公网 URL 或受支持的 data URL，不使用本地路径。</p>
+        <p><code>seed</code>、<code>fps</code>、自定义 <code>watermark</code> 等视频参数当前未实现。参数放在 JSON 顶层，不需要自行构造 <code>extra_parameters</code>。</p>
+      </details>
+      <details>
+        <summary>可复制调用示例 · 生图、改图、视频与轮询</summary>
+        <p>下面是 HTTP 请求示例。把 <code>&lt;GATEWAY_KEY&gt;</code> 替换为设置页的聚合 Key；模型若被隐藏或目录已改名，请先从实时目录选择。复制示例不会发起生成。</p>
+        <div class="toolbar"><b>文生图</b><span style="flex:1"></span><button class="btn sec mini" data-media-copy="media-example-image">复制生图示例</button></div>
+        <pre id="media-example-image">POST http://127.0.0.1:8787/v1/images/generations
+Authorization: Bearer &lt;GATEWAY_KEY&gt;
+Content-Type: application/json
+
+{
+  "model": "workbuddy/hunyuan-image-alpha",
+  "prompt": "雨后的江南小巷，水彩风格，柔和光线",
+  "size": "1536x1024",
+  "n": 1,
+  "response_format": "url"
+}</pre>
+        <div class="toolbar"><b>改图（JSON）</b><span style="flex:1"></span><button class="btn sec mini" data-media-copy="media-example-edit">复制改图示例</button></div>
+        <pre id="media-example-edit">POST http://127.0.0.1:8787/v1/images/edits
+Authorization: Bearer &lt;GATEWAY_KEY&gt;
+Content-Type: application/json
+
+{
+  "model": "workbuddy/hunyuan-image-alpha-edit",
+  "prompt": "保留主体，把背景改为雪山",
+  "image": "https://example.com/input.png",
+  "size": "1024x1024",
+  "response_format": "url"
+}</pre>
+        <div class="toolbar"><b>提交视频</b><span style="flex:1"></span><button class="btn sec mini" data-media-copy="media-example-video">复制视频示例</button></div>
+        <pre id="media-example-video">POST http://127.0.0.1:8787/v1/videos
+Authorization: Bearer &lt;GATEWAY_KEY&gt;
+Content-Type: application/json
+
+{
+  "model": "workbuddy/minimax-video-h3",
+  "prompt": "镜头缓慢推进，晨雾笼罩湖面，远处群山若隐若现",
+  "seconds": 5,
+  "resolution": "768P",
+  "aspect_ratio": "16:9",
+  "enable_audio": true
+}</pre>
+        <div class="toolbar"><b>查询视频任务</b><span style="flex:1"></span><button class="btn sec mini" data-media-copy="media-example-poll">复制轮询示例</button></div>
+        <pre id="media-example-poll">GET http://127.0.0.1:8787/v1/videos/&lt;TASK_ID&gt;
+Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
+        <p>每隔几秒查询同一个任务 ID；完成时下载返回的 <code>url</code>。等待或查询失败时不要重复提交视频，重复提交可能产生多份任务并分别计费。没有百分比进度时只显示实际任务状态。</p>
+      </details>
+    </div>
+  </div>
+
   <div id="view-usage" class="view">
     <div class="pagetitle">用量</div>
     <div class="pagesub">三平台请求记录（各取最近 500–1000 条，workbuddy 含国内+国际双区）；曲线与统计跟随当前筛选。</div>
@@ -344,9 +510,9 @@ td.num,th.num{text-align:right}
       </div>
       <div class="sub" style="margin-top:10px;line-height:1.95">
         <b>执行逻辑：</b>
-        ① <b>定时调度器</b>在各引擎内每天自动跑（WorkBuddy 巡检含签到/打卡/任务/旅行；Qoder 每日 09:00 / 10:05 / 21:00 签到）——本页按钮是「立即补做」，不改变定时计划，也不会因为手动点过就停掉自动。
+        ① <b>定时调度器</b>在各引擎内自动跑：WorkBuddy 包含签到、国内活跃、国际打卡、旅行、盲盒、连登和夜猫子；一次性成长与活动流水线需要手动运行成长任务。Qoder 每日 09:00 / 10:05 / 21:00 签到。本页补做不改变定时计划。
         ② 同一动作执行期间按钮锁定，不会并发重复。
-        ③ <b>一键全自动</b>顺序：WorkBuddy 签到+国际打卡 → 成长任务 → 领奖 → 猫猫旅行 → 连登/夜猫子 → Qoder 签到 → 领全部福利 → 猫猫旅行；千问办公没有签到/任务（每日积分由上游自动发放），不在序列里。单步失败不中断，逐条记入下方「操作结果」。
+        ③ <b>一键全自动</b>顺序：WorkBuddy 签到+国际打卡 → 成长/活动任务 → 全账号领奖 → 猫猫旅行 → 连登/夜猫子 → Qoder 签到/福利/旅行 → 提交 WorkBuddy 补充巡检（国内活跃、Buddy 盲盒、保活）。最后一步为后台执行，提交成功后请看调度详情；夜猫子仅在夜间执行。千问办公积分自动发放；手机 App 对话任务需在官方 App 完成。
       </div>
     </div>
     <div class="grid3" id="auto-cards"><div class="empty">加载中…</div></div>
@@ -609,7 +775,7 @@ function requestPolicy(p,opt){
   if(p==='/api/engine'){
     try{if(JSON.parse(opt.body||'{}').method==='GET') return {read:true,views:[]};}catch(e){}
   }
-  const views=p.startsWith('/api/models/')?['models','overview','usage']
+  const views=p.startsWith('/api/models/')?['models','media','overview','usage']
     :p==='/api/gwconfig'?['settings','models','overview']
     :['accounts','overview','auto','usage'];
   return {read:false,views};
@@ -646,7 +812,7 @@ document.getElementById('gate-btn').onclick=tryGate;
 document.getElementById('gate-input').addEventListener('keydown',e=>{if(e.key==='Enter')tryGate();});
 
 /* ── 视图切换 ── */
-const LOADERS={overview:loadOverview, accounts:loadStatus, add:null, models:loadModels, usage:loadUsage, auto:autoView, settings:loadSettings, logs:loadLogs};
+const LOADERS={overview:loadOverview, accounts:loadStatus, add:null, models:loadModels, media:loadMedia, usage:loadUsage, auto:autoView, settings:loadSettings, logs:loadLogs};
 const VIEW_LOADED=new Map(), VIEW_PENDING=new Map(), VIEW_STATE=new Map();
 let navigationVersion=0;
 function renderViewState(view){
@@ -779,6 +945,7 @@ function renderModels(){
     const rows=groups[pf2].map(m=>{
       const hid=hiddenSet.has(m.id);
       const realmPill=(m.realms&&m.realms.length===1)?` <span class="pill gray" title="上游仅在此区域提供该模型">${m.realms[0]==='cn'?'仅国内':'仅国际'}</span>`:'';
+      const mediaPill=m.media?` <span class="pill ${m.media==='video'?'purple':'indigo'}" title="媒体模型：不进入 /v1/models，走 /v1/media/models 与生图/生视频接口">${m.media==='video'?'视频':'图片'}</span>`:'';
       const routePill=(m.route&&m.realms&&m.realms.length>1)
         ?` <span class="pill indigo" title="双区模型：出口由调度策略决定（设置页「路由偏好」可改）">出口: ${m.route_auto?'自动→':''}${m.route==='cn'?'国内':'国际'}</span>`:'';
       const proPill=(m.requires_pro&&!m.pro_locked)?' <span class="pill purple" title="上游目录标注：需要 WorkBuddy 付费会员（PRO）">PRO</span>':'';
@@ -805,10 +972,16 @@ function renderModels(){
       else if(caps.reasoning===false) spec.push('不支持思考');
       if(caps.vision) spec.push('视觉');
       if(caps.tools) spec.push('工具');
+      if(m.media){
+        const mtags=(m.tags||[]).map(t=>TAG_LABEL[t]||t).join('/');
+        spec.push((m.media==='video'?'视频生成':'图片生成')+(mtags?` · ${mtags}`:''));
+      }
       const specHtml=spec.length?`<div class="sub-cell mono" style="color:var(--dim)">▣ ${spec.join(' · ')}</div>`:'';
       const manual=m.multiplier&&m.multiplier.source==='manual';
       let rateCell;
-      if(pf2==='qwenwork'&&(!m.multiplier||manual)){
+      if(m.media){
+        rateCell=`<span class="sub-cell">${esc(mediaPrice(m))}</span>`;
+      } else if(pf2==='qwenwork'&&(!m.multiplier||manual)){
         rateCell=`<div class="toolbar" style="gap:4px;margin:0">
              <input class="rate-input" data-rate="${esc(m.id)}" placeholder="x0.35" value="${esc(manual&&m.multiplier.factor?m.multiplier.factor:'')}" style="width:64px;min-height:26px;border:1px solid var(--line2);border-radius:7px;padding:0 6px;background:var(--panel)">
              <button class="btn mini" data-ratesave="${esc(m.id)}">存</button>
@@ -820,7 +993,7 @@ function renderModels(){
       const star=m.fav?'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="0" title="取消常用" style="color:var(--orange);border:none;background:none;padding:2px 4px">★</button>':'<button class="btn sec mini" data-fav="'+esc(m.id)+'" data-favv="1" title="标为常用" style="border:none;background:none;padding:2px 4px">☆</button>';
       return `<tr>
         <td><input type="checkbox" class="msel-box" data-msel="${esc(m.id)}" ${MSEL.has(m.id)?'checked':''}></td>
-        <td class="name-cell"><span class="mono">${esc(m.id)}</span> ${st}${proPill}${realmPill}${routePill} ${star}${subHtml}${specHtml}</td>
+        <td class="name-cell"><span class="mono">${esc(m.id)}</span> ${st}${proPill}${mediaPill}${realmPill}${routePill} ${star}${subHtml}${specHtml}</td>
         <td>${rateCell}</td><td style="text-align:right">${act}</td></tr>`;
     }).join('');
     return `<div style="margin-bottom:16px">
@@ -870,6 +1043,134 @@ document.getElementById('btn-model-showall').onclick=()=>setModelVisible({visibl
 document.getElementById('model-search').oninput=renderModels;
 document.getElementById('model-filter').onchange=renderModels;
 document.getElementById('model-visfilter').onchange=renderModels;
+/* ── 媒体（生图 / 生视频） ── */
+let MEDIA={items:[],errors:{}}, MEDIA_POLL=null;
+const TAG_LABEL={'text-to-image':'文生图','image-to-image':'图生图','text-to-video':'文生视频','image-to-video':'图生视频'};
+async function loadMedia(force){
+  try{
+    const d=await api('/api/media/models'+(force?'?force=1':''));
+    MEDIA=d||{items:[]};
+    renderMedia();
+    return true;
+  }catch(e){ return viewFailure('media',e); }
+}
+function mediaPrice(m){
+  if((m.kind||m.media)==='image') return m.credit_per_image!=null?`${m.credit_per_image} 积分/张${m.image_measured?'（实测）':'（估）'}`:'图片单价待测';
+  const per=m.credits_per_second||{};
+  const vals=Object.values(per).filter(v=>typeof v==='number');
+  if(vals.length) return `视频 ${Math.min(...vals)}–${Math.max(...vals)} 积分/秒`;
+  if(m.credit_per_second!=null) return `视频 ${m.credit_per_second} 积分/秒`;
+  return m.credit_ceiling!=null?`视频上限 ${m.credit_ceiling} 积分/秒`:'视频单价待测';
+}
+function renderMedia(){
+  const items=MEDIA.items||[];
+  const el=document.getElementById('media-models');
+  if(!el) return;
+  const sel=document.getElementById('media-model');
+  const cur=sel?sel.value:'';
+  const visible=items.filter(m=>!m.hidden);
+  const generatable=visible.filter(m=>m.available!==false&&(m.tags||[]).some(t=>t==='text-to-image'||t==='text-to-video'));
+  document.getElementById('media-count').textContent=`媒体模型 ${visible.length} / ${items.length} · 当前可生成 ${generatable.length}`;
+  const errs=MEDIA.errors||{};
+  document.getElementById('media-realm-note').textContent=Object.keys(errs).length
+    ?('目录部分失败: '+Object.entries(errs).map(([k,v])=>k+' '+v).join('; ')):'';
+  el.innerHTML=items.length?items.map(m=>{
+    const realm=(m.realms||[]).map(r=>r==='cn'?'国内':'国际').join('/');
+    const tags=(m.tags||[]).map(t=>TAG_LABEL[t]||t).join(' · ');
+    return `<div class="media-row">
+      <span class="pill ${m.kind==='video'?'purple':'indigo'}">${m.kind==='video'?'视频':'图片'}</span>
+      <div style="flex:1;min-width:0">
+        <div class="name-cell"><span class="mono">${esc(m.id)}</span> ${m.hidden?'<span class="pill gray">已隐藏</span>':''}</div>
+        <div class="sub-cell">${esc(m.name)} · ${esc(tags)} · ${esc(mediaPrice(m))} · ${esc(realm)}${m.available===false?' · 当前出口不可用':''}</div>
+      </div>
+      <button class="btn ${m.hidden?'':'sec'} mini" data-media-vis="${esc(m.id)}" data-v="${m.hidden?'1':'0'}">${m.hidden?'恢复显示':'隐藏'}</button>
+    </div>`;
+  }).join(''):'<div class="empty">没有媒体模型（确认 WorkBuddy 引擎在线且账号有生图权限）</div>';
+  if(sel){
+    sel.innerHTML=generatable.length?generatable.map(m=>`<option value="${esc(m.id)}">${m.kind==='video'?'视频 · ':'图片 · '}${esc(m.model)}</option>`).join('')
+      :'<option value="">（当前出口无可用生成模型）</option>';
+    if(cur&&generatable.some(m=>m.id===cur)) sel.value=cur;
+  }
+  updateMediaForm();
+  document.querySelectorAll('[data-media-vis]').forEach(b=>b.onclick=()=>setMediaVisible(b.dataset.mediaVis,b.dataset.v==='1',b));
+}
+function currentMediaModel(){return (MEDIA.items||[]).find(m=>m.id===document.getElementById('media-model').value);}
+function updateMediaForm(){
+  const m=currentMediaModel(), video=!!(m&&m.kind==='video');
+  const opts=document.getElementById('media-video-opts');
+  if(opts) opts.style.display=video?'flex':'none';
+  const size=document.getElementById('media-size');
+  if(size) size.style.display=video?'none':'';
+}
+async function setMediaVisible(id,visible,btn){
+  if(btn)btn.disabled=true;
+  try{
+    const r=await api('/api/models/visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,visible})});
+    if(r.ok){const m=(MEDIA.items||[]).find(x=>x.id===id);if(m)m.hidden=!visible;renderMedia();toast(visible?'已恢复显示':'已隐藏');}
+    else toast('失败: '+errMsg(r));
+  }catch(e){toast('失败: '+e.message);}
+  if(btn)btn.disabled=false;
+}
+function stopMediaPoll(){if(MEDIA_POLL){clearInterval(MEDIA_POLL);MEDIA_POLL=null;}}
+function mediaResult(html){const el=document.getElementById('media-result');if(el)el.innerHTML=html;}
+async function mediaGenerate(){
+  const m=currentMediaModel();
+  const prompt=document.getElementById('media-prompt').value.trim();
+  if(!m){toast('没有可用的媒体模型');return;}
+  if(!prompt){toast('请先写提示词');return;}
+  const btn=document.getElementById('btn-media-gen');
+  btn.disabled=true;stopMediaPoll();
+  mediaResult('<div class="sub">提交中…</div>');
+  try{
+    if(m.kind==='image'){
+      const body={model:m.id,prompt,n:1,response_format:'url'};
+      const size=document.getElementById('media-size').value;
+      if(size) body.size=size;
+      const r=await api('/v1/images/generations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const item=(r.data||[])[0]||{};
+      const url=item.url||(item.b64_json?'data:image/png;base64,'+item.b64_json:'');
+      mediaResult(url
+        ?`<img src="${esc(url)}" alt="生成结果"><div class="sub" style="margin-top:8px">模型 ${esc(r.model||m.id)}${r.credit!=null?' · 扣 '+esc(String(r.credit))+' 积分':''}${r.hint?' · '+esc(r.hint):''}</div>`
+        :'<div class="empty">上游没有返回图片</div>');
+    } else {
+      const body={model:m.id,prompt};
+      const secs=parseInt(document.getElementById('media-seconds').value,10);
+      if(secs>0) body.seconds=secs;
+      const r=await api('/v1/videos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      renderVideoTask(r,m.id);
+      if(r.status!=='completed'&&r.status!=='failed'&&r.id){
+        MEDIA_POLL=setInterval(async()=>{
+          try{
+            const t=await api('/v1/videos/'+encodeURIComponent(r.id));
+            renderVideoTask(t,m.id);
+            if(t.status==='completed'||t.status==='failed')stopMediaPoll();
+          }catch(e){stopMediaPoll();viewFailure('media',e);}
+        },5000);
+      }
+    }
+  }catch(e){mediaResult('<div class="empty">失败: '+esc(e.message)+'</div>');}
+  btn.disabled=false;
+}
+function renderVideoTask(t,model){
+  const st=t.status||'?';
+  const label={queued:'排队中',in_progress:'生成中',completed:'已完成',failed:'失败'}[st]||st;
+  let html=`<div class="sub">任务 <span class="mono">${esc(t.id||'')}</span> · ${esc(label)} · ${esc(t.model||model||'')}`;
+  if(t.queue_position!=null) html+=` · 队列第 ${esc(String(t.queue_position))} 位`;
+  if(t.credit!=null) html+=` · 扣 ${esc(String(t.credit))} 积分`;
+  html+='</div>';
+  if(t.status==='completed'&&t.url) html+=`<video src="${esc(t.url)}" controls preload="metadata"></video><div class="sub"><a href="${esc(t.url)}" target="_blank" rel="noopener">下载 MP4</a>${t.hint?' · '+esc(t.hint):''}</div>`;
+  else if(t.status==='failed') html+=`<div class="empty">失败: ${esc((t.error&&t.error.message)||'上游未给出原因')}</div>`;
+  else html+=`<div class="sub">每 5 秒自动轮询，完成后显示视频。</div>`;
+  mediaResult(html);
+}
+document.getElementById('media-model').onchange=updateMediaForm;
+document.getElementById('btn-media-refresh').onclick=()=>loadMedia(true);
+document.getElementById('btn-media-gen').onclick=mediaGenerate;
+document.querySelectorAll('[data-media-copy]').forEach(b=>b.onclick=()=>{
+  const example=document.getElementById(b.dataset.mediaCopy);
+  if(example) copyText(example.textContent,b);
+});
+
 // 账号页区域筛选：只重排已有数据，不额外请求（30s 轮询会带着最新池子重绘）
 document.getElementById('acc-realm-filter').onchange=()=>{ if(ACC_PLATFORMS) renderPlatforms(ACC_PLATFORMS); };
   document.getElementById('usage-model').onchange=()=>{UPAGE=1;renderUsage();};
@@ -1315,9 +1616,10 @@ function renderUsageConversion(rows){
   }).join('　|　');
   note.textContent='平台汇总（当前筛选）→ '+summary;
 }
-/* 额度可用量预估（总览页）：余额 ÷ 近期有效单价 → 预计可用 token。
-   单价 = Σ(模型实扣积分) ÷ Σ(token) 的实测值，或上游目录/短样本参考价；
-   余额未知（引擎没返回 remain）时显示待测，不按 0 估算。 */
+/* 额度可用量预估（总览页）：余额 ÷ 单价 → 预计可用 token。
+   单价优先用「Σ实扣积分 ÷ Σtoken」的实测值（天然含缓存折扣）；
+   没有扣费样本时，目录全价/千问短样本价只作零缓存保守下限，
+   缓存假设只作乐观参考；余额未知显示待测，不按 0 估算。 */
 let EST_CACHE={ts:0,data:null};
 async function loadEstimate(force){
   if(!force && EST_CACHE.data && Date.now()-EST_CACHE.ts < 300000){ renderEstimate(); return; }
@@ -1349,12 +1651,14 @@ function renderEstimate(){
     models.forEach((m,i)=>{
       const scope=m.balance_scope
         ?`<div class="sub-cell">${esc(m.balance_scope)}${m.model_balance!=null?` · 可用 ${fmt(m.model_balance)} 分`:' · 余额待测'}</div>`:'';
-      const range=`<div class="sub-cell">${esc(m.note||'样本估算')} · ${m.samples||0} 条样本</div>`;
-      const noCache=(m.est_tokens_nocache!=null && m.est_tokens_nocache!==m.est_tokens)
-        ? `<div class="sub-cell">0% 缓存下限 ${fmtTok(m.est_tokens_nocache)}</div>`:'';
+      const range=`<div class="sub-cell">${esc(m.note||'样本估算')} · ${m.samples||0} 条样本${m.sample_hours!=null?` · 覆盖 ${m.sample_hours}h`:''}</div>`;
+      const floor=(m.est_tokens_floor!=null && m.est_tokens_floor!==m.est_tokens)
+        ? `<div class="sub-cell">全未命中下限 ${fmtTok(m.est_tokens_floor)}</div>`:'';
+      const opt=(m.est_tokens_opt!=null && m.cache_assumed)
+        ? `<div class="sub-cell">乐观（${Math.round((m.cache_hit_rate||0)*100)}% 缓存假设） ${fmtTok(m.est_tokens_opt)}</div>`:'';
       html+=`<tr>${i===0
         ? `<td rowspan="${models.length}" style="vertical-align:top">${label}</td><td rowspan="${models.length}" class="num" style="vertical-align:top">${bal}</td>`
-        : ''}<td class="mono">${esc(m.model)}${scope}${range}${noCache}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'待测'}</td></tr>`;
+        : ''}<td class="mono">${esc(m.model)}${scope}${range}${floor}${opt}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'待测'}</td></tr>`;
     });
   }
   tb.innerHTML=html||'<tr><td colspan="4" class="empty">暂无数据</td></tr>';
@@ -1442,10 +1746,11 @@ const AUTO_BUTTONS={
     {g:'每日', items:[
       {t:'签到 + 国际打卡', d:'国内版每日签到 + 国际版活跃打卡，一次完成', k:'checkin/workbuddy', run:b=>doCheckin('workbuddy',b), primary:true},
       {t:'仅国际打卡', d:'只给国际版账号补今天的活跃打卡', k:'dailychat/workbuddy', run:b=>dailyChat(b)},
+      {t:'网页通道补打卡', d:'桌面通道失败时改走网页会话补国际版活跃打卡', k:'task/daily-web/workbuddy', run:b=>runTask('daily-web','workbuddy',b)},
     ]},
     {g:'成长任务', items:[
       {t:'运行成长任务', d:'引擎开真实会话完成当日成长任务，可能要几分钟', k:'task/run/workbuddy', run:b=>runTask('run','workbuddy',b)},
-      {t:'领取任务奖励', d:'扫描并领取已完成任务的奖励；先「运行成长任务」再领', k:'task/claim/workbuddy', run:b=>runTask('claim','workbuddy',b)},
+      {t:'领取任务奖励', d:'按账号扫描并领取所有已完成任务的奖励；先「运行成长任务」再领', k:'task/claim/workbuddy', run:b=>runTask('claim','workbuddy',b)},
       {t:'猫猫旅行', d:'派出/召回猫猫并领取旅行奖励', k:'task/travel/workbuddy', run:b=>runTask('travel','workbuddy',b)},
       {t:'连登奖励', d:'领取连续登录管家奖励', k:'task/streak-bonus/workbuddy', run:b=>runTask('streak-bonus','workbuddy',b)},
       {t:'夜猫子', d:'仅 23:00-08:00 计入的夜间任务', k:'task/night/workbuddy', run:b=>runTask('night','workbuddy',b)},
@@ -1453,6 +1758,7 @@ const AUTO_BUTTONS={
     {g:'维护', items:[
       {t:'Token 全池保活', d:'刷新全部账号凭证，避免过期掉线', k:'engine/workbuddy/accounts/refresh', run:b=>runEngine({platform:'workbuddy',path:'accounts/refresh'},b)},
       {t:'积分刷新', d:'重新拉取各账号积分快照', k:'engine/workbuddy/accounts/credits/fetch', run:b=>runEngine({platform:'workbuddy',path:'accounts/credits/fetch'},b)},
+      {t:'刷新额度窗口', d:'立即查询到点的模型额度窗口，不吃对话额度', k:'engine/workbuddy/quota-scan/run', run:b=>runEngine({platform:'workbuddy',path:'quota-scan/run'},b)},
       {t:'立即巡检一轮', d:'让引擎调度器马上跑一轮；会重复当日已完成的动作，一般不用手动点', k:'engine/workbuddy/scheduler/trigger', run:b=>runEngine({platform:'workbuddy',path:'scheduler/trigger'},b)},
     ]},
   ],
@@ -1622,8 +1928,8 @@ document.getElementById('btn-checkin-all').onclick=async function(){
   }, ()=>cur).finally(()=>runDone('checkin-all'));
 };
 
-/* 一键全自动：签到 → 成长任务 → 领奖 → 旅行 → 连登/夜猫子 → 千问保活。
-   单步失败不中断，每步单独记入操作结果；顺序与「执行逻辑」文案一致。 */
+/* 一键补做：同步成长/福利任务完成后提交一次补充巡检。
+   巡检异步执行国内活跃、Buddy 盲盒等，其结果从调度详情读取。 */
 const DAILY_STEPS=[
   {label:'WorkBuddy · 签到 + 国际打卡', kind:'checkin', platform:'workbuddy'},
   {label:'WorkBuddy · 运行成长任务', kind:'task', action:'run', platform:'workbuddy'},
@@ -1634,6 +1940,7 @@ const DAILY_STEPS=[
   {label:'Qoder · 签到', kind:'checkin', platform:'qoder'},
   {label:'Qoder · 领取全部福利', kind:'task', action:'run', platform:'qoder'},
   {label:'Qoder · 猫猫旅行', kind:'task', action:'travel', platform:'qoder'},
+  {label:'WorkBuddy · 提交补充巡检（国内活跃 / Buddy 盲盒 / 保活）', kind:'engine', platform:'workbuddy', path:'scheduler/trigger'},
 ];
 document.getElementById('btn-daily-all').onclick=async function(){
   if(!runOnce('daily/all')) return;
@@ -1856,6 +2163,8 @@ async function loadUpdates(force){
         <span class="mono" style="color:${r.has_update?'var(--red)':'inherit'}">最新 ${esc(r.latest||'—')}</span>
         ${badge}
         ${r.source?`<span class="sub-cell">源: ${esc(r.source)}</span>`:''}
+        ${r.mirror?'<span class="pill orange" title="官方发布源不可用，改用社区镜像 tag；镜像可能滞后，仅供参照">镜像参照</span>':''}
+        ${r.checked_at?`<span class="sub-cell">上次检测: ${esc(r.checked_at)}</span>`:''}
         ${r.error?`<span class="sub-cell" style="color:var(--orange)">${esc(r.error)}</span>`:''}
       </div>`;
     }).join('')||'<div class="empty">—</div>';

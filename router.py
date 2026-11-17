@@ -9,6 +9,8 @@
 """
 
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -575,6 +577,157 @@ def public_catalog():
     return entries
 
 
+# ---------------------------------------------------------------------------
+# WorkBuddy 媒体模型（生图 / 生视频）。
+#
+# 引擎把媒体目录放在 /v1/media/models，并刻意不混进 /v1/models（聊天客户端
+# 会把图片模型当对话模型用）。网关沿用这个边界：聊天目录不动，媒体模型走
+# /api/media/models 与 /v1/media/models，生成请求按 /v1/images/*、/v1/videos*
+# 原样转发给 workbuddy。媒体与文本共用引擎的 API Key 与媒体号池，网关只做
+# 模型名校验、可见性过滤和任务产物 URL 回写。
+# ---------------------------------------------------------------------------
+
+WB_MEDIA_REALMS = ("cn", "intl")
+WB_MEDIA_TTL = 30.0
+_wb_media_lock = threading.Lock()
+_wb_media_cache = {"ts": 0.0, "models": [], "errors": {}}
+_media_link_secret = secrets.token_bytes(32)
+
+
+def _media_link_signature(target, expires):
+    message = f"{target}|{expires}".encode("utf-8")
+    return hmac.new(_media_link_secret, message, hashlib.sha256).hexdigest()
+
+
+def _media_download_allowed(target):
+    original, sep, signature = target.rpartition("&gw_exp=")
+    if not sep or not re.fullmatch(r"/v1/videos/[A-Za-z0-9_-]+/content\?[^#]*", original):
+        return False
+    expires, sep, supplied = signature.partition("&gw_sig=")
+    if not sep or not re.fullmatch(r"[0-9]{1,12}", expires):
+        return False
+    deadline = int(expires)
+    return (time.time() <= deadline <= time.time() + 3601
+            and hmac.compare_digest(supplied, _media_link_signature(original, expires)))
+
+
+def _wb_media_fetch(force=False):
+    """拉取国内/国际两区媒体目录并按模型 id 合并。
+
+    同一模型可能两区都有（kling-video-v3）；合并后 realms 记录所有可用区域，
+    区域专属模型（hunyuan-image-alpha / hy-image-3.5）只标自己那一区。
+    """
+    now = time.time()
+    with _wb_media_lock:
+        if not force and now - _wb_media_cache["ts"] < WB_MEDIA_TTL:
+            return _wb_media_cache["models"], _wb_media_cache["errors"]
+    up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
+    merged, errors, active_realm = {}, {}, None
+    if up:
+        for requested in (None, *WB_MEDIA_REALMS):
+            query = f"?realm={requested}" if requested else ""
+            try:
+                req = urllib.request.Request(
+                    up["base_url"].rstrip("/") + "/v1/media/models" + query,
+                    headers=_upstream_headers(up))
+                with _urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+                    raise ValueError("媒体目录响应缺少 models 数组")
+                realm = data.get("realm")
+                if realm not in WB_MEDIA_REALMS:
+                    raise ValueError("媒体目录响应缺少有效区域")
+                if requested is None:
+                    active_realm = realm
+            except Exception as exc:
+                errors[requested or "active"] = f"{type(exc).__name__}: {exc}"
+                continue
+            rows = data["models"]
+            for row in rows or []:
+                if not isinstance(row, dict) or not row.get("id"):
+                    continue
+                mid = str(row["id"])
+                tags = [str(t) for t in (row.get("tags") or []) if str(t)]
+                item = merged.get(mid)
+                if item is None:
+                    item = merged[mid] = {
+                        "id": mid,
+                        "name": str(row.get("name") or mid),
+                        "tags": tags,
+                        "realms": [],
+                        "video": row.get("videoGeneration"),
+                        "credit_per_image": _known_num(row.get("creditPerImage")),
+                        "image_measured": bool(row.get("creditPerImageMeasured")),
+                        "credit_per_second": _known_num(row.get("creditPerSecond")),
+                        "credit_ceiling": _known_num(row.get("creditPerSecondCeiling")),
+                        "credits_per_second": row.get("creditsPerSecond") or {},
+                        "credits_with_reference": row.get("creditsPerSecondWithReference") or {},
+                    }
+                item["realms"].append(realm)
+                item["tags"] = sorted(set(item["tags"]) | set(tags))
+                if item["video"] is None:
+                    item["video"] = row.get("videoGeneration")
+    models = []
+    for item in merged.values():
+        item["realms"] = sorted(set(item["realms"]))
+        item["kind"] = "video" if any("video" in t for t in item["tags"]) else "image"
+        item["active_realm"] = active_realm
+        item["available"] = active_realm in item["realms"]
+        models.append(item)
+    models.sort(key=lambda m: (m["kind"], m["id"]))
+    with _wb_media_lock:
+        _wb_media_cache.update(ts=now, models=models, errors=errors)
+    return models, errors
+
+
+def public_media_catalog(force=False):
+    models, _ = _wb_media_fetch(force=force)
+    return [dict(m, platform="workbuddy", public=m["id"], upstream=m["id"])
+            for m in models]
+
+
+def resolve_media_model(model, tag=None):
+    """只从当前媒体出口中挑可见且支持目标操作的模型。"""
+    model = (model or "").strip()
+    up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
+    if up is None:
+        return None, None, None, "未配置 workbuddy 上游，媒体模型不可用"
+    entries = public_media_catalog()
+    platform, sep, rest = model.partition("/")
+    if sep and platform.lower() != "workbuddy":
+        return None, None, None, f"媒体生成目前只由 workbuddy 上游提供，不支持 `{model}`"
+    wanted = rest if sep else model
+    if sep and not wanted:
+        return None, None, None, f"模型名 `{model}` 缺少 `/` 后的模型部分"
+    if not wanted:
+        entry = next((m for m in entries if m.get("available")
+                      and not _model_hidden("workbuddy", m["public"])
+                      and (not tag or tag in m["tags"])), None)
+        if entry is None:
+            return None, None, None, "当前媒体出口没有可见且支持该操作的模型"
+        wanted = entry["public"]
+    else:
+        entry = next((m for m in entries if m["public"] == wanted), None)
+        if entry is None:
+            return None, None, None, f"未知媒体模型 `{model}`"
+    if _model_hidden("workbuddy", wanted):
+        return None, None, None, f"媒体模型 `{model}` 已在控制台隐藏（媒体页可恢复显示）"
+    if not entry.get("available"):
+        return None, None, None, f"媒体模型 `{wanted}` 不在当前媒体出口，请检查 WorkBuddy 引擎的媒体区域与账号池"
+    if tag and tag not in entry["tags"]:
+        return None, None, None, f"媒体模型 `{wanted}` 不支持 `{tag}`"
+    return up, wanted, (model or f"workbuddy/{wanted}"), None
+
+
+#: 媒体生成入口（与引擎 MEDIA_POST_PATHS 对齐）。视频任务的状态/产物/取消
+#: 是 /v1/videos/... 的动态路径，单独在 do_POST / do_GET 里判。
+MEDIA_POST_PATHS = {
+    "/v1/images/generations", "/images/generations",
+    "/v1/images/edits", "/images/edits",
+    "/v1/videos", "/videos",
+}
+
+
 def _row_alt_desc(platform, row):
     """给目录页展示的「真实名称 / 描述」。"""
     if platform == "qoder":
@@ -698,7 +851,11 @@ def _upstream_path(up, path):
 
 
 def forward(up, method, path, body, client_headers, stream):
-    """把请求转发到上游，返回 (status, headers, 响应迭代器/字节)。"""
+    """把请求转发到上游，返回 (status, headers, 响应迭代器/字节)。
+
+    stream=True 走 SSE 分块；stream="raw" 用于二进制/大文件透传（视频产物），
+    不缓冲、不改 Content-Type、不覆盖 Accept。
+    """
     conn = _connect(up)
     streaming = False  # relay 生成器路径由生成器自己的 finally 关闭连接
     try:
@@ -711,7 +868,7 @@ def forward(up, method, path, body, client_headers, stream):
                 if lower in ("accept", "user-agent", "anthropic-version", "anthropic-beta") or lower.startswith("x-"):
                     if not any(key.lower() == lower for key in headers):
                         headers[k] = v
-            if stream:
+            if stream is True:
                 headers["Accept"] = "text/event-stream"
             payload = body if body else None
             if payload is not None and isinstance(payload, (bytes, bytearray)):
@@ -724,7 +881,7 @@ def forward(up, method, path, body, client_headers, stream):
             raise
         # 客户端要流式、但上游回了非流式响应（如 400/401 错误 JSON）时退回缓冲发送：
         # 否则响应无 Content-Length 也无分帧，客户端会挂到自己超时。
-        if stream and "event-stream" not in (resp_headers.get("Content-Type") or "").lower():
+        if stream is True and "event-stream" not in (resp_headers.get("Content-Type") or "").lower():
             data = resp.read()
             return resp.status, resp_headers, data
         if stream:
@@ -975,6 +1132,38 @@ _updates_lock = threading.Lock()
 _updates_cache = {"ts": 0.0, "data": None}
 UPDATES_TTL = 3600.0
 
+# 官方 wb 仓库已下线（GitHub 404），引擎自带检查因此永远拿不到 latest。
+# 回退到社区镜像的 release tag：只作参照，明确标注镜像可能滞后；可用
+# config.json 的 wb_update_mirror（owner/repo）覆盖这一默认值。
+WB_UPDATE_MIRRORS = ("niyouqianma/workbuddy2api-hub",)
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+
+
+def _wb_mirror_update(row):
+    """官方源不可用时用镜像 tag 补齐 latest；成功返回 True。"""
+    mirrors = []
+    configured = str(CONFIG.get("wb_update_mirror") or "").strip()
+    for repo in ((configured,) if configured else ()) + WB_UPDATE_MIRRORS:
+        if repo and repo not in mirrors and _REPO_RE.fullmatch(repo):
+            mirrors.append(repo)
+    last_error = ""
+    for repo in mirrors:
+        try:
+            latest = _github_latest(repo)
+        except Exception as exc:
+            last_error = f"{repo}: {type(exc).__name__}: {exc}"
+            continue
+        row["latest"] = latest
+        row["source"] = f"mirror:{repo}"
+        row["mirror"] = True
+        cur_t, lat_t = _ver_tuple(row.get("current")), _ver_tuple(str(latest).lstrip("vV"))
+        if cur_t and lat_t:
+            row["has_update"] = lat_t > cur_t
+        return True
+    if last_error:
+        row["error"] = (row.get("error") or "") + f"；社区镜像也失败: {last_error}"[:180]
+    return False
+
 
 def _ver_tuple(s):
     m = re.search(r"(\d+(?:\.\d+){0,3})", str(s or ""))
@@ -1028,15 +1217,29 @@ def _collect_updates(force=False):
                 row["current"] = st.get("current_version") or row["current"]
                 row["latest"] = st.get("latest_version") or None
                 row["source"] = "engine"
+                row["checked_at"] = st.get("last_attempt")
+                engine_error = ""
+                if st.get("last_error"):
+                    engine_error = "引擎更新检测失败: " + str(st["last_error"])[:140]
+                elif st.get("checking"):
+                    engine_error = "引擎正在检查更新，请稍后刷新"
+                elif st.get("last_attempt") and not row["latest"]:
+                    engine_error = "引擎检测未返回可用发布版本"
+                elif not st.get("last_attempt"):
+                    engine_error = "尚未执行引擎更新检测"
                 if row["latest"]:
                     row["has_update"] = bool(st.get("update_available"))
-                    row["error"] = ""
-                elif st.get("last_error"):
-                    row["error"] = str(st.get("last_error"))[:180]
+                    row["error"] = engine_error
+                elif _wb_mirror_update(row):
+                    # 官方源 404：镜像 tag 只作参照，绝不标成官方结论。
+                    row["error"] = (engine_error + "；已改用社区镜像检测，镜像可能滞后，仅供参照"
+                                    if engine_error else "已改用社区镜像检测，镜像可能滞后")
                 else:
-                    row["error"] = "引擎更新检查未执行过（官方仓库已转 Telegram 分发，GitHub 无发布源）"
+                    row["error"] = engine_error + "（官方 Telegram 渠道仍是权威来源）"
             except Exception as exc:
                 row["error"] = f"引擎 /updates 不可用: {type(exc).__name__}"
+                if _wb_mirror_update(row):
+                    row["error"] += "；已改用社区镜像检测，镜像可能滞后"
         else:
             repo = (up.get("repo") or "").strip()
             if not repo:
@@ -1353,23 +1556,49 @@ def estimate_snapshot(force=False):
             item["usage_error"] = type(exc).__name__
         samples = {}
         for r in rows:
-            at = _estimate_at(r)
-            if not now - 86400 <= at <= now:
-                continue
             model = _estimate_public_model(name, r.get("resolved_model") or r.get("model"))
-            sample = samples.setdefault(model, {"tokens": 0, "priced_tokens": 0, "credit": 0, "rows": 0})
-            tokens = _num(r.get("total_tokens") or r.get("total"))
-            sample["tokens"] += tokens
+            sample = samples.setdefault(model, {
+                "rows": 0, "tokens": 0.0, "prompt": 0.0, "completion": 0.0,
+                "cached": 0.0, "cached_rows": 0,
+                "priced_rows": 0, "priced_tokens": 0.0, "credit": 0.0,
+                "billed_priced": 0.0, "first_at": None})
             sample["rows"] += 1
-            credit = r.get("credit")
-            if credit is not None and tokens > 0:
+            at = _estimate_at(r)
+            if at and (sample["first_at"] is None or at < sample["first_at"]):
+                sample["first_at"] = at
+            tokens = _num(r.get("total_tokens") or r.get("total"))
+            prompt = _num(r.get("prompt_tokens") or r.get("prompt"))
+            completion = _num(r.get("completion_tokens") or r.get("completion"))
+            sample["tokens"] += tokens
+            sample["prompt"] += prompt
+            sample["completion"] += completion
+            cached = None
+            raw_cached = r.get("cached_tokens")
+            if raw_cached is not None:
                 try:
-                    credit = float(credit)
-                except (ValueError, TypeError):
-                    continue
-                if 0 <= credit < float("inf"):
+                    cached = float(raw_cached)
+                except (TypeError, ValueError):
+                    cached = None
+                if cached is not None and (cached < 0 or tokens <= 0):
+                    cached = None
+            billed = None
+            if cached is not None:
+                sample["cached"] += cached
+                sample["cached_rows"] += 1
+                # 计费口径：非缓存输入 + 全部输出。billed/tokens 就是缓存折扣率。
+                billed = max(0.0, prompt - cached) + completion
+            raw_credit = r.get("credit")
+            if raw_credit is not None and tokens > 0:
+                try:
+                    credit = float(raw_credit)
+                except (TypeError, ValueError):
+                    credit = None
+                if credit is not None and 0 <= credit < float("inf"):
+                    sample["priced_rows"] += 1
                     sample["priced_tokens"] += tokens
                     sample["credit"] += credit
+                    if billed is not None:
+                        sample["billed_priced"] += billed
         models = []
         for entry in catalog:
             if entry["platform"] != name or _model_hidden(name, entry["public"]):
@@ -1386,47 +1615,79 @@ def estimate_snapshot(force=False):
                                  else sum(scoped_balances))
                 scope = "双区合计" if len(realms) > 1 else ("仅国际" if realms[0] == "intl" else "仅国内")
             sample = samples.get(public) or {}
-            priced = sample.get("priced_tokens", 0)
-            credit = sample.get("credit", 0)
-            measured = credit / priced * 1000 if priced >= 1000 and credit > 0 else None
+            priced = sample.get("priced_tokens", 0.0)
+            credit = sample.get("credit", 0.0)
+            coverage = priced / sample["tokens"] if sample.get("tokens") else 0
+            # 实测有效单价 = 扣费 / 全部 token（天然含缓存折扣）；
+            # 实测全价 = 扣费 / 计费 token（非缓存输入 + 输出），即零缓存下限。
+            measured_eff = (credit / priced * 1000
+                            if sample.get("priced_rows", 0) >= 3 and priced >= 500 and credit > 0
+                            else None)
+            measured_full = (credit / sample["billed_priced"] * 1000
+                             if sample.get("billed_priced", 0.0) >= 500 and credit > 0
+                             else None)
             spec = _qwen_rate_spec(entry["upstream"], entry["public"]) if name == "qwenwork" else None
-            rate = None
+            rate = None          # 支撑 est_tokens 的单价（积分/千tok）
+            floor_rate = None    # 零缓存全价（积分/千tok）
             rate_src = "unknown"
             note = "缺少可靠单价，暂不估算"
             extra = {}
-            if spec:
-                rate = (spec["hit_rate"] * spec["hit_per_ktok"]
-                        + (1 - spec["hit_rate"]) * spec["miss_per_ktok"])
+            if measured_eff is not None:
+                rate = measured_eff
+                rate_src = "measured"
+                note = (f"按最近 {sample['priced_rows']} 条扣费样本实测（含实际缓存表现），非保证容量")
+                if measured_full is not None:
+                    floor_rate = measured_full
+                else:
+                    try:
+                        floor_rate = (_row_multiplier(name, entry["row"]) or {}).get("factor")
+                    except Exception:
+                        floor_rate = None
+                    if floor_rate:
+                        note += "；下限按目录全价（未经本机校准）"
+                    else:
+                        floor_rate = None
+            elif spec:
+                miss = spec["miss_per_ktok"]
+                hit_rate = spec["hit_rate"]
+                eff = hit_rate * spec["hit_per_ktok"] + (1 - hit_rate) * miss
+                # 千问没有逐请求扣费：headline 取全价（零缓存）作保守下限，
+                # 缓存假设只作乐观参考，不冒充主估算。
+                rate = miss
                 rate_src = "cache_assumed"
-                hit_pct = int(spec["hit_rate"] * 100)
-                extra = {"cache_hit_rate": spec["hit_rate"], "cache_assumed": True,
-                         "rate_nocache_per_ktok": round(spec["miss_per_ktok"], 6),
-                         "est_tokens_nocache": (int(model_balance / spec["miss_per_ktok"] * 1000)
-                                                if model_balance is not None and model_balance > 0
-                                                else None)}
-                note = f"短样本参考：按 {hit_pct}% 缓存假设，非保证容量"
-            elif name in ("workbuddy", "qoder"):
+                hit_pct = int(hit_rate * 100)
+                note = f"短样本全价下限（未计缓存）；乐观值按 {hit_pct}% 缓存假设，未经持续校准"
+                extra = {"cache_hit_rate": hit_rate, "cache_assumed": True,
+                         "rate_opt_per_ktok": round(eff, 6),
+                         "est_tokens_opt": None}
+            else:
                 try:
                     factor = (_row_multiplier(name, entry["row"]) or {}).get("factor")
                 except Exception:
                     factor = None
                 if factor:
-                    rate = float(factor)
-                    rate_src = "catalog"
-                    note = "官方目录单价（未计缓存折扣）"
-            if rate is None and measured:
-                rate = measured
-                rate_src = "measured"
-                note = "按已记录扣费样本外推，非保证容量"
-            est = (int(model_balance / rate * 1000)
-                   if (rate and model_balance is not None and model_balance > 0) else None)
+                    floor_rate = float(factor)
+                    rate_src = "catalog_floor"
+                    note = "无扣费样本：目录全价仅作零缓存下限，未经本机校准"
+            est = floor_est = None
             if model_balance is None:
                 note = "余额待测，暂不估算"
-            coverage = priced / sample["tokens"] if sample.get("tokens") else 0
+            elif model_balance > 0:
+                if rate:
+                    est = int(model_balance / rate * 1000)
+                if floor_rate:
+                    floor_est = int(model_balance / floor_rate * 1000)
+                if extra.get("cache_assumed") and extra.get("rate_opt_per_ktok"):
+                    extra["est_tokens_opt"] = int(model_balance / extra["rate_opt_per_ktok"] * 1000)
+            sample_hours = None
+            if sample.get("first_at"):
+                sample_hours = round(max(0.0, (now - sample["first_at"]) / 3600), 1)
             row = {"model": public, "tokens": sample.get("tokens", 0),
                    "samples": sample.get("rows", 0), "coverage": coverage,
+                   "sample_hours": sample_hours,
                    "rate_per_ktok": rate, "rate_source": rate_src,
-                   "est_tokens": est,
+                   "rate_floor_per_ktok": (round(floor_rate, 6) if floor_rate else None),
+                   "est_tokens": est, "est_tokens_floor": floor_est,
                    "model_balance": (round(model_balance, 2)
                                      if model_balance is not None else None),
                    "balance_scope": scope,
@@ -1439,7 +1700,9 @@ def estimate_snapshot(force=False):
         # 不从分散到期的积分包推断整个池的寿命。
         item.update(burn_day=None, days=None, effective_days=None, pool_all=False)
         out.append(item)
-    data = {"ok": True, "generated_at": int(now), "window_hours": 24, "platforms": out}
+    data = {"ok": True, "generated_at": int(now),
+            "sample_basis": "各引擎最近返回的用量行（每引擎最多 1000 条，不限 24 小时）",
+            "platforms": out}
     with _estimate_lock:
         _estimate_cache.update(ts=now, data=data)
     return data
@@ -1521,9 +1784,16 @@ def _action_status(result):
 
 
 def tail_log(lines=120):
+    """只读日志尾部，避免每次把整份 router.log 读进内存。"""
     try:
-        with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            return [re.sub(r"API Key:.*", "API Key: [redacted]", line) for line in f.readlines()[-lines:]]
+        with open(LOG_PATH, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - 256 * 1024)
+            f.seek(start)
+            data = f.read().decode("utf-8", "ignore")
+        rows = data.splitlines()[-lines:]
+        return [re.sub(r"API Key:.*", "API Key: [redacted]", line) for line in rows]
     except OSError:
         return []
 
@@ -1637,10 +1907,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_bytes(204, b"", "image/x-icon")
         if path == "/health":
             return self._health()
+        if _media_download_allowed(self.path):
+            return self._media_video_get()
         if not self._authorized():
             return self._deny(401, "API Key 缺失或不正确")
         if path in ("/v1/models", "/models"):
             return self._models()
+        if path in ("/v1/media/models", "/media/models"):
+            return self._media_models()
+        if path == "/api/media/models":
+            return self._api_media_models()
+        if path == "/v1/media/tasks":
+            return self._media_tasks()
+        if path.startswith("/v1/videos/"):
+            return self._media_video_get()
         if path == "/api/ping":
             return self._send_json(200, {"ok": True})
         if path == "/api/gwconfig":
@@ -1695,6 +1975,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_engine()
         if path == "/api/gwconfig":
             return self._api_gwconfig()
+        if (path in MEDIA_POST_PATHS
+                or (path.startswith("/v1/videos/") and path.endswith("/cancel"))):
+            return self._media_post()
         if path not in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
             return self._deny(404, "仅支持 /v1/* 与 /api/*")
 
@@ -1815,6 +2098,208 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
+    # ---- 媒体（生图 / 生视频） ----
+
+    def _media_models(self):
+        """GET /v1/media/models：媒体模型清单（OpenAI 风格外壳）。
+
+        媒体模型刻意不进 /v1/models——聊天客户端会把它们当对话模型调用。
+        支持 ?tag=text-to-image / image-to-video 等与 ?realm=cn|intl 过滤。
+        """
+        from urllib.parse import parse_qs
+        qs = parse_qs(urlsplit(self.path).query)
+        tag = (qs.get("tag") or [""])[0]
+        realm = (qs.get("realm") or [""])[0]
+        models, errors = _wb_media_fetch()
+        data = []
+        for m in models:
+            if _model_hidden("workbuddy", m["id"]):
+                continue
+            if tag and tag not in m["tags"]:
+                continue
+            if realm and realm not in m["realms"]:
+                continue
+            data.append({
+                "id": f"workbuddy/{m['id']}",
+                "object": "model",
+                "owned_by": "workbuddy",
+                "name": m["name"],
+                "type": m["kind"],
+                "tags": m["tags"],
+                "realms": m["realms"],
+                "available": m["available"],
+                "active_realm": m["active_realm"],
+                "videoGeneration": m["video"],
+                "creditPerImage": m["credit_per_image"],
+                "creditPerImageMeasured": m["image_measured"],
+                "creditPerSecond": m["credit_per_second"],
+                "creditPerSecondCeiling": m["credit_ceiling"],
+                "creditsPerSecond": m["credits_per_second"],
+                "creditsPerSecondWithReference": m["credits_with_reference"],
+            })
+        payload = {"object": "list", "data": data, "total": len(data)}
+        if errors:
+            payload["errors"] = errors
+        self._send_json(200, payload)
+
+    def _api_media_models(self):
+        """GET /api/media/models：控制台用（带 hidden 标记与刷新）。"""
+        models, errors = _wb_media_fetch(force="force=1" in self.path)
+        items = []
+        for m in models:
+            items.append({
+                "id": f"workbuddy/{m['id']}",
+                "platform": "workbuddy",
+                "model": m["id"],
+                "name": m["name"],
+                "kind": m["kind"],
+                "tags": m["tags"],
+                "realms": m["realms"],
+                "video": m["video"],
+                "credit_per_image": m["credit_per_image"],
+                "image_measured": m["image_measured"],
+                "credit_per_second": m["credit_per_second"],
+                "credit_ceiling": m["credit_ceiling"],
+                "credits_per_second": m["credits_per_second"],
+                "credits_with_reference": m["credits_with_reference"],
+                "hidden": _model_hidden("workbuddy", m["id"]),
+                "available": m["available"],
+                "active_realm": m["active_realm"],
+            })
+        self._send_json(200, {"ok": True, "items": items, "total": len(items),
+                              "hidden_count": sum(1 for i in items if i["hidden"]),
+                              "errors": errors})
+
+    def _abs_media_url(self, url):
+        """引擎回的是相对产物路径（/v1/videos/...?t=签名）；转成网关直链。
+
+        签名 token 自带鉴权，<video>/浏览器直接打开也能下载；不带网关 Key。
+        """
+        if (isinstance(url, str)
+                and re.fullmatch(r"/v1/videos/[A-Za-z0-9_-]+/content\?[^#]*", url)):
+            port = CONFIG.get("listen_port") or 8787
+            expires = str(int(time.time()) + 3600)
+            signature = _media_link_signature(url, expires)
+            return f"http://127.0.0.1:{port}{url}&gw_exp={expires}&gw_sig={signature}"
+        return url
+
+    def _media_rewrite(self, obj, client_facing):
+        if not isinstance(obj, dict):
+            return obj
+        if client_facing and isinstance(obj.get("model"), str):
+            obj["model"] = client_facing
+        if isinstance(obj.get("url"), str):
+            obj["url"] = self._abs_media_url(obj["url"])
+        for key in ("data", "tasks"):
+            for row in obj.get(key) or []:
+                if isinstance(row, dict) and isinstance(row.get("url"), str):
+                    row["url"] = self._abs_media_url(row["url"])
+        return obj
+
+    def _relay_media_json(self, status, headers, data, client_facing=None):
+        """媒体 JSON 透传：改写模型名与产物直链；错误体原样保留。"""
+        if status >= 400:
+            return self._relay_json(status, headers, data, None)
+        try:
+            obj = json.loads(data.decode("utf-8"))
+            if not isinstance(obj, dict):
+                raise ValueError
+        except ValueError:
+            return self._relay_json(status, headers, data, None)
+        obj = self._media_rewrite(obj, client_facing)
+        out = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", headers.get("Content-Type", "application/json"))
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def _relay_binary(self, status, headers, chunks):
+        """视频产物直传：不缓冲、不改 Content-Type，连接关闭即结束。"""
+        self.send_response(status)
+        for key in ("Content-Type", "Content-Length", "Content-Disposition",
+                    "Cache-Control", "ETag", "Last-Modified"):
+            if headers.get(key):
+                self.send_header(key, headers[key])
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        try:
+            for chunk in chunks:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (ConnectionError, TimeoutError, HTTPException) as exc:
+            log(f"媒体下载中断: {type(exc).__name__}")
+        finally:
+            close = getattr(chunks, "close", None)
+            if close:
+                close()
+
+    def _media_upstream(self):
+        up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
+        if not up:
+            self._deny(404, "未配置 workbuddy 上游，媒体不可用")
+        return up
+
+    def _media_post(self):
+        up = self._media_upstream()
+        if up is None:
+            return
+        path = self.path.split("?")[0]
+        cancel = path.startswith("/v1/videos/") and path.endswith("/cancel")
+        client_facing = None
+        if not cancel:
+            req = self._post_body
+            model = req.get("model", "")
+            if not isinstance(model, str):
+                return self._deny(400, "model 必须是字符串")
+            if path in ("/v1/videos", "/videos"):
+                has_images = any(req.get(k) for k in ("image", "input_reference", "reference_images", "images"))
+                tag = "image-to-video" if has_images else "text-to-video"
+            else:
+                tag = "image-to-image" if path.endswith("/edits") else "text-to-image"
+            up, upstream_model, client_facing, reason = resolve_media_model(model, tag)
+            if up is None:
+                return self._deny(400, reason)
+            req["model"] = upstream_model
+            self._post_body = req
+        payload = json.dumps(self._post_body, ensure_ascii=False).encode("utf-8")
+        try:
+            status, headers, data = forward(up, "POST", self.path, payload,
+                                            dict(self.headers.items()), False)
+        except (OSError, TimeoutError, HTTPException) as exc:
+            log(f"upstream[workbuddy] 媒体请求失败: {type(exc).__name__}: {exc}")
+            return self._send_json(502, {"error": {
+                "message": f"上游 workbuddy 不可达: {exc}", "type": "upstream_error"}})
+        log(f"media {path} model={client_facing or '(默认)'} -> HTTP {status}")
+        self._relay_media_json(status, headers, data, client_facing)
+
+    def _media_video_get(self):
+        up = self._media_upstream()
+        if up is None:
+            return
+        path = self.path.split("?")[0]
+        try:
+            if path.endswith("/content"):
+                status, headers, chunks = forward(up, "GET", self.path, None, {}, "raw")
+                return self._relay_binary(status, headers, chunks)
+            status, headers, data = forward(up, "GET", self.path, None, {}, False)
+        except (OSError, TimeoutError, HTTPException) as exc:
+            return self._send_json(502, {"error": {
+                "message": f"上游 workbuddy 不可达: {exc}", "type": "upstream_error"}})
+        self._relay_media_json(status, headers, data)
+
+    def _media_tasks(self):
+        up = self._media_upstream()
+        if up is None:
+            return
+        try:
+            status, headers, data = forward(up, "GET", self.path, None, {}, False)
+        except (OSError, TimeoutError, HTTPException) as exc:
+            return self._send_json(502, {"error": {
+                "message": f"上游 workbuddy 不可达: {exc}", "type": "upstream_error"}})
+        self._relay_media_json(status, headers, data)
+
     # ---- 控制台 API ----
 
     def _api_status(self):
@@ -1929,6 +2414,7 @@ class Handler(BaseHTTPRequestHandler):
                    "qoder": ("/tasks/travel", "猫猫旅行（派出/领奖闭环）")},
         "night": {"workbuddy": ("/tasks/night", "夜猫子任务（仅 23:00-08:00 计数）")},
         "streak-bonus": {"workbuddy": ("/tasks/streak-bonus", "连登管家奖励")},
+        "daily-web": {"workbuddy": ("/accounts/daily-chat-web", "国际版网页通道补打卡")},
     }
 
     def _api_tasks_get(self, name):
@@ -1944,6 +2430,62 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(502, {"ok": False, "platform": name, "error": f"{type(exc).__name__}: {exc}"})
 
+    def _wb_claim_all(self, up, body):
+        """遍历所有启用的国内任务账号领取已完成任务。
+
+        旧实现只挑第一个 cn 账号、且用不带 uid 的 /tasks 判定，多账号池里
+        其余账号的奖励永远领不到。返回引擎风格的结果容器；显式 uid+code
+        的单任务请求返回 None，交给原逻辑直接转发。
+        """
+        from urllib.parse import quote
+        wanted = str(body.get("uid") or "").strip()
+        code = str(body.get("code") or "").strip()
+        if code and not wanted:
+            return {"ok": False, "error": "指定任务 code 时必须同时指定 uid"}
+        if wanted and code:
+            return None
+        accs = engine_request(up, "GET", "/accounts?realm=all", timeout=30)
+        alist = accs.get("accounts") if isinstance(accs, dict) else accs
+        targets = [a for a in (alist or [])
+                   if isinstance(a, dict) and a.get("realm") == "cn"
+                   and a.get("enabled") and not a.get("accountBanned")
+                   and a.get("tasksEnabled") is not False
+                   and (not wanted or a.get("uid") == wanted)]
+        if not targets:
+            return {"ok": False, "error": "没有启用的国内版任务账号可领取"}
+        claimed, accounts = [], []
+        for acct in targets:
+            uid = acct.get("uid")
+            row = {"uid": uid, "nickname": acct.get("nickname") or ""}
+            try:
+                status = engine_request(
+                    up, "GET", f"/tasks?uid={quote(str(uid), safe='')}", timeout=60)
+                tasks = status.get("tasks") if isinstance(status, dict) else status
+                codes = [t.get("task_code") for t in (tasks or [])
+                         if isinstance(t, dict) and t.get("status") == "accepted"
+                         and _num(t.get("current")) >= _num(t.get("target")) > 0]
+                if not codes:
+                    row["skipped"] = True
+                    row["msg"] = "没有已完成待领取的任务"
+                    accounts.append(row)
+                    continue
+                row["codes"] = codes
+                for one_code in codes:
+                    try:
+                        one = engine_request(up, "POST", "/tasks/claim",
+                                             {"uid": uid, "code": one_code}, timeout=300)
+                        claimed.append({"uid": uid, "code": one_code, "result": one})
+                    except Exception as exc:
+                        claimed.append({"uid": uid, "code": one_code,
+                                        "error": f"{type(exc).__name__}: {exc}"})
+                accounts.append(row)
+            except Exception as exc:
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                accounts.append(row)
+        results = [row for row in accounts if row.get("error") or row.get("skipped")]
+        return {"uid": wanted or "all", "accounts": accounts,
+                "results": results, "claimed": claimed}
+
     def _api_tasks_post(self, action, name):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up:
@@ -1953,44 +2495,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._deny(400, f"平台 `{name}` 不支持任务操作 `{action}`")
         engine_path, label = spec
         body = self._post_body
-        # wb 的 /tasks/claim 必须指定 {uid, code}；控制台调用没带 code 时自动
-        # 拉 /tasks 找出「已完成未领奖」的任务逐个领取。
+        # wb 的 /tasks/claim 必须指定 {uid, code}：控制台不带 code 时按账号
+        # 逐个拉 /tasks、把「已完成未领奖」的任务全部领掉（不再只领第一个号）。
         if action == "claim" and name == "workbuddy":
             try:
-                accs = engine_request(up, "GET", "/accounts")
-                alist = accs.get("accounts") if isinstance(accs, dict) else accs
-                pick = next((a for a in (alist or [])
-                             if isinstance(a, dict) and a.get("enabled")
-                             and a.get("realm") == "cn" and not a.get("accountBanned")), None)
-                uid = pick.get("uid") if pick else None
-                if not uid:
-                    return self._send_json(200, {"ok": False, "platform": name, "action": action,
-                                                 "error": "没有启用的国内版账号可领取"})
-                if not body.get("code"):
-                    status = engine_request(up, "GET", "/tasks")
-                    claimable = [t.get("task_code") for t in (status.get("tasks") or [])
-                                 if isinstance(t, dict)
-                                 and t.get("status") == "accepted"
-                                 and _num(t.get("current")) >= _num(t.get("target")) > 0]
-                    if not claimable:
-                        return self._send_json(200, {"ok": True, "platform": name, "action": action,
-                                                     "label": label,
-                                                     "result": {"ok": True,
-                                                                "msg": "没有已完成待领取的任务（进度未满的会留在池里继续跑）"}})
-                    results = []
-                    for code in claimable:
-                        try:
-                            one = engine_request(up, "POST", "/tasks/claim", {"uid": uid, "code": code})
-                            results.append({"code": code, "result": one})
-                        except Exception as exc:
-                            results.append({"code": code, "error": str(exc)})
-                    log(f"tasks/claim[{name}] auto -> {len(results)} 项: {json.dumps(results, ensure_ascii=False)[:150]}")
-                    return self._send_json(200, {"platform": name, "action": action,
-                                                 "result": {"uid": uid, "claimed": results},
-                                                 **_action_status({"claimed": results})})
-                body["uid"] = uid
+                result = self._wb_claim_all(up, body)
             except Exception as exc:
-                log(f"tasks/claim[{name}] 预备阶段失败（继续按原 body 执行）: {type(exc).__name__}: {exc}")
+                log(f"tasks/claim[{name}] 预备阶段失败: {type(exc).__name__}: {exc}")
+                return self._send_json(502, {"ok": False, "platform": name, "action": action,
+                                             "error": f"{type(exc).__name__}: {exc}"})
+            if result is not None:
+                log(f"tasks/claim[{name}] auto -> {json.dumps(result, ensure_ascii=False)[:180]}")
+                return self._send_json(200, {"platform": name, "action": action,
+                                             "label": label, "result": result,
+                                             **_action_status(result)})
+            # 只剩「显式 uid + code」这一种：原 body 已带全，直接转发。
         try:
             # run/claim/travel 在引擎里跑真实会话，分钟级耗时；默认 15s 会 502 而
             # 引擎仍在跑，用户重复点击造成重复执行
@@ -2011,9 +2530,10 @@ class Handler(BaseHTTPRequestHandler):
     ENGINE_WHITELIST = {
         "workbuddy": {
             "accounts/refresh", "accounts/credits/fetch", "accounts/credits",
+            "accounts/credits/grants", "accounts/sync-profile", "accounts/test",
             "accounts/daily-chat", "accounts/daily-chat-web", "scheduler",
             "scheduler/trigger", "scheduler/toggle",
-            "activity/history", "tasks/progress",
+            "activity/history", "tasks/progress", "quota-scan/run",
             "settings", "settings/save",
             "updates", "updates/check",
         },
@@ -2331,6 +2851,34 @@ class Handler(BaseHTTPRequestHandler):
                 if alias_of:
                     item["alias_of"] = alias_of  # 本 id 是某逻辑模型在国际版出口的改名
             items.append(item)
+        # 媒体模型并进同一张目录表（带 media 标记），可见性/批量操作与聊天
+        # 模型共用 hidden_models；但 /v1/models 不会列出它们。
+        for m in public_media_catalog():
+            full = f"workbuddy/{m['public']}"
+            mult = None
+            if full in custom:
+                mult = {"factor": custom[full].get("factor"), "source": "manual",
+                        "note": custom[full].get("note", ""),
+                        "recorded_at": custom[full].get("recorded_at", "")}
+            items.append({
+                "id": full, "platform": "workbuddy", "model": m["public"],
+                "upstream": m["upstream"], "alt": m["name"], "desc": "",
+                "hidden": _model_hidden("workbuddy", m["public"]),
+                "fav": full in favorites,
+                "requires_pro": False,
+                "realms": m["realms"],
+                "pro_locked": False,
+                "multiplier": mult,
+                "media": m["kind"],
+                "tags": m["tags"],
+                "video": m["video"],
+                "credit_per_image": m["credit_per_image"],
+                "image_measured": m["image_measured"],
+                "credit_per_second": m["credit_per_second"],
+                "credit_ceiling": m["credit_ceiling"],
+                "credits_per_second": m["credits_per_second"],
+                "caps": {},
+            })
         items.sort(key=lambda i: (i["platform"], i["model"]))
         hidden = _hidden_set()
         # hidden 数组是前端实时同步行状态的依据：只回 hidden_count 会让
@@ -2366,7 +2914,8 @@ class Handler(BaseHTTPRequestHandler):
         if not mid:
             return self._deny(400, "需要 id（平台/模型 全名）")
         # 校验 id 在公共目录里存在，防止手滑记到不存在的模型上变孤儿数据
-        known = any(f"{x['platform']}/{x['public']}" == mid for x in public_catalog())
+        known = (any(f"{x['platform']}/{x['public']}" == mid for x in public_catalog())
+                 or any(f"workbuddy/{m['public']}" == mid for m in public_media_catalog()))
         if not known:
             return self._deny(404, f"模型 `{mid}` 不在当前目录里（千问办公渠道只有 qwen 系模型）")
         try:
@@ -2395,6 +2944,20 @@ class Handler(BaseHTTPRequestHandler):
         {"visible": true}                         全部恢复显示
         """
         body = self._post_body
+        # 整平台操作要先枚举目录（可能打上游），放在配置锁外，避免一次
+        # 网络抖动把 /api/status 和配置写全部拖住。
+        platform_names = None
+        if "platform" in body:
+            pf = str(body["platform"] or "").strip().lower()
+            up = next((u for u in CONFIG["upstreams"] if u["name"].lower() == pf), None)
+            if not up:
+                return self._deny(400, f"未知平台 `{pf}`")
+            # 按公共目录名整平台操作：直接用上游原始 id 会写出
+            # `qwenwork/qwenwork/flash` 这类垃圾键且对剥前缀的条目不生效
+            platform_names = [f"{x['platform']}/{x['public']}" for x in public_catalog()
+                              if x["platform"] == up["name"]]
+            if up["name"] == "workbuddy":
+                platform_names += [f"workbuddy/{m['public']}" for m in public_media_catalog()]
         with _config_lock:
             hidden = _hidden_set()
             if "ids" in body:
@@ -2415,16 +2978,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     hidden.discard(mid)
             elif "platform" in body:
-                pf = str(body["platform"] or "").strip().lower()
-                up = next((u for u in CONFIG["upstreams"] if u["name"].lower() == pf), None)
-                if not up:
-                    return self._deny(400, f"未知平台 `{pf}`")
-                # 按公共目录名整平台操作：直接用上游原始 id 会写出
-                # `qwenwork/qwenwork/flash` 这类垃圾键且对剥前缀的条目不生效
-                for x in public_catalog():
-                    if x["platform"] != up["name"]:
-                        continue
-                    full = f"{x['platform']}/{x['public']}"
+                for full in platform_names or []:
                     if body.get("visible") is False:
                         hidden.add(full)
                     else:
@@ -2523,7 +3077,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 
 
 def main():
