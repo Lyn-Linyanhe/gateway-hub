@@ -55,6 +55,18 @@
 
 4. 浏览器打开 <http://127.0.0.1:8787>，输入 `config.json` 里的 `api_key` 进入控制台。
 
+### 一键更新
+
+朋友/其他机器不需要每次手动打开 GitHub：双击 `update.bat` 即可检查并更新到最新 Release。
+
+- 自动读取 GitHub 最新 release，版本不高于本机时直接退出。
+- 优先在干净的 git 仓库里 `git pull --ff-only`；否则下载 release 源码并只覆盖代码文件。
+- 不会覆盖 `config.json`、账号、日志和运行态文件。
+- 更新后自动做 Python 语法检查并重启 8787；失败会从 `backup-*` 恢复旧文件。
+- 只想检查不更新：`update.bat -CheckOnly`；不自动重启：`update.bat -NoRestart`。
+
+首次需要把 `update.bat`、`update.ps1` 放进网关目录（或直接使用 v1.8.1 及以上 Release 的源码包）；之后双击即可。
+
 5. 客户端接入：
 
    ```
