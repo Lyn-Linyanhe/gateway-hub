@@ -68,6 +68,16 @@
 
 首次需要把 `update.bat`、`update.ps1` 放进网关目录（或直接使用 v1.8.1 及以上 Release 的源码包）；之后双击即可。
 
+### QwenWork 上游启动（可选）
+
+Buddy2api 放在网关同级的 `..\Buddy2api` 时，直接双击 `start-buddy2api.bat`；其它位置用：
+
+```bat
+start-buddy2api.bat 8792 D:\path\to\Buddy2api
+```
+
+它固定用仓库 `.venv\Scripts\python.exe`（含千问聊天必需的 `wasmtime`），并在启动进程里清空 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`、只把 `gateway.qwenwork.cn` 放进 `NO_PROXY`。这样即使系统里残留了已停止的 FlClash `127.0.0.1:7890`，也不会再出现 `All connection attempts failed` 的 502。若所在网络必须经代理访问千问，请改脚本显式配置代理。
+
 5. 客户端接入：
 
    ```
