@@ -15,13 +15,15 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -39,6 +41,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _local_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+# 外部只读检查（GitHub release）优先直连：本机残留的失效代理会让更新检测
+# 误报“不可达”；直连失败再回退系统代理，需要代理的网络仍能用。
+_direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _urlopen(request, timeout):
@@ -251,16 +256,20 @@ _wb_state_cache = {"ts": 0.0, "state": {}, "refreshing": False}
 
 def _wb_pool_fetch(up):
     """拉 /accounts?realm=all 并写池状态缓存；拉不到沿用上次结果。"""
-    state = {"realms": {}, "paid_any": False}
+    state = {"realms": {}, "paid_any": False, "known": False}
     if up:
         try:
             data = engine_request(up, "GET", "/accounts?realm=all")
             items = data.get("accounts") if isinstance(data, dict) else data
-            for a in (items or []):
-                if not isinstance(a, dict) or not a.get("enabled"):
+            if not isinstance(items, list) or any(not isinstance(a, dict) for a in items):
+                raise ValueError("账号池响应缺少 accounts 数组")
+            state["known"] = True
+            for a in items:
+                if not a.get("enabled", True) or a.get("accountBanned") or a.get("ready") is False:
                     continue
                 realm = a.get("realm")
                 if realm not in ("cn", "intl"):
+                    state["known"] = False
                     continue
                 paid = bool((a.get("tier") or {}).get("paid") or a.get("is_paid_user"))
                 state["paid_any"] = state["paid_any"] or paid
@@ -322,6 +331,20 @@ def _wb_usable_realms(upstream_id):
             if realm not in pro or (pool.get(realm) or {}).get("paid")]
 
 
+def _wb_account_realms(upstream_id):
+    """已知号池时排除空区域；部分观测优先走已观察区域。
+
+    读取失败且没有任何旧观测时保留目录区域作为未知候选，不能把未知当成
+    空区域；但只要响应中观察到某个区域，就不把未出现的区域伪装成有账号。
+    """
+    available = _wb_usable_realms(upstream_id)
+    state = _wb_pool_state()
+    observed = set(state.get("realms") or {})
+    if state.get("known") or observed:
+        return [realm for realm in available if realm in observed]
+    return available
+
+
 def _wb_entry_locked(entry):
     if entry.get("platform") != "workbuddy":
         return False
@@ -334,7 +357,7 @@ def _wb_entry_locked(entry):
 
 
 def _wb_model_realm(upstream_id):
-    """模型专属区域（cn/intl）；双区同名或未知返回 None（交给 _wb_route_realm）。"""
+    """模型专属区域（cn/intl）；双区同名或未知返回 None。"""
     meta = _wb_realm_meta().get(upstream_id)
     if not meta:
         return None
@@ -370,11 +393,238 @@ def _wb_route_realm(upstream_id):
     meta = _wb_realm_meta().get(upstream_id)
     if not meta or not meta.get("realms"):
         return None
-    available = _wb_usable_realms(upstream_id)
+    available = _wb_account_realms(upstream_id)
     pref = _wb_dual_prefer()
     if pref in available:
         return pref
-    return next(iter(sorted(available or meta["realms"])), None)
+    return next(iter(sorted(available)), None)
+
+
+# ---------------------------------------------------------------------------
+# WorkBuddy 区域级调度（网关层）：会话粘性 + 区域健康度 + 首字前换区。
+#
+# 账号选择仍在 WorkBuddy 引擎内；网关只能决定国内/国际出口。这里的目标是
+# 不因几小时的临期差反复换区（保护 prompt cache），并避开刚失败过的区域。
+# ---------------------------------------------------------------------------
+
+WB_STICKY_TTL = 1800.0          # 同一会话 30 分钟无请求后解除粘性
+WB_STICKY_MAX = 2048            # 防止无界增长
+WB_HEALTH_BASE_COOLDOWN = 30.0  # 首次失败冷却
+WB_HEALTH_MAX_COOLDOWN = 300.0  # 连续失败最长冷却
+WB_RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+_wb_route_lock = threading.Lock()
+_wb_route_sticky = {}   # session_key -> {"realm": str, "ts": float}
+_wb_route_health = {}   # realm -> {"failures", "cooldown_until", "last_fail", "last_ok", "last_status"}
+
+
+def _wb_header(headers, name):
+    """大小写不敏感地读一个请求头（self.headers / dict 都适用）。"""
+    if not headers:
+        return ""
+    try:
+        value = headers.get(name)
+        if value:
+            return str(value)
+    except AttributeError:
+        pass
+    target = name.lower()
+    for key, value in getattr(headers, "items", lambda: [])():
+        if str(key).lower() == target and value:
+            return str(value)
+    return ""
+
+
+def _wb_session_key(req, path, headers, model):
+    """会话粘性键：优先客户端显式 id，其次 system/tools 前缀哈希。
+
+    只用哈希落日志，不记录原始 system prompt 或用户标识。
+    """
+    raw = ""
+    for name in ("prompt_cache_key", "conversation_id", "session_id", "thread_id", "user"):
+        value = req.get(name)
+        if isinstance(value, str) and value.strip():
+            raw = value.strip()
+            break
+    if not raw:
+        for name in ("X-Session-Id", "X-Conversation-Id", "X-Thread-Id",
+                     "Session-Id", "Conversation-Id"):
+            value = _wb_header(headers, name)
+            if value.strip():
+                raw = value.strip()
+                break
+    if not raw:
+        parts = [str(model or "")]
+        if path.endswith("/responses"):
+            parts.append(str(req.get("instructions") or ""))
+        else:
+            messages = req.get("messages") or []
+            if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+                parts.append(str(messages[0].get("content") or ""))
+        tools = req.get("tools")
+        if tools:
+            try:
+                parts.append(json.dumps(tools, sort_keys=True, ensure_ascii=False))
+            except (TypeError, ValueError):
+                parts.append(str(tools))
+        if len(parts) == 1:
+            return None  # 没有任何可稳定识别的会话特征，不做粘性
+        raw = "\x1f".join(parts)
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def _wb_sticky_get(key):
+    if not key:
+        return None
+    now = time.time()
+    with _wb_route_lock:
+        item = _wb_route_sticky.get(key)
+        if not item:
+            return None
+        if now - item["ts"] > WB_STICKY_TTL:
+            _wb_route_sticky.pop(key, None)
+            return None
+        item["ts"] = now  # 滑动 TTL：活跃会话持续粘住
+        return item["realm"]
+
+
+def _wb_sticky_set(key, realm):
+    if not key or not realm:
+        return
+    with _wb_route_lock:
+        if len(_wb_route_sticky) >= WB_STICKY_MAX:
+            # 只淘汰最旧的一批，避免每次写入都排序全表
+            oldest = sorted(_wb_route_sticky.items(), key=lambda kv: kv[1]["ts"])[:WB_STICKY_MAX // 10 or 1]
+            for old_key, _ in oldest:
+                _wb_route_sticky.pop(old_key, None)
+        _wb_route_sticky[key] = {"realm": realm, "ts": time.time()}
+
+
+def _wb_sticky_clear(key):
+    if not key:
+        return
+    with _wb_route_lock:
+        _wb_route_sticky.pop(key, None)
+
+
+def _wb_health_ok(realm):
+    with _wb_route_lock:
+        item = _wb_route_health.get(realm)
+        return not item or item.get("cooldown_until", 0) <= time.time()
+
+
+def _wb_health_fail(realm, status=None, retry_after=None):
+    now = time.time()
+    with _wb_route_lock:
+        item = _wb_route_health.setdefault(realm, {
+            "failures": 0, "cooldown_until": 0, "last_fail": 0,
+            "last_ok": 0, "last_status": None})
+        item["failures"] += 1
+        item["last_fail"] = now
+        item["last_status"] = status
+        cooldown = min(WB_HEALTH_MAX_COOLDOWN,
+                       WB_HEALTH_BASE_COOLDOWN * (2 ** (item["failures"] - 1)))
+        if retry_after is not None:
+            cooldown = max(cooldown, min(WB_HEALTH_MAX_COOLDOWN, float(retry_after)))
+        item["cooldown_until"] = now + cooldown
+        failures = item["failures"]
+    log(f"wb health {realm} fail status={status} failures={failures} cooldown={int(cooldown)}s")
+
+
+def _wb_health_success(realm):
+    now = time.time()
+    with _wb_route_lock:
+        item = _wb_route_health.get(realm)
+        was_bad = bool(item and (item.get("failures") or item.get("cooldown_until", 0) > now))
+        if item:
+            item.update(failures=0, cooldown_until=0, last_ok=now, last_status=200)
+        else:
+            _wb_route_health[realm] = {
+                "failures": 0, "cooldown_until": 0, "last_fail": 0,
+                "last_ok": now, "last_status": 200}
+    if was_bad:
+        log(f"wb health {realm} recovered")
+
+
+def _wb_retryable(status, body):
+    """只重试“上游还没开始生成”的失败；400/401/404/内容拒绝不重试。"""
+    if status in WB_RETRY_STATUSES:
+        return True
+    if status == 403:
+        try:
+            text = (body.decode("utf-8", "ignore") if isinstance(body, (bytes, bytearray))
+                    else str(body)).lower()
+        except Exception:
+            text = ""
+        return any(marker in text for marker in
+                   ("rate limit", "queue", "10605", "too many requests", "retryafter"))
+    return False
+
+
+def _wb_retry_after(headers):
+    value = (headers or {}).get("Retry-After") or (headers or {}).get("retry-after")
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(300, seconds))
+
+
+def _wb_plan(upstream_model, req, path, headers):
+    """返回本次 WB 请求的区域候选顺序与决策依据。
+
+    order 已经按“健康优先、粘性/偏好其次”排好；账号仍由引擎选择。
+    """
+    available = _wb_account_realms(upstream_model)
+    fixed = _wb_model_realm(upstream_model)
+    key = _wb_session_key(req, path, headers, upstream_model)
+    if not available:
+        return {"order": [], "available": [], "preferred": fixed,
+                "sticky": None, "key": key, "reason": "no-account", "fixed": fixed}
+    if fixed:
+        order = [fixed] if fixed in available else []
+        return {"order": order, "available": available, "preferred": fixed,
+                "sticky": None, "key": key, "reason": "fixed", "fixed": fixed}
+    preferred = _wb_dual_prefer()
+    if preferred not in available:
+        preferred = sorted(available)[0]
+    sticky = _wb_sticky_get(key) if key else None
+    if sticky not in available:
+        sticky = None
+    base = []
+    for realm in ([sticky] if sticky else []) + [preferred] + sorted(available):
+        if realm in available and realm not in base:
+            base.append(realm)
+    healthy = [realm for realm in base if _wb_health_ok(realm)]
+    cooling = [realm for realm in base if not _wb_health_ok(realm)]
+    reason = "sticky" if sticky else "prefer"
+    if cooling and healthy:
+        reason += "+health"
+    elif cooling:
+        reason += "+all-cooling"
+    return {"order": healthy + cooling, "available": available,
+            "preferred": preferred, "sticky": sticky, "key": key,
+            "reason": reason, "fixed": None}
+
+
+def _wb_log_route(rid, model, plan, attempt, realm, status=None,
+                  outcome="", next_realm="", retry_after=None):
+    """结构化决策日志：只落会话哈希，不落原始 prompt / 用户标识。"""
+    parts = [f"route rid={rid}", f"model={model}",
+             f"session={(plan.get('key') or '-')[:8]}",
+             f"pref={plan.get('preferred') or '-'}",
+             f"sticky={plan.get('sticky') or '-'}",
+             f"order={','.join(plan.get('order') or []) or '-'}",
+             f"reason={plan.get('reason') or '-'}",
+             f"attempt={attempt}", f"realm={realm or '-'}"]
+    if status is not None:
+        parts.append(f"status={status}")
+    parts.append(f"outcome={outcome or '-'}")
+    if next_realm:
+        parts.append(f"next={next_realm}")
+    if retry_after is not None:
+        parts.append(f"retry_after={retry_after}")
+    log(" ".join(parts))
 
 
 def _upstream_headers(up, extra=None):
@@ -394,6 +644,413 @@ def _hidden_set():
 
 def _model_hidden(platform, model):
     return f"{platform}/{model}" in _hidden_set()
+
+
+# ---------------------------------------------------------------------------
+# 平台启用开关：停用的平台不展示模型、不接受调用、不轮询状态。
+# 只影响网关编排；上游引擎进程是否运行由 launch 配置与设置页的进程按钮决定。
+# ---------------------------------------------------------------------------
+
+def _disabled_platforms():
+    return {str(name) for name in (CONFIG.get("disabled_platforms") or [])}
+
+
+def platform_enabled(name):
+    return name not in _disabled_platforms()
+
+
+def active_upstreams():
+    return [up for up in CONFIG["upstreams"] if platform_enabled(up["name"])]
+
+
+def _upstream_by_name(name):
+    return next((up for up in CONFIG["upstreams"] if up["name"] == name), None)
+
+
+def _model_in_disabled_platform(model):
+    """裸模型名只存在于已停用平台时，给出比「未知模型」更准确的原因。
+
+    只读 15 秒目录缓存，不主动拉取停用平台——停用后不该再产生上游请求。
+    """
+    for up in CONFIG["upstreams"]:
+        if platform_enabled(up["name"]):
+            continue
+        with _catalog_lock:
+            hit = _catalog_cache.get(up["name"])
+        for row in (hit[1] if hit else []):
+            if _public_name(up["name"], row.get("id") or "") == model:
+                return up["name"]
+    return None
+
+
+# 小浣熊桌面端用顶层 raccoon_thinking_level（off / level_1..level_5）。
+# 网关保留原生字段，不把 reasoning_effort 猜译为等级；具体可选档位由模型目录
+# 决定。旧 xhx2api 的 Responses 转换可能丢弃该字段，详见 docs/raccoon-thinking.md。
+
+
+# 进程管理：只记录由本网关启动的子进程。外部手动启动的引擎只显示状态，
+# 不按端口猜 PID 强杀，避免误停别的程序。
+_proc_lock = threading.Lock()
+_managed_procs = {}
+_platform_op_locks = {}
+
+
+def _platform_op_lock(name):
+    with _proc_lock:
+        return _platform_op_locks.setdefault(name, threading.Lock())
+
+
+def _launch_spec(up):
+    """读取 upstreams[].launch：{command, cwd, timeout, env}。
+
+    command 可以是数组（可执行文件 + 参数），也可以是字符串（按 shell
+    命令执行，便于调用引擎自带的 .bat/.sh 启动脚本）。字符串只来自配置
+    或设置页保存前的校验，不直接来自客户端请求。
+    """
+    spec = up.get("launch")
+    if not isinstance(spec, dict):
+        return None
+    command = spec.get("command")
+    shell = False
+    if isinstance(command, str):
+        if not command.strip():
+            return None
+        command = (["cmd.exe", "/c", command] if os.name == "nt"
+                   else ["/bin/sh", "-c", command])
+        shell = True
+    elif isinstance(command, list):
+        if (not command
+                or not all(isinstance(part, str) and part.strip() for part in command)):
+            return None
+    else:
+        return None
+    cwd = spec.get("cwd") or None
+    if cwd is not None:
+        if not isinstance(cwd, str):
+            return None
+        if not os.path.isabs(cwd):
+            # 相对路径按网关目录解析，避免依赖启动时的工作目录
+            cwd = os.path.normpath(os.path.join(HERE, cwd))
+        if not os.path.isdir(cwd):
+            return None
+    env = spec.get("env")
+    if env is not None:
+        if (not isinstance(env, dict)
+                or not all(isinstance(k, str) and k and isinstance(v, str)
+                           for k, v in env.items())):
+            return None
+        env = dict(env)
+    else:
+        env = {}
+    if not shell:
+        exe = command[0]
+        if not os.path.isabs(exe) and os.sep not in exe and "/" not in exe:
+            candidate = os.path.join(cwd or HERE, exe)
+            if os.path.isfile(candidate):
+                command = [candidate] + command[1:]
+    try:
+        timeout = int(spec.get("timeout") or 30)
+    except (TypeError, ValueError):
+        timeout = 30
+    return {"command": command, "cwd": cwd, "timeout": max(5, min(180, timeout)),
+            "env": env, "shell": shell}
+
+
+def _upstream_health(up, timeout=3):
+    """轻量健康检查（只读 /health），用于进程启动确认和设置页状态。"""
+    try:
+        # xhx2api（raccoon）用 /healthz；其它 hub 系引擎用 /health。
+        health_path = "/healthz" if up.get("name") == "raccoon" else "/health"
+        req = urllib.request.Request(up["base_url"].rstrip("/") + health_path)
+        with _urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(body, dict):
+            return True
+        if "ok" in body:
+            return bool(body.get("ok"))
+        if "status" in body:
+            return body.get("status") == "ok"
+        return True
+    except Exception:
+        return False
+
+
+def _platform_process(up):
+    """{managed, running, pid, launch_configured}；managed 仅指网关启动的进程。"""
+    name = up["name"]
+    with _proc_lock:
+        proc = _managed_procs.get(name)
+        if proc is not None and proc.poll() is not None:
+            _managed_procs.pop(name, None)
+            proc = None
+    healthy = _upstream_health(up) if platform_enabled(name) else False
+    if proc is not None:
+        return {"managed": True, "running": True, "healthy": healthy,
+                "pid": proc.pid,
+                "launch_configured": _launch_spec(up) is not None}
+    return {"managed": False, "running": healthy, "healthy": healthy, "pid": None,
+            "launch_configured": _launch_spec(up) is not None}
+
+
+def _start_platform(up):
+    """按 launch 配置启动引擎并等待健康检查通过。"""
+    with _platform_op_lock(up["name"]):
+        return _start_platform_locked(up)
+
+
+def _start_platform_locked(up):
+    name = up["name"]
+    spec = _launch_spec(up)
+    if spec is None:
+        return {"ok": False, "error": "未配置 launch.command（config.json upstreams[].launch）"}
+    with _proc_lock:
+        proc = _managed_procs.get(name)
+        if proc is not None and proc.poll() is None:
+            return {"ok": True, "already": True, "pid": proc.pid}
+    if _upstream_health(up):
+        return {"ok": True, "already": True, "external": True}
+    with _proc_lock:
+        log_path = os.path.join(HERE, f"engine-{name}.log")
+        try:
+            out = open(log_path, "ab")
+        except OSError as exc:
+            return {"ok": False, "error": f"无法写引擎日志: {exc}"}
+        flags = 0
+        if os.name == "nt":
+            flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0))
+        try:
+            env = {**os.environ, **spec["env"]} if spec["env"] else None
+            proc = subprocess.Popen(spec["command"], cwd=spec["cwd"], env=env,
+                                    stdout=out, stderr=subprocess.STDOUT,
+                                    creationflags=flags, close_fds=True)
+        except OSError as exc:
+            out.close()
+            return {"ok": False, "error": f"启动失败: {exc}"}
+        out.close()
+        _managed_procs[name] = proc
+    deadline = time.time() + spec["timeout"]
+    exited_at = None
+    while time.time() < deadline:
+        if _upstream_health(up):
+            if proc.poll() is None:
+                log(f"platform[{name}] 启动成功 pid={proc.pid}")
+                return {"ok": True, "started": True, "pid": proc.pid}
+            # 启动脚本把引擎拉成独立进程后自己退出：引擎已就绪，但不再由
+            # 网关托管；停止时走端口识别。
+            with _proc_lock:
+                _managed_procs.pop(name, None)
+            log(f"platform[{name}] 启动成功（脚本已退出，引擎独立运行）")
+            return {"ok": True, "started": True, "detached": True, "pid": proc.pid}
+        if proc.poll() is not None:
+            if exited_at is None:
+                exited_at = time.time()
+            elif time.time() - exited_at > 5:
+                with _proc_lock:
+                    _managed_procs.pop(name, None)
+                return {"ok": False,
+                        "error": f"启动命令已退出（code {proc.returncode}），健康检查未通过，见 engine-{name}.log"}
+        time.sleep(0.5)
+    with _proc_lock:
+        if proc.poll() is not None:
+            _managed_procs.pop(name, None)
+    return {"ok": False,
+            "error": f"启动后 {spec['timeout']} 秒内健康检查未通过（pid {proc.pid}）"}
+
+
+def _listener_port(address):
+    endpoint = (address or "").strip()
+    if endpoint.startswith("["):
+        end = endpoint.find("]")
+        if end < 0 or endpoint[end + 1:end + 2] != ":":
+            return None
+        raw = endpoint[end + 2:]
+    else:
+        _, sep, raw = endpoint.rpartition(":")
+        if not sep:
+            return None
+    return int(raw) if raw.isdigit() else None
+
+
+def _port_listener_pid(port, host=None):
+    """Windows: return a listener for the requested port and optional host."""
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP" or parts[3].upper() != "LISTENING":
+            continue
+        if _listener_port(parts[1]) != int(port):
+            continue
+        if host:
+            local_host = parts[1].rsplit(":", 1)[0].strip("[]")
+            if local_host not in (host, "0.0.0.0", "::"):
+                continue
+        try:
+            return int(parts[4])
+        except ValueError:
+            continue
+    return None
+
+
+def _process_command_line(pid):
+    """Windows：读进程命令行，用于停止前确认身份；失败返回空串。"""
+    if os.name != "nt":
+        return ""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}').CommandLine"],
+            capture_output=True, text=True, timeout=8).stdout
+        return out.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _engine_identity_tokens(up):
+    """仅返回可在命令行上精确核对的仓库名/脚本名片段，不含通用参数。"""
+    tokens = set()
+    repo = str(up.get("repo") or "").strip().rstrip("/")
+    if repo:
+        tokens.add(repo.rsplit("/", 1)[-1])
+    spec = _launch_spec(up)
+    if spec:
+        command = spec["command"]
+        if spec.get("shell"):
+            script = command[-1] if command else ""
+            tokens.add(os.path.basename(script))
+        else:
+            for part in command:
+                base = os.path.basename(part)
+                if base.lower().endswith((".py", ".exe", ".bat", ".cmd", ".ps1", ".sh")):
+                    tokens.add(base)
+    return {token for token in tokens if len(token) >= 4}
+
+
+def _command_matches_engine(cmdline, tokens):
+    """Match a configured script/executable as a complete command token."""
+    if not cmdline or not tokens:
+        return False
+    try:
+        parts = subprocess.list2cmdline([])  # touch stdlib cmdline support consistently
+        del parts
+        import shlex
+        argv = shlex.split(cmdline, posix=(os.name != "nt"))
+    except ValueError:
+        argv = cmdline.split()
+    basenames = {os.path.basename(part.strip('"')).lower() for part in argv if part}
+    return any(token.lower() in basenames for token in tokens)
+
+
+def _kill_tree(pid):
+    """Windows：taskkill /T 收整棵进程树；其它平台按 PID 终止。"""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+        return
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+
+
+def _stop_platform(up, allow_external=False):
+    """停止平台引擎。"""
+    with _platform_op_lock(up["name"]):
+        return _stop_platform_locked(up, allow_external)
+
+
+def _stop_platform_locked(up, allow_external=False):
+    """停止平台引擎。
+
+    网关自己启动的进程直接收进程树；外部进程仅在 allow_external=True 时，
+    先按 base_url 端口找到监听 PID，并确认命令行包含平台名/仓库名/launch
+    路径片段后才停止，避免误杀端口上的其它程序。
+    """
+    name = up["name"]
+    with _proc_lock:
+        proc = _managed_procs.get(name)
+        if proc is not None and proc.poll() is not None:
+            _managed_procs.pop(name, None)
+            proc = None
+    if proc is not None:
+        _kill_tree(proc.pid)
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "stopped": False, "managed": True, "pid": proc.pid,
+                    "error": f"停止 PID {proc.pid} 超时，仍保留托管记录以便重试"}
+        if proc.poll() is None:
+            return {"ok": False, "stopped": False, "managed": True, "pid": proc.pid,
+                    "error": f"停止 PID {proc.pid} 未确认退出，仍保留托管记录以便重试"}
+        with _proc_lock:
+            if _managed_procs.get(name) is proc:
+                _managed_procs.pop(name, None)
+        log(f"platform[{name}] 已停止 pid={proc.pid}（网关托管）")
+        return {"ok": True, "stopped": True, "managed": True, "pid": proc.pid}
+    if not allow_external:
+        return {"ok": False, "error": "该平台不是由网关启动的（或已退出），不自动结束外部进程"}
+    try:
+        base = urlsplit(up.get("base_url") or "")
+        port = base.port
+        host = base.hostname
+    except ValueError:
+        port, host = None, None
+    if not port:
+        return {"ok": False, "error": "上游 base_url 没有有效端口，无法定位进程"}
+    pid = _port_listener_pid(port, host)
+    if pid is None:
+        return {"ok": True, "already": True, "note": f"端口 {port} 没有监听进程"}
+    if not host or host not in ("127.0.0.1", "localhost", "::1"):
+        return {"ok": False, "error": "外部引擎地址不是本机回环地址，拒绝按端口停止进程"}
+    if pid == os.getpid():
+        return {"ok": False, "pid": pid, "error": "目标 PID 是网关自身，拒绝停止"}
+    cmdline = _process_command_line(pid)
+    tokens = _engine_identity_tokens(up)
+    if not cmdline or not _command_matches_engine(cmdline, tokens):
+        return {"ok": False, "pid": pid,
+                "error": f"端口 {port} 上的进程 PID {pid} 无法确认属于 {name}，未停止"}
+    # Re-check the listener before terminating to avoid killing a PID that has
+    # already stopped serving this port and may have been reused.
+    if _port_listener_pid(port, host) != pid:
+        return {"ok": False, "pid": pid,
+                "error": f"端口 {port} 的监听进程已变化，未停止 PID {pid}"}
+    _kill_tree(pid)
+    time.sleep(0.5)
+    if _port_listener_pid(port, host) == pid:
+        return {"ok": False, "pid": pid,
+                "error": f"已请求停止 PID {pid}，但端口 {port} 仍在监听"}
+    log(f"platform[{name}] 已停止 pid={pid}（外部进程，端口 {port}）")
+    return {"ok": True, "stopped": True, "managed": False, "pid": pid}
+
+
+def _set_platform_enabled(name, enabled):
+    """写 disabled_platforms 并清掉受影响的缓存。"""
+    with _config_lock:
+        disabled = {str(item) for item in (CONFIG.get("disabled_platforms") or [])}
+        if enabled:
+            disabled.discard(name)
+        else:
+            disabled.add(name)
+        CONFIG["disabled_platforms"] = sorted(disabled)
+        save_config()
+    global _catalog_pub_generation
+    with _catalog_pub_lock:
+        _catalog_pub_generation += 1
+        _catalog_pub_cache.pop("all", None)
+    with _estimate_lock:
+        _estimate_cache["data"] = None
+        _estimate_cache["ts"] = 0.0
+    with _updates_lock:
+        _updates_cache["data"] = None
+        _updates_cache["ts"] = 0.0
+    return sorted(disabled)
 
 
 def _row_multiplier(platform, row):
@@ -419,6 +1076,21 @@ def _row_multiplier(platform, row):
                 if pv is not None:
                     out["valley"] = float(pv)
                 return out
+        elif platform == "raccoon":
+            # xhx2api 的目录给 credits="x0.05"（相对倍率，不是积分/千tok）。
+            # 只用于模型页展示，不参与额度预估。
+            c = row.get("credits")
+            if c:
+                mnum = re.match(r"[xX]\s*([0-9]+(?:\.[0-9]+)?)", str(c).strip())
+                if mnum:
+                    return {"factor": float(mnum.group(1))}
+        elif platform == "trae":
+            # trae2api-hub 把官方 features.consumption_rate.data.rate 原样透传为
+            # consumption_rate（信用消费倍率，0.06 = 基础价的 6%）。只用于模型页
+            # 展示；上游 usage 不带 credits，额度预估仍显示待测。
+            cr = row.get("consumption_rate")
+            if cr is not None and not isinstance(cr, bool):
+                return {"factor": float(cr)}
     except (TypeError, ValueError):
         pass
     return None
@@ -429,6 +1101,7 @@ def _row_multiplier(platform, row):
 INNER_CHANNEL_PREFIXES = ("workbuddy/", "qwenwork/")
 
 _catalog_pub_cache = {}
+_catalog_pub_generation = 0
 _catalog_pub_lock = threading.Lock()
 
 
@@ -495,6 +1168,8 @@ def _row_caps(platform, row):
     tools = row.get("supports_tool_calls")
     if tools is None:
         tools = cap.get("tool_calls")
+    if tools is None:
+        tools = cap.get("tools")  # xhx2api 用 capabilities.tools
     if tools is not None:
         caps["tools"] = bool(tools)
     reasoning = row.get("supports_reasoning")
@@ -534,8 +1209,10 @@ def public_catalog():
         hit = _catalog_pub_cache.get("all")
         if hit and now - hit[0] < 15:
             return hit[1]
+    with _catalog_pub_lock:
+        generation = _catalog_pub_generation
     entries = []
-    for up in CONFIG["upstreams"]:
+    for up in active_upstreams():
         by_public = {}
         order = []
         for row in upstream_rows(up) or []:
@@ -548,6 +1225,12 @@ def public_catalog():
             if (up["name"] == "qwenwork"
                     and row.get("channel") == "workbuddy" and m != "auto"):
                 continue
+            # xhx2api 会把生图/改图别名（gpt-image-*、dall-e-*）也列进 /v1/models；
+            # 它们 capabilities.chat=false，不能当聊天模型暴露给客户端。
+            if up["name"] == "raccoon":
+                caps = row.get("capabilities")
+                if isinstance(caps, dict) and caps.get("chat") is False:
+                    continue
             public = _public_name(up["name"], m)
             if public is None:
                 continue  # 另一渠道的清单残留，不对外
@@ -573,6 +1256,8 @@ def public_catalog():
                     entry["requires_pro"] = bool(meta["pro"]) and set(meta["realms"]) <= set(meta["pro"])
             entries.append(entry)
     with _catalog_pub_lock:
+        if generation != _catalog_pub_generation:
+            return public_catalog()
         _catalog_pub_cache["all"] = (now, entries)
     return entries
 
@@ -586,6 +1271,19 @@ def public_catalog():
 # 原样转发给 workbuddy。媒体与文本共用引擎的 API Key 与媒体号池，网关只做
 # 模型名校验、可见性过滤和任务产物 URL 回写。
 # ---------------------------------------------------------------------------
+
+def _media_supports_tag(model, tag, realm=None):
+    """Check operation support in the requested/current realm, not a union across regions."""
+    if not tag:
+        return True
+    by_realm = model.get("tags_by_realm")
+    if isinstance(by_realm, dict):
+        selected = realm or model.get("active_realm")
+        if selected:
+            return tag in (by_realm.get(selected) or [])
+        return any(tag in (tags or []) for tags in by_realm.values())
+    return tag in (model.get("tags") or [])
+
 
 WB_MEDIA_REALMS = ("cn", "intl")
 WB_MEDIA_TTL = 30.0
@@ -653,7 +1351,7 @@ def _wb_media_fetch(force=False):
                     item = merged[mid] = {
                         "id": mid,
                         "name": str(row.get("name") or mid),
-                        "tags": tags,
+                        "tags_by_realm": {},
                         "realms": [],
                         "video": row.get("videoGeneration"),
                         "credit_per_image": _known_num(row.get("creditPerImage")),
@@ -664,12 +1362,14 @@ def _wb_media_fetch(force=False):
                         "credits_with_reference": row.get("creditsPerSecondWithReference") or {},
                     }
                 item["realms"].append(realm)
-                item["tags"] = sorted(set(item["tags"]) | set(tags))
+                item["tags_by_realm"][realm] = sorted(set(tags))
+                item["tags"] = sorted(set(item.get("tags") or []) | set(tags))
                 if item["video"] is None:
                     item["video"] = row.get("videoGeneration")
     models = []
     for item in merged.values():
         item["realms"] = sorted(set(item["realms"]))
+        item["tags"] = sorted({tag for tags in item["tags_by_realm"].values() for tag in tags})
         item["kind"] = "video" if any("video" in t for t in item["tags"]) else "image"
         item["active_realm"] = active_realm
         item["available"] = active_realm in item["realms"]
@@ -680,43 +1380,185 @@ def _wb_media_fetch(force=False):
     return models, errors
 
 
+_raccoon_media_lock = threading.Lock()
+_raccoon_media_cache = {"ts": 0.0, "models": [], "errors": {}}
+RACCOON_MEDIA_TTL = 30.0
+_raccoon_price_lock = threading.Lock()
+_raccoon_price_cache = {"ts": 0.0, "price": None}
+RACCOON_PRICE_TTL = 300.0
+
+
+def _raccoon_image_price(up):
+    """从积分账单里取最近一笔「图片生成」的扣费，作为每张图的实测单价。
+
+    xhx2api 的生图响应只有 token，没有 credit；真实扣费在
+    /panel/api/accounts/{uid}/bills 的 event_name「任务消耗 · 图片生成」里。
+    取最近一笔（账单按时间倒序），5 分钟缓存；没有样本返回 None，不猜。
+    """
+    now = time.time()
+    with _raccoon_price_lock:
+        if now - _raccoon_price_cache["ts"] < RACCOON_PRICE_TTL:
+            return _raccoon_price_cache["price"]
+    price = None
+    latest = None
+    try:
+        overview = engine_request(up, "GET", "/panel/api/overview",
+                                  auth="bearer", timeout=10)
+        accounts = overview.get("accounts") if isinstance(overview, dict) else []
+    except Exception:
+        accounts = []
+    for a in accounts or []:
+        uid = str(a.get("uid") or "")
+        if not uid:
+            continue
+        try:
+            # 单账号账单失败只跳过该账号：整轮中止会把一次网络抖动放大成
+            # 「所有模型未实测」并缓存 5 分钟。
+            bills = engine_request(
+                up, "GET",
+                f"/panel/api/accounts/{quote(uid, safe='')}/bills?limit=100",
+                auth="bearer", timeout=15)
+        except Exception:
+            continue
+        rows = (bills.get("bills") if isinstance(bills, dict) else bills) or []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                pts = float(r.get("points"))
+            except (TypeError, ValueError):
+                continue
+            name = str(r.get("event_name") or "")
+            if pts < 0 and "图片" in name:
+                at = str(r.get("created_at") or "")
+                if latest is None or at > latest[0]:
+                    latest = (at, abs(pts))
+    if latest is not None:
+        value = latest[1]
+        price = int(value) if float(value).is_integer() else round(value, 2)
+    with _raccoon_price_lock:
+        # 用抓取结束的时刻记缓存：抓取耗时不吃掉有效 TTL。
+        _raccoon_price_cache.update(ts=time.time(), price=price)
+    return price
+
+
+def _raccoon_media_fetch(force=False):
+    """xhx2api 的生图模型：/v1/models 里 capabilities.image=true 的行。
+
+    xhx2api 的生图通道忽略 model，raccoon-image-gen / gpt-image-* / dall-e-*
+    都是同一条上游通道；这里把引擎列出的每个 id 都作为独立媒体模型展示，
+    客户端用哪个别名都能直接选。
+    """
+    now = time.time()
+    with _raccoon_media_lock:
+        if not force and now - _raccoon_media_cache["ts"] < RACCOON_MEDIA_TTL:
+            return _raccoon_media_cache["models"], _raccoon_media_cache["errors"]
+    up = _upstream_by_name("raccoon")
+    models, errors = [], {}
+    if up and platform_enabled("raccoon"):
+        try:
+            rows = upstream_rows(up)
+        except Exception as exc:
+            rows, errors["active"] = None, f"{type(exc).__name__}: {exc}"
+        if rows is None and "active" not in errors:
+            # upstream_rows 失败返回 None 不抛异常；不显式标注的话「引擎挂了」
+            # 和「引擎没配生图模型」在媒体页看起来一样。
+            errors["active"] = "raccoon /v1/models 不可达"
+        found = []
+        for row in rows or []:
+            caps = row.get("capabilities")
+            mid = str(row.get("id") or "")
+            if mid and isinstance(caps, dict) and caps.get("image"):
+                found.append((mid, str(row.get("name") or mid)))
+        # 规范 id 排最前，其余保持引擎返回顺序（稳定排序，不按字母重排）。
+        found.sort(key=lambda item: item[0] != "raccoon-image-gen")
+        price = _raccoon_image_price(up)
+        # 目录抖动时（引擎重启瞬间少列了某个别名）resolve_media_model 仍能
+        # 通过别名 fallback 找到规范行——引擎本就忽略 model，走同一条通道。
+        aliases = [mid for mid, _ in found if mid != "raccoon-image-gen"]
+        for mid, name in found:
+            models.append({
+                "id": mid,
+                "name": name,
+                "tags": ["text-to-image", "image-to-image"],
+                # xhx2api 的生图通道按账号池选号，不按模型分区。
+                "realms": ["cn", "intl"],
+                "video": None,
+                "credit_per_image": price,
+                "image_measured": price is not None,
+                "credit_per_second": None,
+                "credit_ceiling": None,
+                "credits_per_second": {},
+                "credits_with_reference": {},
+                "kind": "image",
+                "active_realm": None,
+                "available": True,
+                "aliases": aliases if mid == "raccoon-image-gen" else [],
+            })
+    with _raccoon_media_lock:
+        _raccoon_media_cache.update(ts=now, models=models, errors=errors)
+    return models, errors
+
+
 def public_media_catalog(force=False):
-    models, _ = _wb_media_fetch(force=force)
-    return [dict(m, platform="workbuddy", public=m["id"], upstream=m["id"])
-            for m in models]
+    out = []
+    if platform_enabled("workbuddy"):
+        models, _ = _wb_media_fetch(force=force)
+        out.extend(dict(m, platform="workbuddy", public=m["id"], upstream=m["id"])
+                   for m in models)
+    if platform_enabled("raccoon"):
+        models, _ = _raccoon_media_fetch(force=force)
+        out.extend(dict(m, platform="raccoon", public=m["id"], upstream=m["id"])
+                   for m in models)
+    return out
 
 
 def resolve_media_model(model, tag=None):
-    """只从当前媒体出口中挑可见且支持目标操作的模型。"""
+    """只从当前媒体出口中挑可见且支持目标操作的模型（workbuddy / raccoon）。"""
     model = (model or "").strip()
-    up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
-    if up is None:
-        return None, None, None, "未配置 workbuddy 上游，媒体模型不可用"
-    entries = public_media_catalog()
     platform, sep, rest = model.partition("/")
-    if sep and platform.lower() != "workbuddy":
-        return None, None, None, f"媒体生成目前只由 workbuddy 上游提供，不支持 `{model}`"
+    platform = platform.lower() if sep else ""
+    if sep and platform not in ("workbuddy", "raccoon"):
+        return None, None, None, f"未知媒体平台 `{platform}`（可用: workbuddy, raccoon）"
     wanted = rest if sep else model
     if sep and not wanted:
         return None, None, None, f"模型名 `{model}` 缺少 `/` 后的模型部分"
-    if not wanted:
-        entry = next((m for m in entries if m.get("available")
-                      and not _model_hidden("workbuddy", m["public"])
-                      and (not tag or tag in m["tags"])), None)
-        if entry is None:
-            return None, None, None, "当前媒体出口没有可见且支持该操作的模型"
-        wanted = entry["public"]
-    else:
-        entry = next((m for m in entries if m["public"] == wanted), None)
-        if entry is None:
-            return None, None, None, f"未知媒体模型 `{model}`"
-    if _model_hidden("workbuddy", wanted):
-        return None, None, None, f"媒体模型 `{model}` 已在控制台隐藏（媒体页可恢复显示）"
-    if not entry.get("available"):
-        return None, None, None, f"媒体模型 `{wanted}` 不在当前媒体出口，请检查 WorkBuddy 引擎的媒体区域与账号池"
-    if tag and tag not in entry["tags"]:
-        return None, None, None, f"媒体模型 `{wanted}` 不支持 `{tag}`"
-    return up, wanted, (model or f"workbuddy/{wanted}"), None
+    entries = public_media_catalog()
+    candidates = [platform] if platform else ["workbuddy", "raccoon"]
+    for name in candidates:
+        up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
+        if not up or not platform_enabled(name):
+            continue
+        pool = [m for m in entries if (m.get("platform") or "workbuddy") == name]
+        active_realm = next((m.get("active_realm") for m in pool
+                             if m.get("active_realm")), None)
+        entry = None
+        wanted_name = wanted
+        if not wanted:
+            entry = next((m for m in pool if m.get("available")
+                          and not _model_hidden(name, m["public"])
+                          and _media_supports_tag(m, tag, active_realm)), None)
+            if entry is None:
+                continue
+            wanted_name = entry["public"]
+        else:
+            entry = next((m for m in pool if m["public"] == wanted), None)
+            if entry is None and name == "raccoon":
+                # 生图别名（gpt-image-1 等）也能调；引擎忽略 model，统一走同一条通道。
+                aliases = next((m.get("aliases") for m in pool if m.get("aliases")), [])
+                if wanted in aliases:
+                    entry = pool[0]
+            if entry is None:
+                continue
+        if _model_hidden(name, entry["public"]):
+            return None, None, None, f"媒体模型 `{model}` 已在控制台隐藏（媒体页可恢复显示）"
+        if not entry.get("available"):
+            return None, None, None, (f"媒体模型 `{wanted_name}` 不在当前媒体出口，"
+                                      f"请检查 {name} 引擎的区域与账号池")
+        if tag and not _media_supports_tag(entry, tag, active_realm):
+            return None, None, None, f"媒体模型 `{wanted_name}` 不支持 `{tag}` 的当前区域出口"
+        return up, wanted_name, (model or f"{name}/{wanted_name}"), None
+    return None, None, None, f"未知媒体模型 `{model}`"
 
 
 #: 媒体生成入口（与引擎 MEDIA_POST_PATHS 对齐）。视频任务的状态/产物/取消
@@ -726,6 +1568,17 @@ MEDIA_POST_PATHS = {
     "/v1/images/edits", "/images/edits",
     "/v1/videos", "/videos",
 }
+
+
+def _media_multipart_reject(path, content_type):
+    """OpenAI 规范的 /v1/images/edits 是 multipart 文件上传；本网关媒体接口
+    只收 JSON（image 传 URL 或 data URL）。multipart 放进 _read_post_object
+    只会得到误导性的「请求体不是合法 JSON」，所以先识别并让调用方拦下说明。"""
+    p = (path or "").split("?")[0]
+    if p not in MEDIA_POST_PATHS \
+            and not (p.startswith("/v1/videos/") and p.endswith("/cancel")):
+        return False
+    return "multipart/form-data" in (content_type or "").lower()
 
 
 def _row_alt_desc(platform, row):
@@ -787,6 +1640,9 @@ def resolve_model(model):
         if not up:
             return (None, None, None,
                     f"未知平台前缀 `{platform}`（可用: {', '.join(u['name'] for u in CONFIG['upstreams'])}）")
+        if not platform_enabled(up["name"]):
+            return (None, None, None,
+                    f"平台 `{up['name']}` 已在控制台停用（设置页可重新启用）")
         if not rest:
             return None, None, None, f"模型名 `{model}` 缺少 `/` 后的模型部分"
         e = next((x for x in entries
@@ -825,6 +1681,10 @@ def resolve_model(model):
         return (None, None, None,
                 f"模型 `{model}` 需要 WorkBuddy 付费会员（PRO），当前账号池没有付费账号；"
                 "已自动从 /v1/models 隐藏，会员账号入池后自动恢复")
+    disabled_platform = _model_in_disabled_platform(model)
+    if disabled_platform:
+        return (None, None, None,
+                f"模型 `{model}` 所属平台 `{disabled_platform}` 已在控制台停用（设置页可重新启用）")
     return None, None, None, f"未知模型 `{model}`"
 
 
@@ -952,8 +1812,29 @@ def _panel_token(up, force=False):
     return token
 
 
+def _http_error_detail(exc, limit=300):
+    """Read an HTTPError body once so callers can preserve upstream diagnostics."""
+    cached = getattr(exc, "_gateway_detail", None)
+    if cached is not None:
+        return cached[:limit]
+    try:
+        raw = exc.read(64 * 1024)
+    except Exception:
+        raw = b""
+    if isinstance(raw, bytes):
+        detail = raw.decode("utf-8", "ignore")
+    else:
+        detail = str(raw or "")
+    try:
+        exc._gateway_detail = detail
+    except Exception:
+        pass
+    return detail[:limit]
+
+
 def engine_request(up, method, path, body=None, auth="auto", timeout=15):
-    """对引擎发管理请求。auth: panel（hub 面板）/ none（Buddy2api 本地免鉴权）/ auto。
+    """对引擎发管理请求。auth: panel（hub 面板）/ bearer（引擎 API Key）/
+    none（Buddy2api 本地免鉴权）/ auto。
 
     返回解析后的 JSON（或原始 dict）。面板 401/403 时自动重登一次。
     """
@@ -965,6 +1846,10 @@ def engine_request(up, method, path, body=None, auth="auto", timeout=15):
     for attempt in (1, 2):
         if kind == "panel":
             headers["X-Panel-Token"] = _panel_token(up, force=(attempt == 2))
+        elif kind == "bearer":
+            key = (up.get("api_key") or "").strip()
+            if key:
+                headers["Authorization"] = "Bearer " + key
         req = urllib.request.Request(
             up["base_url"].rstrip("/") + path,
             data=payload,
@@ -975,10 +1860,7 @@ def engine_request(up, method, path, body=None, auth="auto", timeout=15):
             with _urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            try:
-                exc.read()  # 读完错误体再关闭，连接不留到 GC
-            except Exception:
-                pass
+            _http_error_detail(exc, 64 * 1024)  # consume once; callers may include the cached detail
             if exc.code in (401, 403) and kind == "panel" and attempt == 1:
                 continue  # 会话失效，强刷重登
             raise
@@ -1022,7 +1904,7 @@ def normalize_wb(a):
         "name": a.get("nickname") or (a.get("uid") or "")[:8],
         "sub": tier.get("package") or a.get("realm", ""),
         "enabled": bool(a.get("enabled", True)) and not a.get("accountBanned"),
-        "remain": _num(c.get("remain")), "size": _num(c.get("size")),
+        "remain": _known_num(c.get("remain")), "size": _known_num(c.get("size")),
         "pct": c.get("remain_percent") or "",
         "checked_in": bool(ck.get("today_checked_in")),
         "can_checkin": bool(a.get("canCheckin")),
@@ -1043,7 +1925,7 @@ def normalize_qoder(a):
         "name": a.get("nickname") or (a.get("uid") or "")[:8],
         "sub": a.get("plan") or a.get("realm", ""),
         "enabled": bool(a.get("enabled", True)) and not a.get("accountBanned"),
-        "remain": _num(c.get("remain")), "size": _num(c.get("size")),
+        "remain": _known_num(c.get("remain")), "size": _known_num(c.get("size")),
         "pct": c.get("usage_pct") if isinstance(c.get("usage_pct"), str) else "",
         "checked_in": bool(a.get("checkedInToday")),
         "can_checkin": bool(a.get("canCheckin")),
@@ -1107,7 +1989,78 @@ def normalize_buddy(a):
     }
 
 
-NORMALIZERS = {"workbuddy": normalize_wb, "qoder": normalize_qoder, "qwenwork": normalize_buddy}
+def _shanghai_today():
+    """东八区日期：xhx2api 的 checked_in 用上海时区记日期，不能拿本机时区直接比。"""
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
+
+def normalize_raccoon(a):
+    """xhx2api /panel/api/overview 的账号行 → 看板形状。
+
+    credits 是上游积分余额（未知/缺失保持 None）；checked_in 是东八区日期，
+    只用来判断「今天领过没有」；paused/disabled 都表示当前不参与调度。
+    """
+    uid = str(a.get("uid") or "")
+    return {
+        "uid": uid,
+        "name": a.get("nickname") or (uid[:8] if uid else "?"),
+        "sub": "小浣熊",
+        "enabled": not a.get("disabled") and not a.get("paused"),
+        "remain": _known_num(a.get("credits")),
+        "size": None,
+        "pct": "",
+        "checked_in": str(a.get("checked_in") or "") == _shanghai_today(),
+        "can_checkin": True,
+        "can_daily_chat": None,
+        "realm": a.get("realm") if a.get("realm") in ("cn", "intl") else None,
+        "streak": None,
+        "inflight": a.get("in_flight"),
+        "concurrency_limit": None,
+    }
+
+
+def normalize_trae(a):
+    """trae2api-hub /accounts 的账号行 → 看板形状。
+
+    credits 来自官方 v2 entitlement 的 usage_summary（remain/limit），
+    checked_in 是引擎记录的当日签到；uid 已由引擎脱敏（只留后 4 位），
+    看板用 uidHash 做稳定标识。国际版另有 intlQuota，这里不并入积分。
+    """
+    c = a.get("credits") or {}
+    profile = a.get("account") or {}
+    status = str(a.get("status") or "")
+    remain = _known_num(c.get("remain"))
+    size = _known_num(c.get("limit"))
+    realm = a.get("realm") if a.get("realm") in ("cn", "intl") else None
+    realm_name = a.get("realmName") or ("国内版" if realm == "cn" else
+                                        ("国际版" if realm == "intl" else ""))
+    return {
+        "uid": a.get("uidHash") or a.get("uid"),
+        "name": profile.get("username") or a.get("uid") or "Trae 账号",
+        "sub": " · ".join(x for x in [realm_name, str(c.get("plan") or "")] if x),
+        "enabled": bool(a.get("enabled")) and status not in ("disabled", "expired"),
+        "remain": remain,
+        "size": size,
+        "pct": ("%.1f%%" % (remain / size * 100)) if (remain is not None and size) else "",
+        "checked_in": (bool(c.get("checked_in")) if realm == "cn" else None),
+        # Trae 只有国内版有每日签到；国际版没有该接口（引擎如实跳过）。
+        "can_checkin": bool(realm == "cn" and a.get("enabled")
+                            and not c.get("checked_in")),
+        "can_daily_chat": None,
+        "realm": realm,
+        "domain": "trae.com.cn" if realm == "cn" else ("trae.ai" if realm == "intl" else None),
+        "streak": None,
+        "inflight": a.get("inflight"),
+        "concurrency_limit": None,
+        "account_status": status,
+        "cooldown_for": a.get("cooldownFor"),
+        "last_error": a.get("lastError") or "",
+    }
+
+
+NORMALIZERS = {"workbuddy": normalize_wb, "qoder": normalize_qoder,
+               "qwenwork": normalize_buddy, "raccoon": normalize_raccoon,
+               "trae": normalize_trae}
 
 
 def _signable_account(a):
@@ -1175,8 +2128,12 @@ def _github_latest(repo):
     req = urllib.request.Request(
         f"https://github.com/{repo}/releases/latest", method="HEAD",
         headers={"User-Agent": "gateway-hub-update-check"})
-    with _urlopen(req, timeout=15) as resp:
-        final = resp.geturl()
+    try:
+        with _direct_opener.open(req, timeout=15) as resp:
+            final = resp.geturl()
+    except Exception:
+        with _urlopen(req, timeout=15) as resp:
+            final = resp.geturl()
     m = re.search(r"/releases/tag/([^/?#]+)", final)
     if not m:
         raise RuntimeError("release 页面没有 tag")
@@ -1185,6 +2142,10 @@ def _github_latest(repo):
 
 def _engine_version(up):
     """引擎当前版本：/health JSON 的 version 字段，或 Server 头里的 x.y.z。"""
+    if up.get("name") == "raccoon":
+        # xhx2api 的 /healthz 不带版本，/status 才有（Bearer = 引擎 api_key）。
+        data = engine_request(up, "GET", "/status", auth="bearer", timeout=8)
+        return data.get("version"), data
     req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
     with _urlopen(req, timeout=8) as resp:
         raw = resp.read().decode("utf-8", "ignore") or "{}"
@@ -1203,7 +2164,7 @@ def _collect_updates(force=False):
             if now - _updates_cache["ts"] < UPDATES_TTL and _updates_cache["data"] is not None:
                 return _updates_cache["data"]
     rows = []
-    for up in CONFIG["upstreams"]:
+    for up in active_upstreams():
         row = {"platform": up["name"], "current": None, "latest": None,
                "has_update": None, "source": "", "error": ""}
         try:
@@ -1267,7 +2228,9 @@ def platform_status(up):
     out = {"name": name, "base_url": up["base_url"], "health": False, "accounts": [],
            "inflight": _inflight.get(name, 0), "error": ""}
     try:
-        req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
+        # hub 系引擎是 /health；xhx2api 用 /healthz（同样是 JSON status=ok）。
+        health_path = "/healthz" if name == "raccoon" else "/health"
+        req = urllib.request.Request(up["base_url"].rstrip("/") + health_path)
         with _urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         # 各引擎 health 形状不同：hub 系 {"ok": true}，Buddy2api {"status": "ok"}。
@@ -1316,6 +2279,12 @@ def platform_status(up):
                 except Exception:
                     pass
 
+        elif name == "raccoon":
+            # xhx2api 的逐账号清单在 /panel/api/overview（Bearer = 引擎 api_key）；
+            # /status 只回聚合计数，不能拿来展示余额。
+            data = engine_request(up, "GET", "/panel/api/overview", auth="bearer")
+            items = data.get("accounts") if isinstance(data, dict) else data
+            items = items or []
         else:
             # hub 系 /accounts 默认只返回当前区域视图，realm=all 才是全池
             data = engine_request(up, "GET", "/accounts?realm=all")
@@ -1439,37 +2408,26 @@ def platform_status(up):
 _estimate_lock = threading.Lock()
 _estimate_cache = {"ts": 0.0, "data": None}
 ESTIMATE_TTL = 120.0
+_raccoon_billing_lock = threading.Lock()
+_raccoon_billing_cache = {"ts": 0.0, "rows": []}
+RACCOON_BILLING_TTL = 300.0
 
-# 千问短样本参考单价（2026-11-16，柳业宏号；冷/热各一次）。
-# 这不是官方价，也不保证对任意输入/输出构成成立；只作选型参考，界面必须标注。
-QWEN_MODEL_RATES = {
-    "qwork-auto":          {"public": "flash",              "hit_per_ktok": 0.00159, "miss_per_ktok": 0.01562, "hit_rate": 0.90},
-    "ling-3.1-flash":      {"public": "ling-3.1-flash",     "hit_per_ktok": 0.004115, "miss_per_ktok": 0.004115, "hit_rate": 0.0},
-    "glm-5.3-flash":       {"public": "glm-5.3-flash",      "hit_per_ktok": 0.010425, "miss_per_ktok": 0.010425, "hit_rate": 0.0},
-    "deepseek-flash":      {"public": "deepseek-flash",     "hit_per_ktok": 0.02057, "miss_per_ktok": 0.02057, "hit_rate": 0.0},
-    "qwen3.8-flash":       {"public": "qwen3.8-flash",      "hit_per_ktok": 0.00444, "miss_per_ktok": 0.01521, "hit_rate": 0.90},
-    "qwen4-max":           {"public": "qwen4-max",          "hit_per_ktok": 0.00317, "miss_per_ktok": 0.05102, "hit_rate": 0.90},
-    "step-5-preview":      {"public": "step-5-preview",     "hit_per_ktok": 0.03197, "miss_per_ktok": 0.1009, "hit_rate": 0.90},
-    "qwen3.8-max-preview": {"public": "qwen3.8-max-preview","hit_per_ktok": 0.51554, "miss_per_ktok": 0.51554, "hit_rate": 0.0},
+# 千问办公没有逐请求扣费：per-model 预估用短样本全价（未计缓存），
+# 平台钱包实测均价只作对照；WorkBuddy/Qoder 仍按模型实测扣费。
+QWEN_MODEL_PRICES = {
+    "qwork-auto":          {"public": "flash",              "miss_per_ktok": 0.01562},
+    "ling-3.1-flash":      {"public": "ling-3.1-flash",     "miss_per_ktok": 0.004115},
+    "glm-5.3-flash":       {"public": "glm-5.3-flash",      "miss_per_ktok": 0.010425},
+    "deepseek-flash":      {"public": "deepseek-flash",     "miss_per_ktok": 0.02057},
+    "qwen3.8-flash":       {"public": "qwen3.8-flash",      "miss_per_ktok": 0.01521},
+    "qwen4-max":           {"public": "qwen4-max",          "miss_per_ktok": 0.05102},
+    "step-5-preview":      {"public": "step-5-preview",     "miss_per_ktok": 0.1009},
+    "qwen3.8-max-preview": {"public": "qwen3.8-max-preview","miss_per_ktok": 0.51554},
 }
 
 
-def _estimate_public_model(platform, model):
-    """引擎内部模型名 -> 网关公开 id，用于可见性过滤和展示。"""
-    model = str(model or "")
-    while model.startswith(platform + "/"):
-        model = model[len(platform + "/"):]
-    if platform == "qwenwork":
-        spec = _qwen_rate_spec(model, "")
-        if spec:
-            return spec["public"]
-        if model == "qwork-advanced":
-            return "auto"
-    return model
-
-
-def _qwen_rate_spec(upstream, public):
-    """Match upstream ids with or without extra platform prefixes, then public name."""
+def _qwen_sample(upstream, public):
+    """千问模型 → 短样本全价；上游 id / 公开名都匹配，兼容内嵌前缀。"""
     candidates = [upstream, public]
     for raw in (upstream, public):
         text = str(raw or "").strip()
@@ -1477,13 +2435,218 @@ def _qwen_rate_spec(upstream, public):
             text = text[len("qwenwork/"):]
         candidates.append(text)
     for key in candidates:
-        spec = QWEN_MODEL_RATES.get(key)
+        spec = QWEN_MODEL_PRICES.get(key)
         if spec:
             return spec
-    for spec in QWEN_MODEL_RATES.values():
+    for spec in QWEN_MODEL_PRICES.values():
         if spec.get("public") == public:
             return spec
     return None
+
+
+def _estimate_public_model(platform, model):
+    """引擎内部模型名 -> 网关公开 id，用于把用量行归到模型。"""
+    model = str(model or "")
+    while model.startswith(platform + "/"):
+        model = model[len(platform + "/"):]
+    if platform == "qwenwork":
+        spec = _qwen_sample(model, "")
+        if spec:
+            return spec["public"]
+        if model == "qwork-advanced":
+            return "auto"
+    return model
+
+
+def _iso_epoch(value):
+    """RFC3339/ISO 时间 → epoch 秒；解析不了返回 0（不猜时间）。"""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+RACCOON_BILLING_LINKS = os.path.join(HERE, "raccoon_billing_links.jsonl")
+_raccoon_billing_link_lock = threading.Lock()
+
+
+def _raccoon_bill_link_for_request(model, at=None):
+    """Create a random billing marker; never put prompt or caller title in the ledger."""
+    request_id = secrets.token_hex(16)
+    return {"request_id": request_id, "marker": "gw-" + request_id,
+            "model": str(model or "")[:200], "at": float(at or time.time())}
+
+
+def _raccoon_response_id(status, headers, result):
+    """Read xhx2api's request ID from the response header or JSON body."""
+    if not (200 <= int(status or 0) < 300):
+        return ""
+    for key, value in (headers or {}).items():
+        if str(key).lower() == "x-request-id" and value:
+            return str(value).strip()
+    if isinstance(result, (bytes, bytearray)):
+        try:
+            obj = json.loads(bytes(result).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return ""
+        return str(obj.get("id") or "") if isinstance(obj, dict) else ""
+    return ""
+
+
+def _record_raccoon_billing_link(request_id, marker, model, at=None):
+    """Remember the xhx2api request id ↔ unique bill title marker, never prompt text."""
+    request_id = str(request_id or "").strip()
+    marker = str(marker or "").strip()
+    if not request_id or not marker:
+        return False
+    row = {"request_id": request_id[:200], "marker": marker[:64],
+           "model": str(model or "")[:200], "at": float(at or time.time())}
+    try:
+        with _raccoon_billing_link_lock:
+            with open(RACCOON_BILLING_LINKS, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            if os.path.getsize(RACCOON_BILLING_LINKS) > 512 * 1024:
+                with open(RACCOON_BILLING_LINKS, encoding="utf-8") as fh:
+                    keep = fh.readlines()[-2000:]
+                temp = RACCOON_BILLING_LINKS + ".tmp"
+                with open(temp, "w", encoding="utf-8") as fh:
+                    fh.writelines(keep)
+                os.replace(temp, RACCOON_BILLING_LINKS)
+        return True
+    except OSError:
+        return False
+
+
+def _read_raccoon_billing_links():
+    """Read recent non-sensitive request-id/title links; malformed rows are skipped."""
+    rows = []
+    try:
+        with open(RACCOON_BILLING_LINKS, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict) or not row.get("request_id") or not row.get("marker"):
+                    continue
+                rows.append(row)
+    except OSError:
+        return []
+    return rows[-2000:]
+
+
+def _attach_raccoon_bills(events, bills, links):
+    """Attach a bill only through a unique marker, unique xhx request id and same UID."""
+    requests_by_id = {}
+    duplicate_requests = set()
+    for event in events:
+        request_id = str(event.get("id") or "")
+        if not request_id:
+            continue
+        if request_id in requests_by_id:
+            duplicate_requests.add(request_id)
+        requests_by_id[request_id] = event
+
+    links_by_id = {}
+    duplicate_links = set()
+    for link in links:
+        request_id = str(link.get("request_id") or "")
+        if not request_id:
+            continue
+        if request_id in links_by_id:
+            duplicate_links.add(request_id)
+        links_by_id[request_id] = link
+
+    bills_by_marker = {}
+    for bill in bills:
+        event_name = str(bill.get("event_name") or "")
+        for link in links:
+            marker = str(link.get("marker") or "")
+            if marker and marker in event_name:
+                bills_by_marker.setdefault(marker, []).append(bill)
+
+    for request_id, link in links_by_id.items():
+        if request_id in duplicate_links or request_id in duplicate_requests:
+            continue
+        event = requests_by_id.get(request_id)
+        marker = str(link.get("marker") or "")
+        matches = bills_by_marker.get(marker) or []
+        if event is None or len(matches) != 1:
+            continue
+        bill = matches[0]
+        link_at = _known_num(link.get("at")) or 0
+        event_uid = str(event.get("uid") or "")
+        bill_uid = str(bill.get("account") or "")
+        if ((event_uid and event_uid != bill_uid)
+                or not bill_uid or not bill.get("bill_id") or not event.get("model")
+                or _num(event.get("total_tokens")) <= 0
+                or len(marker) < 20
+                or not link_at
+                or _estimate_at(event) < link_at - 1
+                or abs(_estimate_at(event) - link_at) > 900
+                or abs(_estimate_at(event) - _estimate_at(bill)) > 900):
+            continue
+        points = _known_num(bill.get("points"))
+        if points is None or points >= 0:
+            continue
+        event["credit"] = -points
+        event["credit_source"] = "matched_bill"
+    return events
+
+
+def _raccoon_billing_rows(up, limit=200):
+    """读取小浣熊积分流水；只返回可安全对账的消费行。
+
+    账单行按账号查询，字段只有 bill_id/biz_id/event_name/points/time，没有
+    model。event_name 里的 title 也不是稳定的请求 ID，所以这里只做原始账单
+    归档；除非后续能和请求一一对应，否则不把它摊到 token 模型单价。
+    """
+    now = time.time()
+    with _raccoon_billing_lock:
+        cached = _raccoon_billing_cache.get("rows") or []
+        if now - _raccoon_billing_cache.get("ts", 0.0) < RACCOON_BILLING_TTL:
+            return cached
+    try:
+        overview = engine_request(up, "GET", "/panel/api/overview",
+                                  auth="bearer", timeout=10)
+        accounts = overview.get("accounts") if isinstance(overview, dict) else []
+    except Exception:
+        accounts = []
+    rows = []
+    for account in accounts or []:
+        if not isinstance(account, dict):
+            continue
+        uid = str(account.get("uid") or "")
+        if not uid:
+            continue
+        try:
+            data = engine_request(
+                up, "GET", f"/panel/api/accounts/{quote(uid, safe='')}/bills?limit={limit}",
+                auth="bearer", timeout=15)
+        except Exception:
+            continue
+        bills = (data.get("bills") if isinstance(data, dict) else data) or []
+        for bill in bills:
+            if not isinstance(bill, dict):
+                continue
+            points = _known_num(bill.get("points"))
+            if points is None or points >= 0:
+                continue
+            rows.append({
+                "account": uid,
+                "bill_id": str(bill.get("bill_id") or ""),
+                "biz_id": str(bill.get("biz_id") or ""),
+                "event_name": str(bill.get("event_name") or ""),
+                "points": points,
+                "created_at": _iso_epoch(bill.get("created_at")),
+            })
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    with _raccoon_billing_lock:
+        _raccoon_billing_cache.update(ts=time.time(), rows=rows)
+    return rows
 
 
 def _estimate_rows(up):
@@ -1493,6 +2656,32 @@ def _estimate_rows(up):
     if name == "qwenwork":
         data = engine_request(up, "GET", f"/admin/logs?limit={limit}", auth="none")
         return data if isinstance(data, list) else (data.get("items") or data.get("logs") or [])
+    if name == "raccoon":
+        # xhx2api 的请求日志是逐条事件；没有 credit / cached_tokens 字段，
+        # 这两项保持未知，不能拿 0 冒充「零扣费/零缓存」。
+        data = engine_request(up, "GET", f"/panel/api/requests?limit={limit}", auth="bearer")
+        events = (data.get("events") if isinstance(data, dict) else data) or []
+        rows = []
+        all_events = []
+        for e in events:
+            if not isinstance(e, dict) or e.get("status") not in (None, 200):
+                continue
+            event = {
+                "id": str(e.get("id") or ""),
+                "created_at": _iso_epoch(e.get("time")),
+                "model": e.get("model") or "",
+                "uid": str(e.get("uid") or ""),
+                "account": e.get("account") or "",
+                "total_tokens": e.get("total_tokens") or 0,
+                "prompt_tokens": e.get("prompt_tokens") or 0,
+                "completion_tokens": e.get("completion_tokens") or 0,
+                "cached_tokens": None,
+                "credit": None,
+            }
+            all_events.append(event)
+            rows.append(event)
+        bills = _raccoon_billing_rows(up)
+        return _attach_raccoon_bills(all_events, bills, _read_raccoon_billing_links())
     if name == "workbuddy":
         rows = []
         for realm in ("cn", "intl"):
@@ -1514,8 +2703,107 @@ def _estimate_at(row):
     return 0.0
 
 
+QWEN_WALLET_HISTORY = os.path.join(HERE, "qwenwork_wallet_history.jsonl")
+
+
+def _read_wallet_history(path=None):
+    """读取余额快照历史；坏行跳过，读不到返回空列表。"""
+    path = path or QWEN_WALLET_HISTORY
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                ts = _known_num(item.get("ts"))
+                balance = _known_num(item.get("balance"))
+                account = str(item.get("account") or "")
+                metric = str(item.get("metric") or "balance")
+                if ts and balance is not None and account:
+                    rows.append({"ts": ts, "account": account, "metric": metric,
+                                 "balance": balance})
+    except OSError:
+        return []
+    return rows
+
+
+def _credit_rate(rows):
+    """Σ实扣积分 ÷ Σtoken → (分/Mtok, 样本行数, 样本 token)。
+
+    只统计同时有 token 和有效 credit 的行；整批扣费为 0 时没有可换算的
+    单价（免费模型），返回 None。
+    """
+    total_credit = 0.0
+    total_tokens = 0.0
+    priced_rows = 0
+    for row in rows:
+        tokens = _num(row.get("total_tokens") or row.get("total"))
+        credit = _known_num(row.get("credit"))
+        if credit is None or credit < 0 or tokens <= 0:
+            continue
+        total_credit += credit
+        total_tokens += tokens
+        priced_rows += 1
+    if priced_rows < 3 or total_tokens < 500 or total_credit <= 0:
+        return None, priced_rows, total_tokens
+    return total_credit / total_tokens * 1_000_000, priced_rows, total_tokens
+
+
+def _wallet_rate(rows, history):
+    """钱包快照差 ÷ 同期 token → (分/Mtok, 账号数, 样本 token, 覆盖小时)。
+
+    每个账号只用首末快照覆盖的区间；余额增加（发放/充值）的账号跳过，
+    token 也只数同一区间，避免把窗口外的消耗算进来。
+    """
+    per_account = {}
+    for item in history:
+        per_account.setdefault(item["account"], []).append(item)
+    total_credit = 0.0
+    total_tokens = 0.0
+    accounts = 0
+    hours = 0.0
+    for account, snapshots in per_account.items():
+        snapshots.sort(key=lambda item: item["ts"])
+        if len(snapshots) < 2:
+            continue
+        first, last = snapshots[0], snapshots[-1]
+        spent = first["balance"] - last["balance"]
+        if spent <= 0:
+            continue
+        tokens = 0.0
+        for row in rows:
+            row_account = (row.get("account_name") or row.get("account") or "")
+            if str(row_account) != account:
+                continue
+            at = _estimate_at(row)
+            if at and first["ts"] <= at <= last["ts"]:
+                tokens += _num(row.get("total_tokens") or row.get("total"))
+        if tokens <= 0:
+            continue
+        total_credit += spent
+        total_tokens += tokens
+        accounts += 1
+        hours = max(hours, (last["ts"] - first["ts"]) / 3600)
+    if accounts < 1 or total_tokens < 100_000 or total_credit <= 0:
+        return None, accounts, total_tokens, hours
+    return total_credit / total_tokens * 1_000_000, accounts, total_tokens, hours
+
+
 def estimate_snapshot(force=False):
-    """额度预估：目录单价优先，其次有扣费证据的样本；未知不冒充零。"""
+    """额度预估：每个平台、每个模型分别按实测有效单价（分/Mtok）估算。
+
+    预计 token = 模型可用余额 ÷ 单价 × 1,000,000。
+    WorkBuddy/Qoder/Trae 只用明确的逐请求扣费字段；模型样本不足时显示待测。
+    千问办公没有逐请求扣费，按模型短样本相对价用钱包实测均价锚定；
+    小浣熊只有唯一账单关联的聊天样本才参与估值，历史未关联请求保持待测。
+    """
     now = time.time()
     with _estimate_lock:
         hit = _estimate_cache["data"]
@@ -1523,28 +2811,44 @@ def estimate_snapshot(force=False):
             return hit
     catalog = public_catalog()
     out = []
-    for up in CONFIG["upstreams"]:
+    for up in active_upstreams():
         name = up["name"]
         st = platform_status(up)
         accounts = [a for a in st.get("accounts", []) if a.get("enabled")]
         known_balances = [v for v in (_known_num(a.get("remain")) for a in accounts) if v is not None]
-        balance = round(sum(known_balances), 2) if known_balances else None
-        realm_values, realm_totals = {}, {}
+        known_balance = round(sum(known_balances), 2) if known_balances else None
+        balance_complete = bool(accounts) and len(known_balances) == len(accounts)
+        balance = known_balance if balance_complete else None
+        realm_totals, realm_values = {}, {}
+        unknown_realm_total, unknown_realm_values = 0, []
         for a in accounts:
-            realm = a.get("realm") or "cn"
-            realm_totals[realm] = realm_totals.get(realm, 0) + 1
+            realm = a.get("realm") if a.get("realm") in ("cn", "intl") else None
             value = _known_num(a.get("remain"))
+            if realm is None:
+                unknown_realm_total += 1
+                if value is not None:
+                    unknown_realm_values.append(value)
+                continue
+            realm_totals[realm] = realm_totals.get(realm, 0) + 1
             if value is not None:
                 realm_values.setdefault(realm, []).append(value)
         realm_balances = {
-            realm: (round(sum(realm_values[realm]), 2) if realm_values.get(realm) else None)
+            realm: (round(sum(realm_values[realm]), 2)
+                    if len(realm_values.get(realm, [])) == realm_totals[realm] else None)
             for realm in realm_totals
         }
         realm_known = {
             realm: {"known": len(realm_values.get(realm, [])), "total": realm_totals[realm]}
             for realm in realm_totals
         }
-        item = {"name": name, "balance": balance,
+        if unknown_realm_total:
+            realm_balances["unknown"] = (
+                round(sum(unknown_realm_values), 2)
+                if len(unknown_realm_values) == unknown_realm_total else None)
+            realm_known["unknown"] = {"known": len(unknown_realm_values),
+                                      "total": unknown_realm_total}
+        item = {"name": name, "balance": balance, "known_balance": known_balance,
+                "balance_complete": balance_complete,
                 "known": len(known_balances), "total": len(accounts),
                 "enabled": len(accounts),
                 "health": st["health"], "error": st.get("error", ""),
@@ -1554,51 +2858,61 @@ def estimate_snapshot(force=False):
         except Exception as exc:
             rows = []
             item["usage_error"] = type(exc).__name__
-        samples = {}
+
+        # 平台级实测均价：单模型样本不足时的回退，也是千问的对照值。
+        if name == "qwenwork":
+            platform_rate, platform_samples, platform_tokens, platform_hours = _wallet_rate(
+                rows, _read_wallet_history())
+            platform_source = "wallet"
+        elif name == "trae":
+            priced = [row for row in rows
+                      if not row.get("usage_missing")
+                      and row.get("credit_reported") is True
+                      and row.get("credit") is not None]
+            platform_rate, platform_samples, platform_tokens = _credit_rate(priced)
+            first_at = min((_estimate_at(r) for r in priced if _estimate_at(r)), default=0.0)
+            platform_hours = (round(max(0.0, (now - first_at) / 3600), 1)
+                              if first_at else None)
+            platform_source = "measured_credits"
+        else:
+            platform_rate, platform_samples, platform_tokens = _credit_rate(rows)
+            first_at = min((_estimate_at(r) for r in rows if _estimate_at(r)), default=0.0)
+            platform_hours = (round(max(0.0, (now - first_at) / 3600), 1)
+                              if first_at else None)
+            platform_source = "measured"
+        item.update({
+            "rate_per_mtok": (round(platform_rate, 4) if platform_rate is not None else None),
+            "rate_source": (platform_source if platform_rate is not None else "unknown"),
+            "samples": platform_samples,
+            "sample_tokens": int(platform_tokens),
+            "sample_hours": platform_hours,
+            "note": ("平台实测均价" if platform_rate is not None else "平台样本不足"),
+        })
+
+        by_model = {}
         for r in rows:
             model = _estimate_public_model(name, r.get("resolved_model") or r.get("model"))
-            sample = samples.setdefault(model, {
-                "rows": 0, "tokens": 0.0, "prompt": 0.0, "completion": 0.0,
-                "cached": 0.0, "cached_rows": 0,
-                "priced_rows": 0, "priced_tokens": 0.0, "credit": 0.0,
-                "billed_priced": 0.0, "first_at": None})
-            sample["rows"] += 1
-            at = _estimate_at(r)
-            if at and (sample["first_at"] is None or at < sample["first_at"]):
-                sample["first_at"] = at
-            tokens = _num(r.get("total_tokens") or r.get("total"))
-            prompt = _num(r.get("prompt_tokens") or r.get("prompt"))
-            completion = _num(r.get("completion_tokens") or r.get("completion"))
-            sample["tokens"] += tokens
-            sample["prompt"] += prompt
-            sample["completion"] += completion
-            cached = None
-            raw_cached = r.get("cached_tokens")
-            if raw_cached is not None:
-                try:
-                    cached = float(raw_cached)
-                except (TypeError, ValueError):
-                    cached = None
-                if cached is not None and (cached < 0 or tokens <= 0):
-                    cached = None
-            billed = None
-            if cached is not None:
-                sample["cached"] += cached
-                sample["cached_rows"] += 1
-                # 计费口径：非缓存输入 + 全部输出。billed/tokens 就是缓存折扣率。
-                billed = max(0.0, prompt - cached) + completion
-            raw_credit = r.get("credit")
-            if raw_credit is not None and tokens > 0:
-                try:
-                    credit = float(raw_credit)
-                except (TypeError, ValueError):
-                    credit = None
-                if credit is not None and 0 <= credit < float("inf"):
-                    sample["priced_rows"] += 1
-                    sample["priced_tokens"] += tokens
-                    sample["credit"] += credit
-                    if billed is not None:
-                        sample["billed_priced"] += billed
+            by_model.setdefault(model, []).append(r)
+
+        # 千问：用观测到的模型 token 结构，把短样本相对价整体缩放到钱包实测
+        # 均价。这样各模型仍有相对差异，但总量与实际扣费一致。
+        qwen_anchor = None
+        if name == "qwenwork" and platform_rate is not None:
+            weighted = 0.0
+            priced_tokens = 0.0
+            for model_name, model_rows in by_model.items():
+                spec = _qwen_sample(model_name, model_name)
+                if not spec:
+                    continue
+                tokens = sum(_num(r.get("total_tokens") or r.get("total"))
+                             for r in model_rows)
+                if tokens <= 0:
+                    continue
+                weighted += spec["miss_per_ktok"] * 1000 * tokens
+                priced_tokens += tokens
+            if priced_tokens > 0 and weighted > 0:
+                qwen_anchor = platform_rate / (weighted / priced_tokens)
+
         models = []
         for entry in catalog:
             if entry["platform"] != name or _model_hidden(name, entry["public"]):
@@ -1607,113 +2921,118 @@ def estimate_snapshot(force=False):
             model_balance = balance
             scope = ""
             if name == "workbuddy":
-                realms = _wb_usable_realms(entry["upstream"])
-                if not realms:
-                    continue
-                scoped_balances = [realm_balances.get(realm) for realm in realms]
-                model_balance = (None if any(v is None for v in scoped_balances)
-                                 else sum(scoped_balances))
-                scope = "双区合计" if len(realms) > 1 else ("仅国际" if realms[0] == "intl" else "仅国内")
-            sample = samples.get(public) or {}
-            priced = sample.get("priced_tokens", 0.0)
-            credit = sample.get("credit", 0.0)
-            coverage = priced / sample["tokens"] if sample.get("tokens") else 0
-            # 实测有效单价 = 扣费 / 全部 token（天然含缓存折扣）；
-            # 实测全价 = 扣费 / 计费 token（非缓存输入 + 输出），即零缓存下限。
-            measured_eff = (credit / priced * 1000
-                            if sample.get("priced_rows", 0) >= 3 and priced >= 500 and credit > 0
-                            else None)
-            measured_full = (credit / sample["billed_priced"] * 1000
-                             if sample.get("billed_priced", 0.0) >= 500 and credit > 0
-                             else None)
-            spec = _qwen_rate_spec(entry["upstream"], entry["public"]) if name == "qwenwork" else None
-            rate = None          # 支撑 est_tokens 的单价（积分/千tok）
-            floor_rate = None    # 零缓存全价（积分/千tok）
-            rate_src = "unknown"
-            note = "缺少可靠单价，暂不估算"
-            extra = {}
-            if measured_eff is not None:
-                rate = measured_eff
-                rate_src = "measured"
-                note = (f"按最近 {sample['priced_rows']} 条扣费样本实测（含实际缓存表现），非保证容量")
-                if measured_full is not None:
-                    floor_rate = measured_full
+                realms = [realm for realm in _wb_usable_realms(entry["upstream"])
+                          if realm in realm_totals]
+                if realms:
+                    model_balance = (round(sum(realm_balances[realm] for realm in realms), 2)
+                                     if all(realm_balances.get(realm) is not None
+                                            for realm in realms) else None)
                 else:
-                    try:
-                        floor_rate = (_row_multiplier(name, entry["row"]) or {}).get("factor")
-                    except Exception:
-                        floor_rate = None
-                    if floor_rate:
-                        note += "；下限按目录全价（未经本机校准）"
-                    else:
-                        floor_rate = None
-            elif spec:
-                miss = spec["miss_per_ktok"]
-                hit_rate = spec["hit_rate"]
-                eff = hit_rate * spec["hit_per_ktok"] + (1 - hit_rate) * miss
-                # 千问没有逐请求扣费：headline 取全价（零缓存）作保守下限，
-                # 缓存假设只作乐观参考，不冒充主估算。
-                rate = miss
-                rate_src = "cache_assumed"
-                hit_pct = int(hit_rate * 100)
-                note = f"短样本全价下限（未计缓存）；乐观值按 {hit_pct}% 缓存假设，未经持续校准"
-                extra = {"cache_hit_rate": hit_rate, "cache_assumed": True,
-                         "rate_opt_per_ktok": round(eff, 6),
-                         "est_tokens_opt": None}
+                    model_balance = None
+                scope = ("双区合计" if len(realms) > 1 else
+                         ("仅国际" if realms == ["intl"] else "仅国内") if realms
+                         else "无已知可用区域")
+            mrows = by_model.get(public) or []
+            if name == "trae":
+                mrate, msamples, mtokens = _credit_rate(
+                    [r for r in mrows if not r.get("usage_missing")
+                     and r.get("credit_reported") is True])
             else:
-                try:
-                    factor = (_row_multiplier(name, entry["row"]) or {}).get("factor")
-                except Exception:
-                    factor = None
-                if factor:
-                    floor_rate = float(factor)
-                    rate_src = "catalog_floor"
-                    note = "无扣费样本：目录全价仅作零缓存下限，未经本机校准"
-            est = floor_est = None
+                mrate, msamples, mtokens = _credit_rate(mrows)
+            mfirst = min((_estimate_at(r) for r in mrows if _estimate_at(r)), default=0.0)
+            mhours = round(max(0.0, (now - mfirst) / 3600), 1) if mfirst else None
+            rate = None
+            source = "unknown"
+            samples = 0
+            sample_tokens = 0
+            sample_hours = None
+            note = "样本不足，暂不估算"
+            if name == "qwenwork":
+                spec = _qwen_sample(entry["upstream"], public)
+                if spec and qwen_anchor is not None:
+                    rate = spec["miss_per_ktok"] * 1000 * qwen_anchor  # 分/Mtok
+                    source = "anchored"
+                    samples = len(mrows)
+                    sample_tokens = int(sum(_num(r.get("total_tokens") or r.get("total"))
+                                            for r in mrows))
+                    sample_hours = mhours
+                    note = (f"短样本相对价 × 钱包实测均价锚定"
+                            f"（k={qwen_anchor:.2f}）")
+                elif spec:
+                    samples = len(mrows)
+                    sample_tokens = int(sum(_num(r.get("total_tokens") or r.get("total"))
+                                            for r in mrows))
+                    sample_hours = mhours
+                    note = "钱包样本不足，无法锚定"
+                else:
+                    note = "该模型无短样本价，暂不估算"
+            elif mrate is not None:
+                rate = mrate
+                source = "measured"
+                samples = msamples
+                sample_tokens = int(mtokens)
+                sample_hours = mhours
+                note = f"按最近 {msamples} 条扣费样本：Σ实扣 ÷ Σtoken"
+            est = None
             if model_balance is None:
                 note = "余额待测，暂不估算"
-            elif model_balance > 0:
-                if rate:
-                    est = int(model_balance / rate * 1000)
-                if floor_rate:
-                    floor_est = int(model_balance / floor_rate * 1000)
-                if extra.get("cache_assumed") and extra.get("rate_opt_per_ktok"):
-                    extra["est_tokens_opt"] = int(model_balance / extra["rate_opt_per_ktok"] * 1000)
-            sample_hours = None
-            if sample.get("first_at"):
-                sample_hours = round(max(0.0, (now - sample["first_at"]) / 3600), 1)
-            row = {"model": public, "tokens": sample.get("tokens", 0),
-                   "samples": sample.get("rows", 0), "coverage": coverage,
-                   "sample_hours": sample_hours,
-                   "rate_per_ktok": rate, "rate_source": rate_src,
-                   "rate_floor_per_ktok": (round(floor_rate, 6) if floor_rate else None),
-                   "est_tokens": est, "est_tokens_floor": floor_est,
-                   "model_balance": (round(model_balance, 2)
-                                     if model_balance is not None else None),
-                   "balance_scope": scope,
-                   "balance_unknown": model_balance is None,
-                   "note": note}
-            row.update(extra)
-            models.append(row)
+            elif rate is not None:
+                est = int(model_balance / rate * 1_000_000)
+            models.append({
+                "model": public,
+                "rate_per_mtok": (round(rate, 4) if rate is not None else None),
+                "rate_source": source,
+                "samples": samples,
+                "sample_tokens": sample_tokens,
+                "sample_hours": sample_hours,
+                "est_tokens": est,
+                "model_balance": (round(model_balance, 2)
+                                  if model_balance is not None else None),
+                "balance_scope": scope,
+                "note": note,
+            })
         models.sort(key=lambda m: (m["est_tokens"] is None, -(m["est_tokens"] or 0), m["model"]))
         item["models"] = models
-        # 不从分散到期的积分包推断整个池的寿命。
-        item.update(burn_day=None, days=None, effective_days=None, pool_all=False)
         out.append(item)
     data = {"ok": True, "generated_at": int(now),
-            "sample_basis": "各引擎最近返回的用量行（每引擎最多 1000 条，不限 24 小时）",
+            "sample_basis": "按模型 Σ实扣 ÷ Σtoken；千问用短样本相对价 × 钱包实测均价锚定",
             "platforms": out}
     with _estimate_lock:
         _estimate_cache.update(ts=now, data=data)
     return data
 
-
 CHECKIN_PATHS = {
     "workbuddy": ("/accounts/checkin", "panel"),
     "qoder": ("/accounts/checkin", "panel"),
+    "trae": ("/accounts/checkin", "panel"),
+    "raccoon": ("/panel/api/checkin_all", "bearer"),
     # qwenwork 没有签到动作：每日积分由上游自动发放（见 _api_checkin 特判）。
     # 不放进这里，避免把「令牌保活」当签到去调用（那条路 100% 超时/失败）。
 }
+
+
+def _raccoon_checkin_result(result):
+    """xhx2api 的 JobResult（ok/failed/skipped 计数）→ 共享 results 行形状。
+
+    三项计数都必须是非负整数；无效响应保留为显式失败，避免空 results
+    被 _action_status 当作一次成功的空签到。
+    """
+    if not isinstance(result, dict):
+        return {"error": "小浣熊签到响应格式无效：预期 JobResult 对象"}
+    if result.get("ok") is False or result.get("error"):
+        return result
+    counts = {}
+    for key in ("ok", "failed", "skipped"):
+        value = result.get(key)
+        if type(value) is not int or value < 0:
+            return {"error": f"小浣熊签到响应格式无效：{key} 计数缺失或不是非负整数"}
+        counts[key] = value
+    ok, failed, skipped = counts["ok"], counts["failed"], counts["skipped"]
+    rows = [{"ok": True} for _ in range(ok)]
+    rows += [{"ok": False} for _ in range(failed)]
+    rows += [{"ok": True, "skipped": True} for _ in range(skipped)]
+    return {"results": rows, "details": result.get("details") or [],
+            "job": result.get("job") or "checkin"}
 
 
 def _checkin_tally(result):
@@ -1803,6 +3122,15 @@ def tail_log(lines=120):
 _wallet_lock = threading.Lock()
 
 
+def _request_target(target):
+    """Normalize origin-form and proxy absolute-form request targets."""
+    parsed = urlsplit(target or "")
+    if parsed.scheme and parsed.netloc:
+        return parsed.path or "/", parsed.query
+    path, _, query = (target or "").partition("?")
+    return path or "/", query
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "gateway-hub/1.1"
@@ -1818,41 +3146,53 @@ class Handler(BaseHTTPRequestHandler):
             return True
         got = self.headers.get("Authorization", "")
         api_key = self.headers.get("x-api-key", "")
-        return (secrets.compare_digest(got.encode(), ("Bearer " + want).encode())
-                or secrets.compare_digest(got.encode(), want.encode())
-                or secrets.compare_digest(api_key.encode(), want.encode()))
+        bearer_key = ""
+        parts = str(got).strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            bearer_key = parts[1].strip()
+        return (secrets.compare_digest(bearer_key.encode(), want.encode())
+                or secrets.compare_digest(str(got).strip().encode(), want.encode())
+                or secrets.compare_digest(str(api_key).strip().encode(), want.encode()))
 
     def setup(self):
         super().setup()
         self.connection.settimeout(30)
 
     def _read_post_object(self):
-        """Consume one framed object before dispatching any operation."""
+        """Consume one framed JSON object before dispatching any operation."""
         lengths = self.headers.get_all("Content-Length", [])
-        if len(lengths) > 1 or self.headers.get("Transfer-Encoding"):
+        transfer = self.headers.get("Transfer-Encoding", "")
+        if len(lengths) > 1 or (lengths and transfer):
             self.close_connection = True
-            self._deny(400, "不支持的请求体长度或传输编码")
-            return None
-        raw_length = lengths[0].strip() if lengths else "0"
-        if not re.fullmatch(r"[0-9]+", raw_length):
-            self.close_connection = True
-            self._deny(400, "Content-Length 非法")
+            self._deny(400, "请求体长度与传输编码不合法")
             return None
         try:
-            length = int(raw_length)
-        except ValueError:
-            length = 32 * 1024 * 1024 + 1
-        if length > 32 * 1024 * 1024:
+            if transfer:
+                codings = [part.strip().lower() for part in transfer.split(",") if part.strip()]
+                if codings != ["chunked"]:
+                    self.close_connection = True
+                    self._deny(400, "不支持该 Transfer-Encoding")
+                    return None
+                raw = self._read_chunked_body()
+                if raw is None:
+                    return None
+            else:
+                raw_length = lengths[0].strip() if lengths else "0"
+                if not re.fullmatch(r"[0-9]+", raw_length):
+                    self.close_connection = True
+                    self._deny(400, "Content-Length 非法")
+                    return None
+                length = int(raw_length)
+                if length > 32 * 1024 * 1024:
+                    self.close_connection = True
+                    self._deny(413, "请求体过大（上限 32MB）")
+                    return None
+                raw = self.rfile.read(length) if length else b""
+                if len(raw) != length:
+                    raise ValueError("请求体未完整接收")
+        except (OSError, ValueError, OverflowError) as exc:
             self.close_connection = True
-            self._deny(413, "请求体过大（上限 32MB）")
-            return None
-        try:
-            raw = self.rfile.read(length) if length else b""
-            if len(raw) != length:
-                raise ValueError("请求体未完整接收")
-        except (OSError, ValueError):
-            self.close_connection = True
-            self._deny(400, "请求体未完整接收")
+            self._deny(400, f"请求体 framing 错误: {exc}")
             return None
         try:
             body = json.loads(raw.decode("utf-8")) if raw else {}
@@ -1864,7 +3204,45 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return body
 
+    def _read_chunked_body(self):
+        limit = 32 * 1024 * 1024
+        out = bytearray()
+        while True:
+            line = self.rfile.readline(8193)
+            if len(line) > 8192 or not line.endswith(b"\r\n"):
+                raise ValueError("chunk size 行无效或过长")
+            raw_size = line[:-2].split(b";", 1)[0].strip()
+            if not raw_size or not re.fullmatch(rb"[0-9A-Fa-f]+", raw_size):
+                raise ValueError("chunk size 不是十六进制")
+            size = int(raw_size, 16)
+            if size == 0:
+                trailer_bytes = 0
+                while True:
+                    trailer = self.rfile.readline(8193)
+                    trailer_bytes += len(trailer)
+                    if (len(trailer) > 8192 or trailer_bytes > 64 * 1024
+                            or not trailer.endswith(b"\r\n")):
+                        raise ValueError("chunk trailer 无效或过长")
+                    if trailer == b"\r\n":
+                        return bytes(out)
+                    if b":" not in trailer[:-2]:
+                        raise ValueError("chunk trailer 字段无效")
+            if len(out) + size > limit:
+                self.close_connection = True
+                self._deny(413, "请求体过大（上限 32MB）")
+                return None
+            chunk = self.rfile.read(size)
+            if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                raise ValueError("chunk 数据未完整接收")
+            out.extend(chunk)
+
     def _deny(self, code, message, err_type="invalid_request_error"):
+        request_path, _ = _request_target(getattr(self, "path", ""))
+        if request_path == "/v1/messages":
+            anthropic_type = "authentication_error" if code == 401 else err_type
+            self._send_json(code, {"type": "error", "error": {
+                "type": anthropic_type, "message": message}})
+            return
         self._send_json(code, {"error": {"message": message, "type": err_type}})
 
     def _send_json(self, code, obj, model=None):
@@ -1887,7 +3265,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 路由 ----
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        path, query = _request_target(self.path)
         if path in ("/", "/index.html"):
             try:
                 with open(DASHBOARD_PATH, "rb") as f:
@@ -1907,7 +3285,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_bytes(204, b"", "image/x-icon")
         if path == "/health":
             return self._health()
-        if _media_download_allowed(self.path):
+        normalized_target = path + ("?" + query if query else "")
+        if _media_download_allowed(normalized_target):
             return self._media_video_get()
         if not self._authorized():
             return self._deny(401, "API Key 缺失或不正确")
@@ -1925,8 +3304,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True})
         if path == "/api/gwconfig":
             return self._api_gwconfig()
+        if path == "/api/platforms":
+            return self._api_platforms()
         if path == "/api/updates":
-            force = "force=1" in self.path
+            force = "force=1" in query
             return self._send_json(200, {"ok": True, "rows": _collect_updates(force=force)})
         if path == "/api/catalog":
             return self._api_catalog()
@@ -1936,6 +3317,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_usage()
         if path == "/api/estimate":
             return self._api_estimate()
+        if path == "/api/raccoon/scan":
+            return self._api_raccoon_scan()
+        if path == "/api/raccoon/login/poll":
+            return self._api_raccoon_login_poll()
         if path == "/api/login/poll":
             return self._api_login_poll()
         if path.startswith("/api/tasks/"):
@@ -1946,10 +3331,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         t0 = time.time()
-        path = self.path.split("?")[0]
+        path, query = _request_target(self.path)
+        self._target = path + ("?" + query if query else "")
         if not self._authorized():
             self.close_connection = True
             return self._deny(401, "API Key 缺失或不正确")
+        if _media_multipart_reject(path, self.headers.get("Content-Type")):
+            self.close_connection = True  # 请求体未读取，不得在同一连接解析成下一次请求
+            return self._deny(400, "媒体接口只接受 JSON 请求体：不支持 multipart 文件上传，"
+                                   "改图请用 JSON 的 /v1/images/edits（image 传图片 URL 或 data URL）")
         self._post_body = self._read_post_object()
         if self._post_body is None:
             return
@@ -1971,10 +3361,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_login_start(path.rsplit("/", 1)[-1])
         if path.startswith("/api/qwenwork/reimport"):
             return self._api_qwenwork_reimport()
+        if path == "/api/raccoon/import":
+            return self._api_raccoon_import()
+        if path == "/api/raccoon/login/start":
+            return self._api_raccoon_login_start()
         if path == "/api/engine":
             return self._api_engine()
         if path == "/api/gwconfig":
             return self._api_gwconfig()
+        if path in ("/api/platforms", "/api/platforms/process"):
+            return self._api_platforms()
         if (path in MEDIA_POST_PATHS
                 or (path.startswith("/v1/videos/") and path.endswith("/cancel"))):
             return self._media_post()
@@ -1990,6 +3386,15 @@ class Handler(BaseHTTPRequestHandler):
         if up is None:
             return self._deny(400, reason)
 
+        # 小浣熊账单不暴露模型或请求 ID：只对新 Chat Completions 生成随机标题标记，
+        # 并在成功响应带回 X-Request-Id 后记录关联。Responses 路径的上游转换不保留
+        # title，故不在该入口猜测账单归属。
+        raccoon_bill_link = None
+        if (up["name"] == "raccoon" and path == "/v1/chat/completions"
+                and "title" not in req):
+            raccoon_bill_link = _raccoon_bill_link_for_request(upstream_model, t_parse)
+            req["title"] = raccoon_bill_link["marker"]
+
         # 客户端视角的名字回显给客户端；上游拿真实模型名。
         req["model"] = upstream_model
         payload = json.dumps(req, ensure_ascii=False).encode("utf-8")
@@ -1998,35 +3403,88 @@ class Handler(BaseHTTPRequestHandler):
         log(f"{path} model={model} -> {up['name']}/{upstream_model} stream={stream}")
 
         client_h = dict(self.headers.items())
+        wb_plan = None
+        rid = ""
         if up["name"] == "workbuddy":
-            # 区域专属模型显式指路：wb Key 的出口是「跟随面板切换」，面板停在
-            # 国内版时 intl 专属模型会被引擎以跨区 400 拒掉。双区模型按
-            # wb_dual_prefer（默认 auto：临期积分包更紧急的区优先消耗）。
-            realm = _wb_model_realm(upstream_model) or _wb_route_realm(upstream_model)
-            if realm:
-                client_h = {k: v for k, v in client_h.items() if k.lower() != "x-realm"}  # 客户端误带的区域头不覆盖路由判定
-                client_h["X-Realm"] = realm
-                log(f"wb 分区路由: {upstream_model} -> {realm}")
+            rid = secrets.token_hex(4)
+            wb_plan = _wb_plan(upstream_model, req, path, self.headers)
+            if not wb_plan["order"]:
+                _wb_log_route(rid, model, wb_plan, 0, None, outcome="no-account")
+                return self._deny(503, "WorkBuddy 当前没有可用区域/账号，请检查账号池",
+                                  "upstream_error")
+            # 客户端误带的 X-Realm 不覆盖网关判定；每次尝试再写具体区域。
+            client_h = {k: v for k, v in client_h.items() if k.lower() != "x-realm"}
 
         t_route = time.time()
+        attempts = wb_plan["order"] if wb_plan else [None]
 
         # 平台在飞计数：从发起到响应体写完（流式 = 整个流）都算
         with _platform_inflight(up["name"]):
-            try:
-                status, headers, result = forward(
-                    up, "POST", path, payload, client_h, stream
-                )
-            except (OSError, TimeoutError, HTTPException) as exc:
-                log(f"upstream[{up['name']}] 连接失败: {type(exc).__name__}: {exc}")
-                return self._deny(502, f"上游 {up['name']} 不可达: {exc}", "upstream_error")
+            for idx, realm in enumerate(attempts):
+                attempt_no = idx + 1
+                headers = dict(client_h)
+                if realm:
+                    headers["X-Realm"] = realm
+                try:
+                    status, resp_headers, result = forward(
+                        up, "POST", path, payload, headers, stream
+                    )
+                except (OSError, TimeoutError, HTTPException) as exc:
+                    log(f"upstream[{up['name']}] 连接失败: {type(exc).__name__}: {exc}")
+                    if wb_plan and realm:
+                        _wb_health_fail(realm, "connect")
+                        if idx + 1 >= len(attempts):
+                            _wb_sticky_clear(wb_plan.get("key"))
+                        _wb_log_route(rid, model, wb_plan, attempt_no, realm,
+                                      outcome="connect_error",
+                                      next_realm=(attempts[idx + 1] if idx + 1 < len(attempts) else ""))
+                    if wb_plan and idx + 1 < len(attempts):
+                        continue
+                    return self._deny(502, f"上游 {up['name']} 不可达: {exc}", "upstream_error")
 
-            # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
-            if stream and not isinstance(result, (bytes, bytearray)):
-                return self._relay_stream(status, headers, result, client_facing, up,
-                                          t0=t0, t_head=time.time(), label=model,
-                                          t_parse=t_parse, t_payload=t_payload,
-                                          t_route=t_route)
-            return self._relay_json(status, headers, result, client_facing)
+                if wb_plan and realm:
+                    retryable = _wb_retryable(status, result)
+                    retry_after = _wb_retry_after(resp_headers) if retryable else None
+                    if status < 400:
+                        _wb_health_success(realm)
+                        _wb_sticky_set(wb_plan.get("key"), realm)
+                        _wb_log_route(rid, model, wb_plan, attempt_no, realm,
+                                      status=status, outcome="ok")
+                    elif retryable:
+                        _wb_health_fail(realm, status, retry_after=retry_after)
+                        if idx + 1 < len(attempts):
+                            _wb_log_route(rid, model, wb_plan, attempt_no, realm,
+                                          status=status, outcome="retry",
+                                          next_realm=attempts[idx + 1],
+                                          retry_after=retry_after)
+                            close = getattr(result, "close", None)
+                            if close:
+                                close()
+                            continue
+                        _wb_sticky_clear(wb_plan.get("key"))
+                        _wb_log_route(rid, model, wb_plan, attempt_no, realm,
+                                      status=status, outcome="fail",
+                                      retry_after=retry_after)
+                    else:
+                        # 400/401/404/内容拒绝：请求本身的问题，不惩罚区域、不换区。
+                        _wb_log_route(rid, model, wb_plan, attempt_no, realm,
+                                      status=status, outcome="client-error")
+
+        # HTTP 200 + 上游 request id 允许把唯一账单标题和请求日志配对，
+        # 流式请求也通过响应头获取 id；无 id 时宁可保持待测。
+        if raccoon_bill_link and up["name"] == "raccoon" and status < 300:
+            response_id = _raccoon_response_id(status, resp_headers, result)
+            if response_id:
+                _record_raccoon_billing_link(
+                    response_id, raccoon_bill_link["marker"],
+                    raccoon_bill_link["model"], raccoon_bill_link["at"])
+        # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
+        if stream and not isinstance(result, (bytes, bytearray)):
+            return self._relay_stream(status, resp_headers, result, client_facing, up,
+                                      t0=t0, t_head=time.time(), label=model,
+                                      t_parse=t_parse, t_payload=t_payload,
+                                      t_route=t_route)
+        return self._relay_json(status, resp_headers, result, client_facing)
 
     # ---- 转发实现 ----
 
@@ -2100,6 +3558,19 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 媒体（生图 / 生视频） ----
 
+    def _media_catalog_combined(self, force=False):
+        """媒体目录合并：workbuddy 的图片/视频 + xhx2api 的图片。"""
+        rows, errors = [], {}
+        if platform_enabled("workbuddy"):
+            models, err = _wb_media_fetch(force=force)
+            rows.extend(("workbuddy", m) for m in models)
+            errors.update(err)
+        if platform_enabled("raccoon"):
+            models, err = _raccoon_media_fetch(force=force)
+            rows.extend(("raccoon", m) for m in models)
+            errors.update({f"raccoon:{k}": v for k, v in err.items()})
+        return rows, errors
+
     def _media_models(self):
         """GET /v1/media/models：媒体模型清单（OpenAI 风格外壳）。
 
@@ -2110,19 +3581,25 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(urlsplit(self.path).query)
         tag = (qs.get("tag") or [""])[0]
         realm = (qs.get("realm") or [""])[0]
-        models, errors = _wb_media_fetch()
+        if not platform_enabled("workbuddy") and not platform_enabled("raccoon"):
+            return self._send_json(200, {"object": "list", "data": [], "total": 0,
+                                         "disabled": True})
+        rows, errors = self._media_catalog_combined()
         data = []
-        for m in models:
-            if _model_hidden("workbuddy", m["id"]):
+        for platform, m in rows:
+            if _model_hidden(platform, m["id"]):
                 continue
-            if tag and tag not in m["tags"]:
+            realm_tags = m.get("tags_by_realm") or {}
+            supported_realms = [r for r in m["realms"]
+                                if _media_supports_tag(m, tag, r)]
+            if realm and realm not in supported_realms:
                 continue
-            if realm and realm not in m["realms"]:
+            if tag and not realm and not supported_realms:
                 continue
             data.append({
-                "id": f"workbuddy/{m['id']}",
+                "id": f"{platform}/{m['id']}",
                 "object": "model",
-                "owned_by": "workbuddy",
+                "owned_by": platform,
                 "name": m["name"],
                 "type": m["kind"],
                 "tags": m["tags"],
@@ -2144,12 +3621,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_media_models(self):
         """GET /api/media/models：控制台用（带 hidden 标记与刷新）。"""
-        models, errors = _wb_media_fetch(force="force=1" in self.path)
+        if not platform_enabled("workbuddy") and not platform_enabled("raccoon"):
+            return self._send_json(200, {"ok": True, "items": [], "total": 0,
+                                         "hidden_count": 0, "errors": {},
+                                         "disabled": True})
+        rows, errors = self._media_catalog_combined(force="force=1" in self.path)
         items = []
-        for m in models:
+        for platform, m in rows:
             items.append({
-                "id": f"workbuddy/{m['id']}",
-                "platform": "workbuddy",
+                "id": f"{platform}/{m['id']}",
+                "platform": platform,
                 "model": m["id"],
                 "name": m["name"],
                 "kind": m["kind"],
@@ -2162,7 +3643,7 @@ class Handler(BaseHTTPRequestHandler):
                 "credit_ceiling": m["credit_ceiling"],
                 "credits_per_second": m["credits_per_second"],
                 "credits_with_reference": m["credits_with_reference"],
-                "hidden": _model_hidden("workbuddy", m["id"]),
+                "hidden": _model_hidden(platform, m["id"]),
                 "available": m["available"],
                 "active_realm": m["active_realm"],
             })
@@ -2239,16 +3720,22 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == "workbuddy"), None)
         if not up:
             self._deny(404, "未配置 workbuddy 上游，媒体不可用")
+            return None
+        if not platform_enabled("workbuddy"):
+            self._deny(409, "平台 `workbuddy` 已在控制台停用（设置页可重新启用）")
+            return None
         return up
 
     def _media_post(self):
-        up = self._media_upstream()
-        if up is None:
-            return
-        path = self.path.split("?")[0]
+        path, query = _request_target(self.path)
         cancel = path.startswith("/v1/videos/") and path.endswith("/cancel")
         client_facing = None
-        if not cancel:
+        if cancel:
+            # 取消只对 workbuddy 的异步视频任务有效。
+            up = self._media_upstream()
+            if up is None:
+                return
+        else:
             req = self._post_body
             model = req.get("model", "")
             if not isinstance(model, str):
@@ -2262,15 +3749,25 @@ class Handler(BaseHTTPRequestHandler):
             if up is None:
                 return self._deny(400, reason)
             req["model"] = upstream_model
+            if up["name"] == "raccoon" and not path.startswith("/v1/videos"):
+                # xhx2api 会把 n 统一转成字符串再转发，而上游生图接口只收 int；
+                # 默认单张可以省略 n，但多张会被改成默认 1，必须明确拒绝。
+                n = req.get("n", 1)
+                if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                    return self._deny(400, "小浣熊生图参数 n 必须是正整数")
+                if n > 1:
+                    return self._deny(400, "小浣熊上游当前不支持一次生成多张图片（n > 1）")
+                req.pop("n", None)
             self._post_body = req
         payload = json.dumps(self._post_body, ensure_ascii=False).encode("utf-8")
         try:
-            status, headers, data = forward(up, "POST", self.path, payload,
+            target = path + ("?" + query if query else "")
+            status, headers, data = forward(up, "POST", target, payload,
                                             dict(self.headers.items()), False)
         except (OSError, TimeoutError, HTTPException) as exc:
-            log(f"upstream[workbuddy] 媒体请求失败: {type(exc).__name__}: {exc}")
+            log(f"upstream[{up['name']}] 媒体请求失败: {type(exc).__name__}: {exc}")
             return self._send_json(502, {"error": {
-                "message": f"上游 workbuddy 不可达: {exc}", "type": "upstream_error"}})
+                "message": f"上游 {up['name']} 不可达: {exc}", "type": "upstream_error"}})
         log(f"media {path} model={client_facing or '(默认)'} -> HTTP {status}")
         self._relay_media_json(status, headers, data, client_facing)
 
@@ -2278,12 +3775,16 @@ class Handler(BaseHTTPRequestHandler):
         up = self._media_upstream()
         if up is None:
             return
-        path = self.path.split("?")[0]
+        path, _ = _request_target(self.path)
         try:
             if path.endswith("/content"):
-                status, headers, chunks = forward(up, "GET", self.path, None, {}, "raw")
+                target, query = _request_target(self.path)
+                target = target + ("?" + query if query else "")
+                status, headers, chunks = forward(up, "GET", target, None, {}, "raw")
                 return self._relay_binary(status, headers, chunks)
-            status, headers, data = forward(up, "GET", self.path, None, {}, False)
+            target, query = _request_target(self.path)
+            target = target + ("?" + query if query else "")
+            status, headers, data = forward(up, "GET", target, None, {}, False)
         except (OSError, TimeoutError, HTTPException) as exc:
             return self._send_json(502, {"error": {
                 "message": f"上游 workbuddy 不可达: {exc}", "type": "upstream_error"}})
@@ -2294,7 +3795,9 @@ class Handler(BaseHTTPRequestHandler):
         if up is None:
             return
         try:
-            status, headers, data = forward(up, "GET", self.path, None, {}, False)
+            target, query = _request_target(self.path)
+            target = target + ("?" + query if query else "")
+            status, headers, data = forward(up, "GET", target, None, {}, False)
         except (OSError, TimeoutError, HTTPException) as exc:
             return self._send_json(502, {"error": {
                 "message": f"上游 workbuddy 不可达: {exc}", "type": "upstream_error"}})
@@ -2303,7 +3806,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 控制台 API ----
 
     def _api_status(self):
-        platforms = [platform_status(up) for up in CONFIG["upstreams"]]
+        platforms = [platform_status(up) for up in active_upstreams()]
         # 「今日签到」KPI 把国际版活跃打卡也算进来：它没有签到动作，但同样
         # 是每天一次的收益；只统计 can_checkin 会让国际号永远不出现在分母里。
         # 分子分母都走同一个资格判定，避免出现「5/4」这种 checked > checkable。
@@ -2340,6 +3843,8 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up:
             return self._deny(404, f"未知平台 `{name}`")
+        if not platform_enabled(name):
+            return self._deny(409, f"平台 `{name}` 已在控制台停用（设置页可重新启用）")
         if name == "qwenwork":
             # 千问办公没有签到：每日积分由上游自动发放。端点保留但直接回
             # 「跳过」，客户端/审计不会误判失败，也不用等一次注定超时的保活。
@@ -2350,15 +3855,19 @@ class Handler(BaseHTTPRequestHandler):
         if not spec:
             return self._deny(400, f"平台 `{name}` 没有可代执行的签到")
         path, kind = spec
+        # 小浣熊要逐个账号领积分，可能跑几分钟；其余平台保持 15s 默认。
+        timeout = 600 if name == "raccoon" else 15
         try:
-            result = engine_request(up, "POST", path, {}, auth=kind)
+            result = engine_request(up, "POST", path, {}, auth=kind, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")[:300]
+            detail = _http_error_detail(exc, 300)
             return self._send_json(502, {"ok": False, "platform": name,
                                          "error": f"HTTP {exc.code}: {detail}"})
         except Exception as exc:
             return self._send_json(502, {"ok": False, "platform": name,
                                          "error": f"{type(exc).__name__}: {exc}"})
+        if name == "raccoon":
+            result = _raccoon_checkin_result(result)
         # wb 国际版没有每日签到：它的每日收益是活跃对话打卡（30-50 分），
         # 由引擎对显式 uid 名单同步执行。签到动作在这里顺带把国际版未打卡的
         # 账号一并打卡，一次点击覆盖国内+国际。目标筛选必须用 lastDailyChat
@@ -2411,7 +3920,8 @@ class Handler(BaseHTTPRequestHandler):
                 "qoder": ("/tasks/run", "领取全部福利（每日 Credits + 活动 + Pro 包）")},
         "claim": {"workbuddy": ("/tasks/claim", "领取已完成任务的奖励")},
         "travel": {"workbuddy": ("/tasks/travel", "猫猫旅行（派出/领奖闭环）"),
-                   "qoder": ("/tasks/travel", "猫猫旅行（派出/领奖闭环）")},
+                   "qoder": ("/tasks/travel", "猫猫旅行（派出/领奖闭环）"),
+                   "trae": ("/tasks/travel", "领取 Pro 福利包（官方国内版）")},
         "night": {"workbuddy": ("/tasks/night", "夜猫子任务（仅 23:00-08:00 计数）")},
         "streak-bonus": {"workbuddy": ("/tasks/streak-bonus", "连登管家奖励")},
         "daily-web": {"workbuddy": ("/accounts/daily-chat-web", "国际版网页通道补打卡")},
@@ -2420,7 +3930,9 @@ class Handler(BaseHTTPRequestHandler):
     def _api_tasks_get(self, name):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up:
-            return self._deny(404, f"未知平台 `{name}`（可用: workbuddy, qoder, qwenwork）")
+            return self._deny(404, f"未知平台 `{name}`（可用: workbuddy, qoder, qwenwork, raccoon, trae）")
+        if not platform_enabled(name):
+            return self._deny(409, f"平台 `{name}` 已在控制台停用（设置页可重新启用）")
         if name == "qwenwork":
             return self._send_json(200, {"ok": True, "platform": name, "tasks": [],
                 "note": "千问办公的每日积分由上游自动发放，无任务体系"})
@@ -2461,7 +3973,24 @@ class Handler(BaseHTTPRequestHandler):
                 status = engine_request(
                     up, "GET", f"/tasks?uid={quote(str(uid), safe='')}", timeout=60)
                 tasks = status.get("tasks") if isinstance(status, dict) else status
-                codes = [t.get("task_code") for t in (tasks or [])
+                if isinstance(status, dict) and status.get("ok") is False:
+                    row["error"] = str(status.get("error") or "任务列表查询失败")
+                    accounts.append(row)
+                    continue
+                if tasks is None:
+                    # 明确的空列表是「没有待领奖任务」；缺失/非法字段是
+                    # 查询响应格式错误，不能把业务失败伪装成成功跳过。
+                    if isinstance(status, dict) and isinstance(status.get("tasks"), list):
+                        tasks = []
+                    else:
+                        row["error"] = "任务列表响应缺少 tasks 数组"
+                        accounts.append(row)
+                        continue
+                if not isinstance(tasks, list):
+                    row["error"] = "任务列表响应 tasks 不是数组"
+                    accounts.append(row)
+                    continue
+                codes = [t.get("task_code") for t in tasks
                          if isinstance(t, dict) and t.get("status") == "accepted"
                          and _num(t.get("current")) >= _num(t.get("target")) > 0]
                 if not codes:
@@ -2490,6 +4019,8 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up:
             return self._deny(404, f"未知平台 `{name}`")
+        if not platform_enabled(name):
+            return self._deny(409, f"平台 `{name}` 已在控制台停用（设置页可重新启用）")
         spec = self.TASK_ACTIONS.get(action, {}).get(name)
         if not spec:
             return self._deny(400, f"平台 `{name}` 不支持任务操作 `{action}`")
@@ -2518,7 +4049,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"platform": name, "action": action,
                                   "label": label, "result": result, **_action_status(result)})
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")[:300]
+            detail = _http_error_detail(exc, 300)
             self._send_json(502, {"ok": False, "platform": name, "action": action,
                                   "error": f"HTTP {exc.code}: {detail}"})
         except Exception as exc:
@@ -2538,7 +4069,11 @@ class Handler(BaseHTTPRequestHandler):
             "updates", "updates/check",
         },
         "qoder": {"accounts/refresh", "accounts/credits", "accounts/test"},
+        "trae": {"accounts/refresh", "accounts/credits", "accounts/test",
+                 "scheduler/trigger", "tasks/run", "tasks/travel"},
         "qwenwork": {"admin/accounts/keepalive-all", "admin/credit-summary"},
+        "raccoon": {"panel/api/checkin_all", "panel/api/balance_all",
+                    "panel/api/keepalive_all"},
     }
 
     def _api_engine(self):
@@ -2551,21 +4086,25 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up:
             return self._deny(404, f"未知平台 `{name}`")
+        if not platform_enabled(name):
+            return self._deny(409, f"平台 `{name}` 已在控制台停用（设置页可重新启用）")
         allowed = self.ENGINE_WHITELIST.get(name, set())
         if path not in allowed:
             return self._deny(403, f"路径 `{path}` 不在 {name} 的自动化白名单内")
         method = str(body.get("method") or "POST").upper()
         payload = body.get("body") if isinstance(body.get("body"), dict) else {}
         # 每日活跃/成长任务这类要在引擎里跑真实会话的操作，耗时可能几分钟
-        timeout = 300 if ("daily-chat" in path or path.startswith("tasks/")) else 60
+        timeout = 300 if ("daily-chat" in path or "checkin_all" in path
+                          or path.startswith("tasks/")) else 60
         try:
-            auth = "none" if name == "qwenwork" else "panel"
+            auth = ("none" if name == "qwenwork"
+                    else "bearer" if name == "raccoon" else "panel")
             result = engine_request(up, method, "/" + path, payload, auth=auth, timeout=timeout)
             log(f"engine[{name}] {method} /{path} completed")
             self._send_json(200, {"platform": name, "path": path,
                                   "result": result, **_action_status(result)})
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")[:300]
+            detail = _http_error_detail(exc, 300)
             self._send_json(502, {"ok": False, "platform": name, "path": path,
                                   "error": f"HTTP {exc.code}: {detail}"})
         except Exception as exc:
@@ -2584,7 +4123,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True,
                 "hide_pro_locked": bool(CONFIG.get("hide_pro_locked", True)),
                 "wb_dual_prefer": (CONFIG.get("wb_dual_prefer") or "auto").lower(),
-                "wb_realms": (_wb_pool_state().get("realms") or {})})
+                "disabled_platforms": sorted(_disabled_platforms()),
+                "wb_realms": ((_wb_pool_state().get("realms") or {})
+                              if platform_enabled("workbuddy") else {})})
         body = self._post_body
         updates = {}
         if "hide_pro_locked" in body:
@@ -2601,6 +4142,96 @@ class Handler(BaseHTTPRequestHandler):
             save_config()
         log(f"gwconfig 更新: {json.dumps(updates, ensure_ascii=False)}")
         self._send_json(200, {"ok": True, **updates})
+
+    def _api_platforms(self):
+        """GET /api/platforms 读平台开关与进程状态；POST 切换启用或启停进程。
+
+        POST 两种形状：
+          {name, enabled: bool}        网关层启用/停用；停用会同时尝试停止引擎进程
+          {name, action: start|stop}   按 launch 配置启停引擎进程
+        """
+        if self.command == "GET":
+            items = []
+            for up in CONFIG["upstreams"]:
+                proc = _platform_process(up)
+                raw_launch = up.get("launch") if isinstance(up.get("launch"), dict) else {}
+                items.append({
+                    "name": up["name"],
+                    "enabled": platform_enabled(up["name"]),
+                    "base_url": up.get("base_url", ""),
+                    "launch_configured": proc.pop("launch_configured", False),
+                    "launch": ({"command": raw_launch.get("command"),
+                                "cwd": raw_launch.get("cwd"),
+                                "timeout": raw_launch.get("timeout")}
+                               if raw_launch else None),
+                    "process": proc,
+                })
+            return self._send_json(200, {"ok": True, "platforms": items,
+                                         "disabled": sorted(_disabled_platforms())})
+        body = self._post_body
+        name = str(body.get("name") or "").strip()
+        up = _upstream_by_name(name)
+        if not up:
+            return self._deny(404, f"未知平台 `{name}`")
+        if "launch" in body:
+            launch = body.get("launch")
+            if launch is None:
+                up.pop("launch", None)
+            elif isinstance(launch, dict):
+                candidate = {"command": launch.get("command"),
+                             "cwd": launch.get("cwd") or None,
+                             "timeout": launch.get("timeout") or 30}
+                # 控制台只编辑命令/目录；env 由 config.json 维护，别在保存时丢掉
+                # （例如 Trae 的 QODER_DISABLE / 默认区域）。
+                old_env = (up.get("launch") or {}).get("env") \
+                    if isinstance(up.get("launch"), dict) else None
+                if isinstance(old_env, dict) and old_env:
+                    candidate["env"] = old_env
+                if _launch_spec({"name": name, "launch": candidate}) is None:
+                    return self._deny(400, "启动命令无效：command 需要字符串或非空数组，cwd 必须存在")
+                up["launch"] = candidate
+            else:
+                return self._deny(400, "launch 必须是对象或 null")
+            with _config_lock:
+                save_config()
+            log(f"platform[{name}] launch 已更新")
+            return self._send_json(200, {"ok": True, "platform": name,
+                                         "launch_configured": _launch_spec(up) is not None})
+        action = str(body.get("action") or "").strip().lower()
+        if action in ("start", "stop"):
+            result = _start_platform(up) if action == "start" else _stop_platform(up)
+            if not result.get("ok"):
+                return self._send_json(409, {"ok": False, "platform": name,
+                                             "action": action,
+                                             "error": result.get("error", "")})
+            log(f"platform[{name}] {action}: {json.dumps(result, ensure_ascii=False)}")
+            return self._send_json(200, {"ok": True, "platform": name,
+                                         "action": action, **result})
+        if "enabled" in body:
+            enabled = bool(body.get("enabled"))
+            disabled = _set_platform_enabled(name, enabled)
+            process = None
+            if enabled:
+                # 打开开关 = 引擎也要起来：没在跑就按 launch 启动。
+                if not _upstream_health(up):
+                    if _launch_spec(up):
+                        process = _start_platform(up)
+                    else:
+                        process = {"ok": False,
+                                   "error": "未配置启动命令，平台已启用但引擎未启动"}
+                log(f"platform[{name}] 启用后启动进程: "
+                    f"{json.dumps(process, ensure_ascii=False)}")
+            else:
+                # 关掉开关 = 引擎也停。先确认端口上的进程属于该平台再停；
+                # 确认不了只停网关侧，把原因带回给前端。
+                process = _stop_platform(up, allow_external=True)
+                log(f"platform[{name}] 停用后停止进程: "
+                    f"{json.dumps(process, ensure_ascii=False)}")
+            log(f"platform[{name}] {'启用' if enabled else '停用'}; disabled={disabled}")
+            return self._send_json(200, {"ok": True, "platform": name,
+                                         "enabled": enabled, "disabled": disabled,
+                                         "process": process})
+        return self._deny(400, "需要 enabled 或 action=start|stop")
 
     # ---- 聚合请求日志 ----
 
@@ -2626,6 +4257,12 @@ class Handler(BaseHTTPRequestHandler):
             speed = None
         # credit 数值化：上游若回字符串会让前端聚合变字符串拼接、toFixed 崩溃
         raw_credit = row.get("credit")
+        if not isinstance(raw_credit, (int, float)) or isinstance(raw_credit, bool):
+            raw_credit = None
+        # Trae usage_missing 行或未明确报告 credit 的旧行都不能视为免费。
+        # estimated cost_cny 是公开价参考，不是积分结算，不参与估值。
+        if name == "trae" and (row.get("usage_missing") or not row.get("credit_reported")):
+            raw_credit = None
         try:
             credit = None if raw_credit is None else float(raw_credit)
         except (TypeError, ValueError):
@@ -2657,6 +4294,9 @@ class Handler(BaseHTTPRequestHandler):
             "reasoning": _num(row.get("reasoning_tokens")),
             "total": _num(row.get("total_tokens")) or (_num(row.get("prompt_tokens")) + _num(row.get("completion_tokens"))),
             "credit": credit,
+            "credit_reported": bool(row.get("credit_reported")) if name == "trae" else credit is not None,
+            "credit_source": ("upstream_usage" if name == "trae" and row.get("credit_reported")
+                              else row.get("credit_source")),
             "cost_cny": cost_cny,
             "elapsed_ms": row.get("elapsed_ms") if row.get("elapsed_ms") is not None else row.get("duration_ms"),
             "ttft_ms": row.get("ttft_ms"),
@@ -2676,13 +4316,37 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             limit = 60
         rows, errors, usd_cny = [], {}, None
-        for up in CONFIG["upstreams"]:
+        for up in active_upstreams():
             name = up["name"]
             try:
                 uid_names = {}
                 if name == "qwenwork":
                     data = engine_request(up, "GET", f"/admin/logs?limit={limit}", auth="none")
                     items = data if isinstance(data, list) else data.get("items") or data.get("logs") or []
+                elif name == "raccoon":
+                    # xhx2api 没有 /usage/recent：逐条请求在 /panel/api/requests，
+                    # 事件里没有 credit / cached，保持未知而不是补 0。
+                    data = engine_request(up, "GET", f"/panel/api/requests?limit={limit}",
+                                          auth="bearer", timeout=30)
+                    events = (data.get("events") if isinstance(data, dict) else data) or []
+                    items = []
+                    for e in events:
+                        if not isinstance(e, dict):
+                            continue
+                        status = e.get("status")
+                        items.append({
+                            "at": _iso_epoch(e.get("time")),
+                            "model": e.get("model") or "",
+                            "account": e.get("account") or e.get("uid") or "",
+                            "stream": e.get("stream"),
+                            "prompt_tokens": e.get("prompt_tokens") or 0,
+                            "completion_tokens": e.get("completion_tokens") or 0,
+                            "total_tokens": e.get("total_tokens") or 0,
+                            "elapsed_ms": e.get("duration_ms"),
+                            "ttft_ms": e.get("ttfb_ms"),
+                            "outcome": ("ok" if status == 200
+                                        else (e.get("error_kind") or f"http {status}")),
+                        })
                 else:
                     try:  # uid -> 昵称映射，让日志显示人名而不是一串 uuid；
                         # realm=all 才是全池（默认视图漏国际账号）
@@ -2696,18 +4360,37 @@ class Handler(BaseHTTPRequestHandler):
                         # wb 的 /usage/recent 只回当前面板区域，必须双区各拉一份合并，
                         # 否则国际版调用在用量页彻底消失
                         items = []
+                        realm_errors = []
                         for realm in ("cn", "intl"):
-                            d2 = engine_request(up, "GET", f"/usage/recent?realm={realm}&limit={limit}")
-                            r2 = d2.get("rows") if isinstance(d2, dict) else d2
-                            items.extend(r2 or [])
-                            if isinstance(d2, dict) and d2.get("usd_cny"):
-                                usd_cny = d2.get("usd_cny")
+                            try:
+                                d2 = engine_request(
+                                    up, "GET", f"/usage/recent?realm={realm}&limit={limit}")
+                                r2 = d2.get("rows") if isinstance(d2, dict) else d2
+                                items.extend(r2 or [])
+                                if isinstance(d2, dict) and d2.get("usd_cny"):
+                                    usd_cny = d2.get("usd_cny")
+                            except Exception as exc:
+                                realm_errors.append(f"{realm}: {type(exc).__name__}: {exc}")
+                        if realm_errors:
+                            errors[name] = "; ".join(realm_errors)
+                        normed = [self._norm_usage_row(name, r) for r in items if isinstance(r, dict)]
+                        for r in normed:
+                            r["account"] = uid_names.get(r["account"]) or r["account"]
+                        rows.extend(normed)
+                        continue
+
                     else:
                         data = engine_request(up, "GET", f"/usage/recent?limit={limit}")
                         items = data.get("rows") if isinstance(data, dict) else data
                         items = items or []
                         if isinstance(data, dict) and data.get("usd_cny"):
                             usd_cny = data.get("usd_cny")
+                        if name == "trae":
+                            # trae2api-hub 只把成功请求写进 usage.jsonl；行里没有
+                            # outcome/status 字段，补成 ok 才能被前端算进成功数。
+                            for item in items:
+                                if isinstance(item, dict) and not item.get("outcome"):
+                                    item["outcome"] = "ok"
                 normed = [self._norm_usage_row(name, r) for r in items if isinstance(r, dict)]
                 for r in normed:
                     r["account"] = uid_names.get(r["account"]) or r["account"]
@@ -2719,12 +4402,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- OAuth 添加账号 ----
 
-    LOGIN_START = {"workbuddy": {"platform": "CLI"}, "qoder": {}}
+    LOGIN_START = {"workbuddy": {"platform": "CLI"}, "qoder": {}, "trae": {}}
 
     def _api_login_start(self, name):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
         if not up or name == "qwenwork":
             return self._deny(400, "千问办公没有 OAuth 流程：在官方客户端登录后点「重新检测并导入」")
+        if not platform_enabled(name):
+            return self._deny(409, f"平台 `{name}` 已在控制台停用（设置页可重新启用）")
         body = self._post_body
         spec = self.LOGIN_START.get(name)
         if spec is None:  # 配置了上游但没配 OAuth 流程的平台名，别 KeyError 崩线程；
@@ -2737,8 +4422,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = engine_request(up, "POST", "/accounts/login/start", payload)
             log(f"login/start[{name}] realm={realm} state={result.get('state')}")
+            # hub 系引擎用 authUrl；trae2api-hub 的 OAuth 返回
+            # authorization_url / verification_uri，这里统一成 authUrl。
+            auth_url = (result.get("authUrl") or result.get("auth_url")
+                        or result.get("authorization_url")
+                        or result.get("verification_uri"))
             self._send_json(200, {"ok": True, "platform": name, "state": result.get("state"),
-                                  "authUrl": result.get("authUrl")})
+                                  "authUrl": auth_url})
         except Exception as exc:
             self._send_json(502, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -2751,6 +4441,8 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == up_name), None)
         if not up or not state or up_name == "qwenwork":
             return self._deny(400, "需要 platform 与 state 参数")
+        if not platform_enabled(up_name):
+            return self._deny(409, f"平台 `{up_name}` 已在控制台停用（设置页可重新启用）")
         try:
             result = engine_request(up, "GET",
                                     "/accounts/login/poll?state=" + quote(state, safe=""))
@@ -2762,6 +4454,8 @@ class Handler(BaseHTTPRequestHandler):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == "qwenwork"), None)
         if not up:
             return self._deny(404, "未配置 qwenwork 上游")
+        if not platform_enabled("qwenwork"):
+            return self._deny(409, "平台 `qwenwork` 已在控制台停用（设置页可重新启用）")
         try:
             disc = engine_request(up, "GET", "/admin/accounts/discover?channel=qwenwork", auth="none")
             token = disc.get("preview_token") or ""
@@ -2775,6 +4469,121 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "result": result})
         except Exception as exc:
             self._send_json(502, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _raccoon_upstream(self):
+        up = _upstream_by_name("raccoon")
+        if not up:
+            self._deny(404, "未配置 raccoon 上游（config.json upstreams[]）")
+            return None
+        if not platform_enabled("raccoon"):
+            self._deny(409, "平台 `raccoon` 已在控制台停用（设置页可重新启用）")
+            return None
+        return up
+
+    def _api_raccoon_scan(self):
+        """扫描本机小浣熊客户端登录态；只回候选元数据，token 不带到浏览器。"""
+        up = self._raccoon_upstream()
+        if up is None:
+            return
+        try:
+            data = engine_request(up, "GET", "/panel/api/accounts/scan",
+                                  auth="bearer", timeout=30)
+        except Exception as exc:
+            return self._send_json(502, {"ok": False,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+        items = (data.get("candidates") if isinstance(data, dict) else data) or []
+        self._send_json(200, {
+            "ok": True, "items": items,
+            "locations": (data.get("locations") or []) if isinstance(data, dict) else [],
+        })
+
+    def _api_raccoon_import(self):
+        """导入扫描到的客户端凭证；路径由前端从扫描结果带回，凭证不经过网关。"""
+        up = self._raccoon_upstream()
+        if up is None:
+            return
+        paths = self._post_body.get("paths")
+        if (not isinstance(paths, list) or not paths
+                or not all(isinstance(p, str) and p.strip() for p in paths)):
+            return self._deny(400, "需要 paths 数组（扫描结果里的文件路径）")
+        if len(paths) > 20:
+            return self._deny(400, "一次最多导入 20 个文件")
+        try:
+            result = engine_request(up, "POST", "/panel/api/accounts/scan/import",
+                                    {"paths": paths}, auth="bearer", timeout=120)
+        except urllib.error.HTTPError as exc:
+            # 引擎在“一个都没导入成功”时回 400，但 body 里仍有逐条原因；
+            # 转成 200 + ok=false，前端才能把每个文件的失败原因显示出来。
+            try:
+                data = json.loads(_http_error_detail(exc, 64 * 1024))
+            except (ValueError, OSError):
+                data = {}
+            return self._send_json(200, {
+                "ok": False,
+                "imported": data.get("imported") or 0,
+                "results": data.get("results") or [],
+                "error": data.get("error") or f"HTTP {exc.code}",
+            })
+        except Exception as exc:
+            return self._send_json(502, {"ok": False,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+        imported = int(result.get("imported") or 0) if isinstance(result, dict) else 0
+        log(f"raccoon import -> {imported} account(s)")
+        self._send_json(200, {
+            "ok": imported > 0, "imported": imported,
+            "results": (result.get("results") or []) if isinstance(result, dict) else [],
+        })
+
+    def _api_raccoon_login_start(self):
+        """生成小浣熊官方浏览器授权链接（引擎 /panel/api/login/device/start）。"""
+        up = self._raccoon_upstream()
+        if up is None:
+            return
+        try:
+            result = engine_request(up, "POST", "/panel/api/login/device/start", {},
+                                    auth="bearer", timeout=20)
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc, 300)
+            return self._send_json(502, {"ok": False,
+                                         "error": f"HTTP {exc.code}: {detail}"})
+        except Exception as exc:
+            return self._send_json(502, {"ok": False,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+        if not isinstance(result, dict):  # 引擎回 200 但 body 不是对象时别让 .get 崩掉
+            result = {}
+        state = str(result.get("id") or "").strip()
+        auth_url = str(result.get("url") or "").strip()
+        if not state or not auth_url:
+            return self._send_json(502, {"ok": False,
+                                         "error": "小浣熊授权响应缺少会话 ID 或授权链接"})
+        self._send_json(200, {"ok": True, "state": state,
+                              "authUrl": auth_url})
+
+    def _api_raccoon_login_poll(self):
+        """轮询浏览器授权是否完成；完成后引擎自动把账号入池。"""
+        up = self._raccoon_upstream()
+        if up is None:
+            return
+        from urllib.parse import parse_qs, quote  # 局部导入，和 _api_login_poll 一致
+        params = parse_qs(urlsplit(self.path).query)
+        state = (params.get("state") or [""])[0].strip()
+        if not state:
+            return self._deny(400, "需要 state 参数")
+        try:
+            result = engine_request(
+                up, "GET", "/panel/api/login/device/poll?id=" + quote(state, safe=""),
+                auth="bearer", timeout=35)
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc, 300)
+            return self._send_json(502, {"ok": False,
+                                         "error": f"HTTP {exc.code}: {detail}"})
+        except Exception as exc:
+            return self._send_json(502, {"ok": False,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+        if not isinstance(result, dict) or type(result.get("done")) is not bool:
+            return self._send_json(502, {"ok": False,
+                                         "error": "小浣熊授权轮询响应格式无效：缺少 done 状态"})
+        self._send_json(200, {"ok": True, "result": result})
 
     def _models(self):
         hidden_count = len(_hidden_set())
@@ -2854,16 +4663,17 @@ class Handler(BaseHTTPRequestHandler):
         # 媒体模型并进同一张目录表（带 media 标记），可见性/批量操作与聊天
         # 模型共用 hidden_models；但 /v1/models 不会列出它们。
         for m in public_media_catalog():
-            full = f"workbuddy/{m['public']}"
+            platform = m.get("platform") or "workbuddy"
+            full = f"{platform}/{m['public']}"
             mult = None
             if full in custom:
                 mult = {"factor": custom[full].get("factor"), "source": "manual",
                         "note": custom[full].get("note", ""),
                         "recorded_at": custom[full].get("recorded_at", "")}
             items.append({
-                "id": full, "platform": "workbuddy", "model": m["public"],
+                "id": full, "platform": platform, "model": m["public"],
                 "upstream": m["upstream"], "alt": m["name"], "desc": "",
-                "hidden": _model_hidden("workbuddy", m["public"]),
+                "hidden": _model_hidden(platform, m["public"]),
                 "fav": full in favorites,
                 "requires_pro": False,
                 "realms": m["realms"],
@@ -2915,7 +4725,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._deny(400, "需要 id（平台/模型 全名）")
         # 校验 id 在公共目录里存在，防止手滑记到不存在的模型上变孤儿数据
         known = (any(f"{x['platform']}/{x['public']}" == mid for x in public_catalog())
-                 or any(f"workbuddy/{m['public']}" == mid for m in public_media_catalog()))
+                 or any(f"{m.get('platform') or 'workbuddy'}/{m['public']}" == mid
+                        for m in public_media_catalog()))
         if not known:
             return self._deny(404, f"模型 `{mid}` 不在当前目录里（千问办公渠道只有 qwen 系模型）")
         try:
@@ -2956,8 +4767,10 @@ class Handler(BaseHTTPRequestHandler):
             # `qwenwork/qwenwork/flash` 这类垃圾键且对剥前缀的条目不生效
             platform_names = [f"{x['platform']}/{x['public']}" for x in public_catalog()
                               if x["platform"] == up["name"]]
-            if up["name"] == "workbuddy":
-                platform_names += [f"workbuddy/{m['public']}" for m in public_media_catalog()]
+            if up["name"] in ("workbuddy", "raccoon"):
+                platform_names += [f"{m.get('platform') or 'workbuddy'}/{m['public']}"
+                                   for m in public_media_catalog()
+                                   if (m.get("platform") or "workbuddy") == up["name"]]
         with _config_lock:
             hidden = _hidden_set()
             if "ids" in body:
@@ -2994,21 +4807,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _health(self):
         platforms = {}
-        for up in CONFIG["upstreams"]:
-            try:
-                req = urllib.request.Request(up["base_url"].rstrip("/") + "/health")
-                with _urlopen(req, timeout=5) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                # 各引擎 health 形状不同：hub 系 {"ok": true}，Buddy2api {"status": "ok"}。
-                if "ok" in body:
-                    platforms[up["name"]] = bool(body.get("ok"))
-                elif "status" in body:
-                    platforms[up["name"]] = body.get("status") == "ok"
-                else:
-                    platforms[up["name"]] = True
-            except Exception:
-                platforms[up["name"]] = False
-        self._send_json(200, {"ok": all(platforms.values()), "version": VERSION, "platforms": platforms})
+        for up in active_upstreams():
+            # 与平台状态共用同一套健康检查（raccoon 用 /healthz，其余用 /health）。
+            platforms[up["name"]] = _upstream_health(up, timeout=5)
+        self._send_json(200, {"ok": all(platforms.values()), "version": VERSION,
+                              "platforms": platforms,
+                              "disabled": sorted(_disabled_platforms())})
 
 
 def _rewrite_sse_model(chunk, model):
@@ -3077,7 +4881,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 
 def main():

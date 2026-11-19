@@ -1,13 +1,16 @@
 """Offline regression tests. No credentials, sockets or upstream requests."""
 import ast
+import hashlib
 import io
 import json
+from datetime import datetime
 from pathlib import Path
 import re
 import secrets
 import threading
 import time
 import unittest
+from urllib.parse import quote
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler
 
@@ -38,11 +41,29 @@ class GatewayTests(unittest.TestCase):
         self.ns = isolated(ROOT / "router.py", {
             "_rewrite_sse_model", "_rewrite_sse_chunks", "forward", "_action_status", "Handler",
             "_num", "_known_num", "_checkin_tally", "_wb_route_realm", "_wb_usable_realms",
-            "_estimate_public_model", "_qwen_rate_spec", "estimate_snapshot",
-            "_row_multiplier",
-            "_media_link_signature", "_media_download_allowed"},
-            {"QWEN_MODEL_RATES": {}, "hashlib": __import__('hashlib'),
+            "_wb_known_no_account", "estimate_snapshot", "_credit_rate", "_wallet_rate",
+            "_read_wallet_history", "_estimate_public_model", "_qwen_sample",
+            "_row_multiplier", "normalize_wb", "normalize_qoder", "_wb_account_realms",
+            "_wb_pool_fetch", "_wb_dual_prefer", "normalize_raccoon", "_shanghai_today",
+            "_raccoon_checkin_result", "_iso_epoch", "normalize_trae",
+            "_disabled_platforms", "platform_enabled", "active_upstreams", "_upstream_by_name",
+            "_launch_spec", "_raccoon_billing_rows", "_read_raccoon_billing_links",
+            "_attach_raccoon_bills", "_record_raccoon_billing_link",
+            "_raccoon_bill_link_for_request", "_raccoon_response_id",
+            "_estimate_at", "_action_status", "_request_target",
+            "_media_supports_tag",
+            "_media_link_signature", "_media_download_allowed",
+            "_media_multipart_reject"},
+            {"QWEN_WALLET_HISTORY": "", "RACCOON_WALLET_HISTORY": "",
+             "TRAE_WALLET_HISTORY": "", "RACCOON_BILLING_LINKS": "",
+             "_estimate_context": type("EstimateContext", (), {})(),
+             "os": __import__('os'), "HERE": str(ROOT),
+             "_config_lock": threading.RLock(),
+             "QWEN_MODEL_PRICES": constant(ROOT / "router.py", "QWEN_MODEL_PRICES"),
+             "hashlib": __import__('hashlib'),
              "hmac": __import__('hmac'), "_media_link_secret": b'offline-test-only',
+             "datetime": datetime,
+             "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
              "MEDIA_POST_PATHS": constant(ROOT / "router.py", "MEDIA_POST_PATHS")})
 
     def test_loopback_bypasses_proxy(self):
@@ -105,6 +126,24 @@ class GatewayTests(unittest.TestCase):
         row = self.ns['Handler']._norm_usage_row(None, 'qwenwork', {'prompt_tokens':100,'total_tokens':100})
         self.assertIsNone(row['cached'])
 
+    def test_cache_known(self):
+        for value, expected in ((80, 80), (0, 0)):
+            row = self.ns['Handler']._norm_usage_row(
+                None, 'qwenwork',
+                {'prompt_tokens':100,'total_tokens':100,'cached_tokens':value})
+            self.assertEqual(row['cached'], expected)
+
+    def test_bearer_scheme_is_case_insensitive(self):
+        import email.message
+        self.ns['CONFIG'] = {'api_key': 'synthetic-only'}
+        handler = object.__new__(self.ns['Handler'])
+        for header in ('Bearer synthetic-only', 'bearer synthetic-only',
+                       'BEARER synthetic-only', 'Bearer  synthetic-only'):
+            handler.headers = email.message.Message()
+            handler.headers['Authorization'] = header
+            with self.subTest(header=header):
+                self.assertTrue(handler._authorized())
+
     def test_anthropic_key(self):
         self.ns['CONFIG']={'api_key':'synthetic-only'}
         obj=object.__new__(self.ns['Handler'])
@@ -120,95 +159,714 @@ class GatewayTests(unittest.TestCase):
     def test_unknown_cost_is_not_estimated(self):
         self.ns.update(_estimate_lock=threading.Lock(),_estimate_cache={'data':None},ESTIMATE_TTL=120,
             CONFIG={'upstreams':[{'name':'qwenwork'}]},
-            public_catalog=lambda:[{'platform':'qwenwork','public':'mystery-model','upstream':'mystery-model'}],
+            public_catalog=lambda:[{'platform':'qwenwork','public':'pro','upstream':'pro','row':{}}],
             platform_status=lambda _: {'health':True,'accounts':[{'enabled':True,'remain':100}]},
-            _estimate_rows=lambda _: [{'created_at':time.time(),'model':'mystery-model','total_tokens':2000}],
-            _estimate_at=lambda r:r['created_at'],_model_hidden=lambda *_:False)
-        result=self.ns['estimate_snapshot'](True)
-        self.assertIsNone(result['platforms'][0]['models'][0]['est_tokens'])
+            _estimate_rows=lambda _: [{'created_at':time.time(),'model':'pro','total_tokens':2000}],
+            _estimate_at=lambda r:r['created_at'],_model_hidden=lambda *_:False,
+            _read_wallet_history=lambda:[])
+        model=self.ns['estimate_snapshot'](True)['platforms'][0]['models'][0]
+        self.assertIsNone(model['rate_per_mtok'])
+        self.assertIsNone(model['est_tokens'])
+        self.assertIn('暂不估算',model['note'])
 
-    def estimate(self, accounts, rows=(),
-                 catalog=None, rates=None):
+    def estimate(self, accounts, rows=(), history=(), platform='qwenwork',
+                 catalog=None):
         self.ns.update(
             _estimate_lock=threading.Lock(), _estimate_cache={'data':None}, ESTIMATE_TTL=120,
-            QWEN_MODEL_RATES=rates or {},
-            CONFIG={'upstreams':[{'name':'qwenwork'}]},
+            CONFIG={'upstreams':[{'name':platform}]},
             public_catalog=lambda: catalog or [
-                {'platform':'qwenwork','public':'flash','upstream':'qwork-auto','row':{}}],
+                {'platform':platform,'public':'pro','upstream':'pro','row':{}}],
             platform_status=lambda _: {'health':True,'accounts':accounts},
             _estimate_rows=lambda _: list(rows), _estimate_at=lambda r:r['created_at'],
-            _model_hidden=lambda *_:False, _wb_usable_realms=lambda _:[])
+            _model_hidden=lambda *_:False, _read_wallet_history=lambda:list(history),
+            _wb_usable_realms=lambda _:['cn'])
         return self.ns['estimate_snapshot'](True)['platforms'][0]
 
-    def test_unknown_balance_stays_unknown_with_credit_sample(self):
-        rates={'qwork-auto':{'public':'flash','hit_per_ktok':0.001,'miss_per_ktok':0.01,
-                             'hit_rate':0.9}}
-        rows=[{'created_at':time.time(),'model':'qwork-auto','total_tokens':1000,'credit':1}]
-        item=self.estimate([{'enabled':True,'remain':None}], rows, rates=rates)
+    def test_unknown_balance_stays_unknown(self):
+        rows=[{'created_at':time.time(),'model':'q','total_tokens':1000,'credit':1}
+              for _ in range(3)]
+        catalog=[{'platform':'workbuddy','public':'q','upstream':'q','row':{}}]
+        item=self.estimate([{'enabled':True,'remain':None}], rows,
+                           platform='workbuddy', catalog=catalog)
         self.assertIsNone(item['balance'])
         self.assertEqual((item['known'],item['total']),(0,1))
         model=item['models'][0]
-        self.assertIsNone(model['model_balance'])
+        # 单价仍可由扣费样本算出，但余额未知时不出预计 token。
+        self.assertEqual(model['rate_per_mtok'],1000.0)
         self.assertIsNone(model['est_tokens'])
-        self.assertIsNone(model['est_tokens_opt'])
-        self.assertIsNone(model['est_tokens_floor'])
-        self.assertTrue(model['balance_unknown'])
-        self.assertIn('待测', model['note'])
-        item=self.estimate([{'enabled':True,'remain':0}], rates=rates)
-        self.assertEqual(item['balance'],0.0)
-        self.assertEqual((item['known'],item['total']),(1,1))
-        self.assertEqual(item['models'][0]['model_balance'],0.0)
-        self.assertIsNone(item['models'][0]['est_tokens'])
+        self.assertIn('待测',model['note'])
         item=self.estimate([{'enabled':True,'remain':None},{'enabled':True,'remain':5}],
-                           rates=rates)
-        self.assertEqual(item['balance'],5.0)
-        self.assertEqual((item['known'],item['total']),(1,2))
+                           rows, platform='workbuddy', catalog=catalog)
+        self.assertIsNone(item['balance'])
+        self.assertEqual(item['known_balance'],5.0)
+        self.assertFalse(item['balance_complete'])
+        self.assertIsNone(item['models'][0]['est_tokens'])
 
-    def test_qwen_estimate_uses_full_price_as_headline(self):
-        rates = constant(ROOT / 'router.py', 'QWEN_MODEL_RATES')
-        self.assertIn('qwork-auto', rates)
-        rates={'qwork-auto':{'public':'flash','hit_per_ktok':0.001,'miss_per_ktok':0.01,
-                             'hit_rate':0.9}}
-        for upstream in ('qwork-auto', 'flash', 'qwenwork/flash',
-                         'qwenwork/qwork-auto', 'qwenwork/qwenwork/flash'):
-            with self.subTest(upstream=upstream):
-                item=self.estimate([{'enabled':True,'remain':100}],
-                                   catalog=[{'platform':'qwenwork','public':'flash',
-                                             'upstream':upstream,'row':{}}],
-                                   rates=rates)
-                model=item['models'][0]
-                self.assertEqual(model['rate_source'], 'cache_assumed')
-                self.assertTrue(model['cache_assumed'])
-                self.assertEqual(model['cache_hit_rate'], 0.9)
-                # headline = 全价（零缓存）保守下限；缓存假设只作乐观参考
-                self.assertEqual(model['est_tokens'], 10_000_000)
-                self.assertIsNone(model['est_tokens_floor'])
-                self.assertGreater(model['est_tokens_opt'], model['est_tokens'])
-
-    def test_measured_rate_beats_catalog_and_carries_floor(self):
-        rows=[]
-        for _ in range(4):
-            rows.append({'created_at':time.time(),'model':'ds','total_tokens':10000,
-                         'prompt_tokens':9000,'completion_tokens':1000,
-                         'cached_tokens':8800,'credit':0.02})
-        self.ns.update(
-            _estimate_lock=threading.Lock(), _estimate_cache={'data':None}, ESTIMATE_TTL=120,
-            CONFIG={'upstreams':[{'name':'workbuddy'}]},
-            public_catalog=lambda:[{'platform':'workbuddy','public':'ds',
-                                    'upstream':'ds','row':{'credits':'x0.5'}}],
-            platform_status=lambda _: {'health':True,'accounts':[{'enabled':True,'remain':100}]},
-            _estimate_rows=lambda _: list(rows), _estimate_at=lambda r:r['created_at'],
-            _model_hidden=lambda *_:False, _wb_usable_realms=lambda _:['cn'],
-            _wb_realm_meta=lambda:{}, WB_INTL_ALIAS={})
-        item=self.ns['estimate_snapshot'](True)['platforms'][0]
+    def test_estimate_uses_measured_credit_rate(self):
+        rows=[{'created_at':time.time(),'model':'ds','total_tokens':10000,'credit':0.02}
+              for _ in range(4)]
+        item=self.estimate([{'enabled':True,'remain':100,'realm':'cn'}], rows,
+                           platform='workbuddy',
+                           catalog=[{'platform':'workbuddy','public':'ds',
+                                     'upstream':'ds','row':{}}])
         model=item['models'][0]
         self.assertEqual(model['rate_source'],'measured')
-        # 有效单价 0.08/40000*1000*... = 0.002/ktok → 100 分 ≈ 5000 万 token
-        self.assertEqual(model['est_tokens'], 50_000_000)
-        # 全价 = 0.08 / (4×1200 billed) = 0.0167/ktok → 下限 600 万
-        self.assertEqual(model['est_tokens_floor'], 6_000_000)
-        self.assertGreater(model['est_tokens'], model['est_tokens_floor'])
-        self.assertIn('扣费样本', model['note'])
+        self.assertEqual(model['rate_per_mtok'],2.0)
+        self.assertEqual(model['samples'],4)
+        self.assertEqual(model['sample_tokens'],40000)
+        self.assertEqual(model['est_tokens'],50_000_000)
+        self.assertIn('Σ实扣',model['note'])
+
+    def test_qwen_model_without_sample_price_is_unknown(self):
+        now=time.time()
+        rows=[{'created_at':now-3600,'account_name':'a','total_tokens':5_000_000}]
+        history=[{'ts':now-7200,'account':'a','balance':1000.0},
+                 {'ts':now-60,'account':'a','balance':500.0}]
+        item=self.estimate([{'enabled':True,'remain':900}], rows, history,
+                           catalog=[{'platform':'qwenwork','public':'pro',
+                                     'upstream':'pro','row':{}}])
+        model=item['models'][0]
+        self.assertIsNone(model['rate_per_mtok'])
+        self.assertIsNone(model['est_tokens'])
+        self.assertIn('无短样本价',model['note'])
+
+    def test_qwen_prices_are_anchored_to_wallet_rate(self):
+        self.ns['QWEN_MODEL_PRICES'] = {
+            'm1': {'public':'m1','miss_per_ktok':0.05},
+            'm2': {'public':'m2','miss_per_ktok':0.01},
+        }
+        now=time.time()
+        rows=[{'created_at':now-3600,'account_name':'a','total_tokens':5_000_000,'model':'m1'},
+              {'created_at':now-3600,'account_name':'a','total_tokens':5_000_000,'model':'m2'}]
+        history=[{'ts':now-7200,'account':'a','balance':1000.0},
+                 {'ts':now-60,'account':'a','balance':400.0}]
+        catalog=[{'platform':'qwenwork','public':'m1','upstream':'m1','row':{}},
+                 {'platform':'qwenwork','public':'m2','upstream':'m2','row':{}}]
+        item=self.estimate([{'enabled':True,'remain':100}], rows, history,
+                           catalog=catalog)
+        by={m['model']:m for m in item['models']}
+        self.assertEqual(by['m1']['rate_source'],'anchored')
+        self.assertAlmostEqual(by['m1']['rate_per_mtok'],100.0)
+        self.assertAlmostEqual(by['m2']['rate_per_mtok'],20.0)
+        self.assertEqual(by['m1']['est_tokens'],1_000_000)
+        self.assertEqual(by['m2']['est_tokens'],5_000_000)
+        self.assertIn('锚定',by['m1']['note'])
+
+    def test_model_with_insufficient_samples_is_unknown(self):
+        rows=[{'created_at':time.time(),'model':'other','total_tokens':10000,'credit':0.02}
+              for _ in range(4)]
+        catalog=[{'platform':'workbuddy','public':'other','upstream':'other','row':{}},
+                 {'platform':'workbuddy','public':'thin','upstream':'thin','row':{}}]
+        item=self.estimate([{'enabled':True,'remain':100,'realm':'cn'}], rows,
+                           platform='workbuddy', catalog=catalog)
+        by={m['model']:m for m in item['models']}
+        self.assertIsNotNone(by['other']['est_tokens'])
+        self.assertIsNone(by['thin']['rate_per_mtok'])
+        self.assertIsNone(by['thin']['est_tokens'])
+        self.assertIn('样本不足',by['thin']['note'])
+
+    def test_wallet_rate_skips_topups_and_insufficient_samples(self):
+        now=time.time()
+        rows=[{'created_at':now-3600,'account_name':'a','total_tokens':200_000}]
+        history=[{'ts':now-7200,'account':'a','balance':100.0},
+                 {'ts':now-60,'account':'a','balance':150.0}]
+        item=self.estimate([{'enabled':True,'remain':100}], rows, history,
+                           catalog=[{'platform':'qwenwork','public':'pro',
+                                     'upstream':'pro','row':{}}])
+        self.assertIsNone(item['models'][0]['rate_per_mtok'])
+        self.assertIsNone(item['models'][0]['est_tokens'])
+
+    def test_estimate_zero_balance_is_zero_tokens(self):
+        rows=[{'created_at':time.time(),'model':'q','total_tokens':1000,'credit':1}
+              for _ in range(3)]
+        item=self.estimate([{'enabled':True,'remain':0}], rows,
+                           platform='qoder',
+                           catalog=[{'platform':'qoder','public':'q',
+                                     'upstream':'q','row':{}}])
+        self.assertEqual(item['balance'],0.0)
+        self.assertEqual(item['models'][0]['est_tokens'],0)
+
+    def test_catalog_multiplier_is_not_absolute_price(self):
+        self.estimate([{'enabled':True,'remain':100}])
+        self.ns.update(CONFIG={'upstreams':[{'name':'qoder'}]},
+            public_catalog=lambda:[{'platform':'qoder','public':'m','upstream':'m',
+                                    'row':{'price_factor':0.5}}],
+            _estimate_rows=lambda _: [{'created_at':time.time(),'model':'m',
+                                       'total_tokens':2000}],
+            _estimate_at=lambda r:r['created_at'])
+        model=self.ns['estimate_snapshot'](True)['platforms'][0]['models'][0]
+        self.assertIsNone(model['rate_per_mtok'])
+        self.assertIsNone(model['est_tokens'])
+
+    def test_account_balance_unknown_and_zero(self):
+        for name in ('normalize_wb','normalize_qoder'):
+            normalize=self.ns[name]
+            for value in (None, '', 'invalid', True, float('nan'), float('inf')):
+                self.assertIsNone(normalize({'credits':{'remain':value}})['remain'])
+            self.assertIsNone(normalize({})['remain'])
+            self.assertEqual(normalize({'credits':{'remain':0}})['remain'],0)
+
+    def test_known_pool_routes_only_to_present_accounts(self):
+        self.ns.update(_wb_realm_meta=lambda:{'m':{'realms':['cn','intl'],'pro':[]}},
+            _wb_pool_state=lambda:{'known':True,'realms':{'intl':{'paid':False}}})
+        self.assertEqual(self.ns['_wb_route_realm']('m'),'intl')
+        self.ns['_wb_pool_state']=lambda:{'known':False,'realms':{}}
+        self.assertEqual(self.ns['_wb_route_realm']('m'),'cn')
+        self.ns['_wb_pool_state']=lambda:{'known':True,'realms':{}}
+        self.assertIsNone(self.ns['_wb_route_realm']('m'))
+
+    def test_pool_failure_is_unknown_not_empty(self):
+        self.ns.update(_wb_state_lock=threading.Lock(),_wb_state_cache={'state':{}},
+            engine_request=lambda *args:{'unexpected':[]})
+        self.assertFalse(self.ns['_wb_pool_fetch']({})['known'])
+        self.ns['engine_request']=lambda *args:{'accounts':[]}
+        self.assertTrue(self.ns['_wb_pool_fetch']({'name':'workbuddy'})['known'])
+        self.ns['engine_request']=lambda *args:{'accounts':[{'realm':'intl'}]}
+        self.assertIn('intl',self.ns['_wb_pool_fetch']({'name':'workbuddy'})['realms'])
+
+    def test_estimate_keeps_realm_balances_and_unknown_region(self):
+        self.estimate([{'enabled':True,'remain':100}])
+        self.ns.update(CONFIG={'upstreams':[{'name':'workbuddy'}]},
+            public_catalog=lambda:[{'platform':'workbuddy','public':'m',
+                                    'upstream':'m','row':{}}],
+            _wb_usable_realms=lambda _:['intl'],
+            platform_status=lambda _: {'health':True,'accounts':[
+                {'enabled':True,'remain':100,'realm':'intl'},
+                {'enabled':True,'remain':50}]},
+            _estimate_rows=lambda _: [])
+        item=self.ns['estimate_snapshot'](True)['platforms'][0]
+        self.assertEqual(item['realm_balances']['intl'],100)
+        self.assertEqual(item['realm_balances']['unknown'],50)
+        self.assertEqual(item['balance'],150)
+        self.assertEqual(item['models'][0]['balance_scope'],'仅国际')
+
+    def test_raccoon_account_normalization(self):
+        norm = self.ns['normalize_raccoon']
+        today = self.ns['_shanghai_today']()
+        a = norm({'uid': 'u1', 'nickname': 'nick', 'credits': 120,
+                  'checked_in': today, 'realm': 'cn', 'in_flight': 2})
+        self.assertEqual((a['name'], a['remain'], a['checked_in'], a['enabled'], a['realm']),
+                         ('nick', 120, True, True, 'cn'))
+        self.assertEqual(a['inflight'], 2)
+        paused = norm({'uid': 'u2', 'credits': None, 'checked_in': '2020-01-01',
+                       'paused': True})
+        self.assertFalse(paused['enabled'])
+        self.assertIsNone(paused['remain'])
+        self.assertFalse(paused['checked_in'])
+        self.assertEqual(paused['name'], 'u2')
+
+    def test_raccoon_multiplier_and_iso_time(self):
+        self.assertEqual(self.ns['_row_multiplier']('raccoon', {'credits': 'x0.05'}),
+                         {'factor': 0.05})
+        self.assertIsNone(self.ns['_row_multiplier']('raccoon', {}))
+        self.assertGreater(self.ns['_iso_epoch']('2026-11-18T22:00:00+08:00'), 0)
+        self.assertEqual(self.ns['_iso_epoch']('not-a-time'), 0.0)
+        self.assertEqual(self.ns['_iso_epoch'](None), 0.0)
+
+    def test_raccoon_checkin_result_counts(self):
+        result = self.ns['_raccoon_checkin_result']({'ok': 2, 'failed': 1, 'skipped': 3})
+        self.assertEqual(len(result['results']), 6)
+        self.assertEqual(self.ns['_checkin_tally'](result), (5, 6))
+        status = self.ns['_action_status'](result)
+        self.assertFalse(status['ok'])
+        self.assertTrue(status['partial'])
+
+    def test_raccoon_checkin_result_requires_valid_counts(self):
+        conv = self.ns['_raccoon_checkin_result']
+        for bad in ({}, {'error': 'boom'}, {'ok': True, 'failed': 0, 'skipped': 0},
+                    {'ok': 1, 'failed': 0}, {'ok': 0, 'failed': -1, 'skipped': 0},
+                    {'ok': 'true', 'failed': 0, 'skipped': 0}, None):
+            result = conv(bad)
+            self.assertIsInstance(result, dict)
+            self.assertTrue(result.get('error'))
+            self.assertFalse(self.ns['_action_status'](result)['ok'])
+        zero = conv({'ok': 0, 'failed': 0, 'skipped': 0})
+        self.assertEqual(zero, {'results': [], 'details': [], 'job': 'checkin'})
+
+    def test_raccoon_checkin_reports_missing_results(self):
+        import urllib.error
+        from unittest.mock import Mock
+
+        handler = object.__new__(self.ns['Handler'])
+        handler._send_json = Mock()
+        self.ns.update(urllib=urllib,
+                       CONFIG={'upstreams': [{'name': 'raccoon'}]},
+                       CHECKIN_PATHS={'raccoon': ('/panel/api/checkin_all', 'bearer')})
+        for upstream_result in ({}, {'ok': False, 'failed': 0}, None):
+            with self.subTest(result=upstream_result):
+                self.ns['engine_request'] = Mock(return_value=upstream_result)
+                handler._api_checkin('raccoon')
+                body = handler._send_json.call_args.args[1]
+                self.assertFalse(body['ok'])
+                self.assertTrue(body['error'])
+
+    def test_raccoon_login_requires_state_and_link(self):
+        import urllib.error
+        from urllib.parse import urlsplit
+        from unittest.mock import Mock
+
+        handler = object.__new__(self.ns['Handler'])
+        handler._raccoon_upstream = lambda: {'name': 'raccoon'}
+        handler.path = '/api/raccoon/login/poll?state=flow'
+        handler._send_json = Mock()
+        handler._deny = Mock()
+        self.ns.update(urllib=urllib, urlsplit=urlsplit)
+        for upstream_result in (None, {'id': 'flow'}, {'id': '', 'url': 'https://example.invalid/login'}):
+            with self.subTest(result=upstream_result):
+                self.ns['engine_request'] = Mock(return_value=upstream_result)
+                handler._api_raccoon_login_start()
+                code, body = handler._send_json.call_args.args
+                self.assertEqual(code, 502)
+                self.assertFalse(body['ok'])
+                self.assertTrue(body['error'])
+        self.ns['engine_request'] = Mock(return_value={'id': 'flow', 'url': 'https://example.invalid/login'})
+        handler._api_raccoon_login_start()
+        self.assertEqual(handler._send_json.call_args.args,
+                         (200, {'ok': True, 'state': 'flow', 'authUrl': 'https://example.invalid/login'}))
+        for upstream_result in ({}, {'status': '等待浏览器授权'}, None):
+            with self.subTest(poll_result=upstream_result):
+                self.ns['engine_request'] = Mock(return_value=upstream_result)
+                handler._api_raccoon_login_poll()
+                code, body = handler._send_json.call_args.args
+                self.assertEqual(code, 502)
+                self.assertFalse(body['ok'])
+                self.assertTrue(body['error'])
+        pending = {'done': False, 'status': '等待浏览器授权'}
+        self.ns['engine_request'] = Mock(return_value=pending)
+        handler._api_raccoon_login_poll()
+        self.assertEqual(handler._send_json.call_args.args, (200, {'ok': True, 'result': pending}))
+
+    def test_workbuddy_usage_keeps_successful_realm_when_other_fails(self):
+        from unittest.mock import Mock
+
+        handler = object.__new__(self.ns['Handler'])
+        handler.path = '/api/usage?limit=10'
+        handler._send_json = Mock()
+        account = {'uid': 'u1', 'nickname': 'User'}
+        row = {'at': 1000, 'model': 'm', 'account': 'u1', 'total_tokens': 5,
+               'prompt_tokens': 3, 'completion_tokens': 2, 'status_code': 200}
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            if path == '/accounts?realm=all':
+                return {'accounts': [account]}
+            if 'realm=cn' in path:
+                return {'rows': [row]}
+            if 'realm=intl' in path:
+                raise TimeoutError('intl unavailable')
+            raise AssertionError(path)
+
+        self.ns.update(active_upstreams=lambda: [{'name': 'workbuddy'}],
+                       engine_request=fake, _num=lambda n: float(n or 0), time=time)
+        handler._api_usage()
+        code, payload = handler._send_json.call_args.args
+        self.assertEqual(code, 200)
+        self.assertEqual(len(payload['rows']), 1)
+        self.assertEqual(payload['rows'][0]['account'], 'User')
+        self.assertIn('intl', payload['errors']['workbuddy'])
+
+    def test_trae_multiplier(self):
+        self.assertEqual(self.ns['_row_multiplier']('trae', {'consumption_rate': 0.78}),
+                         {'factor': 0.78})
+        self.assertEqual(self.ns['_row_multiplier']('trae', {'consumption_rate': 0}),
+                         {'factor': 0.0})
+        self.assertIsNone(self.ns['_row_multiplier']('trae', {}))
+        self.assertIsNone(self.ns['_row_multiplier']('trae', {'consumption_rate': 'bad'}))
+
+    def test_trae_account_normalization(self):
+        norm = self.ns['normalize_trae']
+        cn = norm({'uid': '…1234', 'uidHash': 'hash', 'realm': 'cn',
+                   'realmName': '国内版', 'enabled': True, 'status': 'ready',
+                   'inflight': 3,
+                   'credits': {'remain': 120.5, 'limit': 200, 'plan': 'Pro',
+                               'checked_in': False},
+                   'account': {'username': 'u***@example.com'}})
+        self.assertEqual(cn['name'], 'u***@example.com')
+        self.assertEqual(cn['uid'], 'hash')
+        self.assertEqual((cn['remain'], cn['size'], cn['realm']),
+                         (120.5, 200, 'cn'))
+        self.assertEqual(cn['inflight'], 3)
+        self.assertTrue(cn['can_checkin'])
+        self.assertFalse(cn['checked_in'])
+        checked = norm({'realm': 'cn', 'enabled': True, 'status': 'ready',
+                        'credits': {'remain': 0, 'limit': 0, 'checked_in': True}})
+        self.assertTrue(checked['checked_in'])
+        self.assertFalse(checked['can_checkin'])
+        # 国际版没有签到接口：checked_in 必须是 None，才不会进「今日签到」分母
+        intl = norm({'realm': 'intl', 'enabled': True, 'status': 'cooldown',
+                     'credits': {'remain': 10, 'limit': 10, 'checked_in': False}})
+        self.assertIsNone(intl['checked_in'])
+        self.assertFalse(intl['can_checkin'])
+        disabled = norm({'realm': 'cn', 'enabled': False, 'status': 'disabled',
+                         'credits': {}})
+        self.assertFalse(disabled['enabled'])
+        self.assertIsNone(disabled['remain'])
+
+    def test_trae_wiring(self):
+        paths = constant(ROOT / 'router.py', 'CHECKIN_PATHS')
+        self.assertEqual(paths['trae'], ('/accounts/checkin', 'panel'))
+        handler = self.ns['Handler']
+        self.assertEqual(handler.LOGIN_START['trae'], {})
+        self.assertIn('trae', handler.ENGINE_WHITELIST)
+        self.assertIn('accounts/refresh', handler.ENGINE_WHITELIST['trae'])
+        self.assertIn('tasks/travel', handler.ENGINE_WHITELIST['trae'])
+
+    def test_raccoon_billing_rows_are_read_only_and_account_scoped(self):
+        calls = []
+        now = time.time()
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            calls.append((method, path, auth))
+            if path.endswith("/overview"):
+                return {"accounts": [{"uid": "acct-a"}, {"uid": "acct-b"}]}
+            if "acct-a" in path:
+                return {"bills": [{"bill_id": "bill-a", "biz_id": "biz-a",
+                                   "event_name": "任务消耗 · gw-marker",
+                                   "points": -2, "created_at": "2026-11-19T01:00:00Z"},
+                                  {"bill_id": "grant-a", "points": 10}]}
+            return {"bills": [{"bill_id": "bill-b", "event_name": "对话消耗",
+                                "points": -3, "created_at": "2026-11-19T01:01:00Z"}]}
+
+        scope = isolated(ROOT / "router.py", {"_raccoon_billing_rows"}, {
+            "engine_request": fake, "_raccoon_billing_lock": threading.Lock(),
+            "_raccoon_billing_cache": {"ts": 0.0, "rows": []},
+            "RACCOON_BILLING_TTL": 300,
+            "RACCOON_BILLING_LINKS": str(ROOT / "raccoon_billing_links-test.jsonl"),
+            "quote": quote, "time": time,
+            "_known_num": self.ns["_known_num"], "_iso_epoch": self.ns["_iso_epoch"]})
+        rows = scope["_raccoon_billing_rows"]({"name": "raccoon"})
+        self.assertEqual([(r["account"], r["bill_id"], r["points"]) for r in rows],
+                         [("acct-b", "bill-b", -3), ("acct-a", "bill-a", -2)])
+        self.assertTrue(all(method == "GET" and auth == "bearer" for method, _, auth in calls))
+        self.assertEqual(sum(path.endswith("/overview") for _, path, _ in calls), 1)
+        self.assertEqual(len(calls), 3)
+
+    def test_raccoon_billing_matches_only_unique_id_marker_account_and_time(self):
+        scope = isolated(ROOT / "router.py", {"_attach_raccoon_bills", "_estimate_at"}, {
+            "_num": self.ns["_num"], "_known_num": self.ns["_known_num"]})
+        marker = "gw-0123456789abcdef0123456789abcdef"
+        event = {"id": "req-1", "uid": "acct-a", "model": "sn-qwen4-max",
+                 "created_at": 2000.0, "total_tokens": 250, "credit": None}
+        bill = {"account": "acct-a", "bill_id": "bill-1", "event_name": f"任务消耗 · {marker}",
+                "points": -2, "created_at": 2001.0}
+        link = {"request_id": "req-1", "marker": marker,
+                "model": "sn-qwen4-max", "at": 2000.0}
+        attached = scope["_attach_raccoon_bills"]([dict(event)], [bill], [link])[0]
+        self.assertEqual(attached["credit"], 2)
+        self.assertEqual(attached["credit_source"], "matched_bill")
+        for bad_event, bad_bills, bad_links in (
+                ([dict(event)], [bill, {**bill, "bill_id": "bill-2"}], [link]),
+                ([dict(event)], [bill], [link, {**link, "request_id": "req-2"}]),
+                ([{**event, "uid": "other"}], [bill], [link]),
+                ([{**event, "created_at": 5000.0}], [bill], [link]),
+                ([{**event, "id": "legacy"}], [bill], [link]),
+                ([{**event, "total_tokens": 0}], [bill], [link])):
+            self.assertIsNone(scope["_attach_raccoon_bills"](
+                bad_event, bad_bills, bad_links)[0].get("credit"))
+
+    def test_raccoon_request_link_uses_random_marker_without_prompt(self):
+        scope = isolated(ROOT / "router.py", {"_raccoon_bill_link_for_request"}, {
+            "secrets": secrets, "time": time})
+        first = scope["_raccoon_bill_link_for_request"]("sn-qwen4-max", 1)
+        second = scope["_raccoon_bill_link_for_request"]("sn-qwen4-max", 1)
+        self.assertNotEqual(first["marker"], second["marker"])
+        self.assertEqual(len(first["request_id"]), 32)
+        self.assertTrue(first["marker"].startswith("gw-"))
+        self.assertNotIn("prompt", first)
+
+    def test_raccoon_response_id_requires_success(self):
+        scope = isolated(ROOT / "router.py", {"_raccoon_response_id"}, {"json": json})
+        self.assertEqual(scope["_raccoon_response_id"](500, {}, b'{"id":"req"}'), "")
+        self.assertEqual(scope["_raccoon_response_id"](
+            200, {"x-request-id": "req-header"}, b'{"id":"req-body"}'), "req-header")
+        self.assertEqual(scope["_raccoon_response_id"](200, {}, b'{"id":"req-body"}'), "req-body")
+
+    def test_trae_usage_missing_credit_is_unknown_not_free(self):
+        norm = self.ns["Handler"]._norm_usage_row
+        missing = norm(None, "trae", {"usage_missing": True, "credit": 0,
+                                         "credit_reported": False, "total_tokens": 1000, "model": "m"})
+        old = norm(None, "trae", {"usage_missing": False, "credit": 0,
+                                     "total_tokens": 1000, "model": "m"})
+        known_zero = norm(None, "trae", {"usage_missing": False, "credit": 0,
+                                           "credit_reported": True, "total_tokens": 1000, "model": "m"})
+        priced = norm(None, "trae", {"usage_missing": False, "credit": 2,
+                                      "credit_reported": True, "total_tokens": 1000, "model": "m"})
+        self.assertIsNone(missing["credit"])
+        self.assertIsNone(old["credit"])
+        self.assertEqual(known_zero["credit"], 0)
+        self.assertEqual(priced["credit"], 2)
+        rate, samples, tokens = self.ns["_credit_rate"]([missing, old, known_zero, priced])
+        self.assertIsNone(rate)
+        self.assertEqual((samples, tokens), (2, 2000))
+
+    def test_estimate_filters_trae_usage_missing_rows(self):
+        self.ns.update(_estimate_lock=threading.Lock(), _estimate_cache={"data": None}, ESTIMATE_TTL=120,
+            CONFIG={"upstreams": [{"name": "trae"}]},
+            public_catalog=lambda: [{"platform":"trae","public":"m","upstream":"m","row":{}}],
+            platform_status=lambda _: {"health":True,"accounts":[{"enabled":True,"remain":100}]},
+            _estimate_rows=lambda _: [
+                {"created_at":time.time(),"model":"m","total_tokens":1000,"credit":0,
+                 "usage_missing":True,"credit_reported":False},
+                {"created_at":time.time(),"model":"m","total_tokens":1000,"credit":2,
+                 "usage_missing":False,"credit_reported":False},
+                *[{"created_at":time.time(),"model":"m","total_tokens":1000,"credit":1,
+                   "usage_missing":False,"credit_reported":True} for _ in range(3)]],
+            _estimate_at=lambda r:r["created_at"], _model_hidden=lambda *_:False,
+            _read_wallet_history=lambda:[])
+        model=self.ns["estimate_snapshot"](True)["platforms"][0]["models"][0]
+        self.assertEqual(model["rate_per_mtok"],1000.0)
+        self.assertEqual(model["samples"],3)
+        self.assertEqual(model["sample_tokens"],3000)
+        self.assertEqual(model["rate_source"],"measured")
+
+    def test_raccoon_estimate_rows_join_only_unique_new_bill_link(self):
+        calls=[]
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            calls.append(path)
+            if path.endswith("/requests?limit=1000"):
+                return {"events":[
+                    {"id":"req-1","uid":"acct-a","status":200,"time":"2026-11-19T01:00:00Z",
+                     "model":"sn-qwen4-max","total_tokens":1000},
+                    {"uid":"legacy","status":200,"time":"2026-11-19T01:01:00Z",
+                     "model":"sn-qwen4-max","total_tokens":1000}]}
+            if path.endswith("/overview"):
+                return {"accounts":[{"uid":"acct-a"}]}
+            if path.endswith("/bills?limit=200"):
+                return {"bills":[{"bill_id":"b1","points":-2,
+                                   "event_name":"任务消耗 · gw-0123456789abcdef0123456789abcdef",
+                                   "created_at":"2026-11-19T01:00:01Z"}]}
+            raise AssertionError(path)
+        scope = isolated(ROOT / "router.py", {"_estimate_rows", "_raccoon_billing_rows", "_read_raccoon_billing_links", "_attach_raccoon_bills", "_iso_epoch", "_estimate_at"}, {
+            "datetime": datetime, "engine_request": fake, "time":time, "json":json,
+            "RACCOON_BILLING_LINKS": str(ROOT / "raccoon_billing_links-test.jsonl"),
+            "quote": quote, "_num": self.ns["_num"], "_known_num": self.ns["_known_num"],
+            "_estimate_at": self.ns["_estimate_at"], "RACCOON_BILLING_TTL":300,
+            "_raccoon_billing_lock":threading.Lock(), "_raccoon_billing_cache":{"ts":0,"rows":[]},
+            "_read_raccoon_billing_links":lambda:[]})
+        scope["_read_raccoon_billing_links"] = lambda: [{
+            "request_id": "req-1", "marker": "gw-0123456789abcdef0123456789abcdef",
+            "model": "sn-qwen4-max", "at": self.ns["_iso_epoch"]("2026-11-19T01:00:00Z")
+        }]
+        rows=scope["_estimate_rows"]({"name":"raccoon"})
+        self.assertEqual(rows[0]["credit"],2)
+        self.assertEqual(rows[0]["credit_source"],"matched_bill")
+        self.assertIsNone(rows[1]["credit"])
+        self.assertTrue(all(path.endswith("/requests?limit=1000") or path.endswith("/overview")
+                            or path.endswith("/bills?limit=200") for path in calls))
+
+
+    def test_raccoon_estimate_rows_keep_credit_unknown(self):
+        scope = isolated(ROOT / 'router.py', {'_estimate_rows', '_iso_epoch'},
+            {'datetime': datetime, '_raccoon_billing_rows': lambda *_: [],
+             '_attach_raccoon_bills': self.ns['_attach_raccoon_bills'],
+             '_read_raccoon_billing_links': lambda: [],
+             '_estimate_at': lambda row: self.ns['_iso_epoch'](row.get('time')),
+             '_num': self.ns['_num'], '_known_num': self.ns['_known_num'],
+             'engine_request': lambda up, method, path, body=None, auth=None, timeout=None: {
+                 'events': [
+                     {'time': '2026-11-18T22:00:00+08:00', 'status': 200,
+                      'model': 'raccoon-chat-ml-5-5', 'total_tokens': 100,
+                      'prompt_tokens': 80, 'completion_tokens': 20},
+                     {'time': '2026-11-18T22:01:00+08:00', 'status': 502,
+                      'model': 'raccoon-chat-ml-5-5', 'total_tokens': 10},
+                 ]}})
+        rows = scope['_estimate_rows']({'name': 'raccoon'})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['model'], 'raccoon-chat-ml-5-5')
+        self.assertEqual(rows[0]['total_tokens'], 100)
+        self.assertIsNone(rows[0]['credit'])
+        self.assertIsNone(rows[0]['cached_tokens'])
+        self.assertGreater(rows[0]['created_at'], 0)
+
+    def test_raccoon_platform_status_reads_overview(self):
+        import urllib.request
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"status":"ok"}'
+        scope = isolated(ROOT / 'router.py',
+                         {'platform_status', 'normalize_raccoon', '_shanghai_today', '_known_num'},
+                         {'urllib': __import__('urllib'),
+                          'CONFIG': {'upstreams': [{'name': 'raccoon',
+                                                    'base_url': 'http://127.0.0.1:7867',
+                                                    'api_key': 'synthetic'}]},
+                          '_inflight': {}, 'NORMALIZERS': {},
+                          'normalize_buddy': lambda a: a,
+                          '_urlopen': lambda req, timeout: Resp(),
+                          'engine_request': lambda up, method, path, body=None,
+                                                    auth=None, timeout=None: {
+                              'accounts': [{'uid': 'u1', 'nickname': 'nick',
+                                            'credits': 5, 'realm': 'cn',
+                                            'checked_in': self.ns['_shanghai_today']()}]}})
+        scope['NORMALIZERS']['raccoon'] = scope['normalize_raccoon']
+        out = scope['platform_status']({'name': 'raccoon',
+                                        'base_url': 'http://127.0.0.1:7867'})
+        self.assertTrue(out['health'])
+        self.assertEqual(len(out['accounts']), 1)
+        self.assertEqual(out['accounts'][0]['remain'], 5)
+        self.assertTrue(out['accounts'][0]['checked_in'])
+
+    def test_platform_toggle_filters_catalog_and_routing(self):
+        scope = isolated(ROOT / "router.py", {
+            "public_catalog", "platform_enabled", "active_upstreams",
+            "_disabled_platforms", "_public_name", "_hidden_set", "_model_hidden",
+            "_wb_entry_locked", "_wb_realm_meta", "resolve_model",
+            "_model_in_disabled_platform"},
+            {"CONFIG": {"upstreams": [{"name": "qoder"}, {"name": "workbuddy"}],
+                        "disabled_platforms": ["workbuddy"]},
+             "upstream_rows": lambda up: [{"id": "m-" + up["name"]}],
+             "_catalog_lock": threading.Lock(),
+             "_catalog_cache": {"workbuddy": (time.time(), [{"id": "m-workbuddy"}])},
+             "_catalog_pub_lock": threading.Lock(), "_catalog_pub_cache": {},
+             "_catalog_pub_generation": 0,
+             "_wb_paid_any": lambda: False})
+        self.assertEqual([u["name"] for u in scope["active_upstreams"]()], ["qoder"])
+        entries = scope["public_catalog"]()
+        self.assertEqual([e["platform"] for e in entries], ["qoder"])
+        err = scope["resolve_model"]("workbuddy/m-workbuddy")[3]
+        self.assertIn("停用", err)
+        err = scope["resolve_model"]("m-workbuddy")[3]
+        self.assertIn("停用", err)
+
+    def test_launch_spec_validation(self):
+        scope = isolated(ROOT / "router.py", {"_launch_spec"},
+                         {"os": __import__("os"), "HERE": str(ROOT)})
+        fn = scope["_launch_spec"]
+        self.assertEqual(fn({"launch": {"command": ["python", "x.py"]}})["command"],
+                         ["python", "x.py"])
+        shell = (["cmd.exe", "/c", "python"] if __import__("os").name == "nt"
+                 else ["/bin/sh", "-c", "python"])
+        self.assertEqual(fn({"launch": {"command": "python"}})["command"], shell)
+        self.assertIsNone(fn({}))
+        self.assertIsNone(fn({"launch": {"command": []}}))
+        self.assertIsNone(fn({"launch": {"command": ["python"], "cwd": "Z:/no-such-dir"}}))
+        self.assertEqual(fn({"launch": {"command": ["python"], "cwd": "."}})["cwd"],
+                         str(ROOT))
+        self.assertEqual(fn({"launch": {"command": ["python"], "timeout": 9999}})["timeout"], 180)
+        self.assertEqual(fn({"launch": {"command": ["python"], "timeout": 1}})["timeout"], 5)
+        self.assertEqual(fn({"launch": {"command": "x", "env": {"QD_NO_PAUSE": "1"}}})["env"],
+                         {"QD_NO_PAUSE": "1"})
+        self.assertIsNone(fn({"launch": {"command": "x", "env": {"A": 1}}}))
+
+    def test_platform_toggle_persists_to_config(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text('{"upstreams":[],"disabled_platforms":[]}', encoding="utf-8")
+            scope = isolated(ROOT / "router.py", {"_set_platform_enabled", "save_config"}, {
+                "os": __import__("os"), "CONFIG_PATH": str(path),
+                "CONFIG": {"upstreams": [], "disabled_platforms": []},
+                "_config_lock": threading.RLock(),
+                "_catalog_pub_lock": threading.Lock(), "_catalog_pub_cache": {},
+                "_catalog_pub_generation": 0,
+                "_estimate_lock": threading.Lock(),
+                "_estimate_cache": {"ts": 0.0, "data": None},
+                "_updates_lock": threading.Lock(),
+                "_updates_cache": {"ts": 0.0, "data": None}})
+            scope["_set_platform_enabled"]("qoder", False)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["disabled_platforms"],
+                             ["qoder"])
+            scope["_set_platform_enabled"]("qoder", True)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["disabled_platforms"],
+                             [])
+
+    def test_platforms_endpoint_lists_and_toggles(self):
+        self.ns.update(
+            CONFIG={"upstreams": [
+                {"name": "qoder", "base_url": "http://127.0.0.1:8790"},
+                {"name": "workbuddy", "base_url": "http://127.0.0.1:8788"}],
+                "disabled_platforms": ["workbuddy"]},
+            _platform_process=lambda up: {"managed": False, "running": False,
+                                          "pid": None, "launch_configured": False})
+        handler = object.__new__(self.ns["Handler"])
+        sent = {}
+        handler._send_json = lambda code, payload: sent.update(code=code, payload=payload)
+        handler._deny = lambda code, message, *args: sent.update(code=code, error=message)
+        handler.command = "GET"
+        handler._api_platforms()
+        self.assertEqual(sent["code"], 200)
+        self.assertEqual([p["name"] for p in sent["payload"]["platforms"]],
+                         ["qoder", "workbuddy"])
+        self.assertFalse(sent["payload"]["platforms"][1]["enabled"])
+        self.assertEqual(sent["payload"]["disabled"], ["workbuddy"])
+
+        self.ns["_set_platform_enabled"] = lambda name, enabled: ["workbuddy"]
+        self.ns["_stop_platform"] = lambda up, allow_external=False: {
+            "ok": True, "stopped": True, "managed": False, "pid": 123}
+        handler.command = "POST"
+        handler._post_body = {"name": "qoder", "enabled": False}
+        handler._api_platforms()
+        self.assertEqual(sent["code"], 200)
+        self.assertFalse(sent["payload"]["enabled"])
+        self.assertTrue(sent["payload"]["process"]["stopped"])
+
+        # 启用时自动启动引擎
+        self.ns["_upstream_health"] = lambda up: False
+        self.ns["_launch_spec"] = lambda up: {"command": ["python"], "cwd": None,
+                                              "timeout": 30, "env": {}, "shell": False}
+        self.ns["_start_platform"] = lambda up: {"ok": True, "started": True, "pid": 456}
+        handler._post_body = {"name": "qoder", "enabled": True}
+        handler._api_platforms()
+        self.assertTrue(sent["payload"]["process"]["started"])
+
+        # 保存启动命令（恢复真实校验）
+        real_launch_spec = isolated(ROOT / "router.py", {"_launch_spec"},
+                                    {"os": __import__("os"), "HERE": str(ROOT)})["_launch_spec"]
+        self.ns["_launch_spec"] = real_launch_spec
+        saved = {}
+        self.ns["save_config"] = lambda: saved.update(done=True)
+        handler._post_body = {"name": "qoder", "launch": {
+            "command": "cmd /c start.bat", "cwd": str(ROOT)}}
+        handler._api_platforms()
+        self.assertTrue(sent["payload"]["launch_configured"])
+        self.assertEqual(self.ns["CONFIG"]["upstreams"][0]["launch"]["command"],
+                         "cmd /c start.bat")
+        self.assertTrue(saved.get("done"))
+
+    def test_stop_managed_keeps_record_when_process_survives(self):
+        class Proc:
+            pid = 778
+            def poll(self): return None
+            def wait(self, timeout=None): return None
+        proc = Proc()
+        managed = {"p": proc}
+        scope = isolated(ROOT / "router.py", {"_stop_platform", "_stop_platform_locked", "_command_matches_engine"}, {
+            "_proc_lock": threading.Lock(), "_managed_procs": managed,
+            "_platform_op_lock": lambda name: threading.Lock(),
+            "_kill_tree": lambda pid: None,
+            "subprocess": __import__("subprocess"),
+            "log": lambda *_: None})
+        out = scope["_stop_platform"]({"name": "p"}, allow_external=False)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["stopped"])
+        self.assertIs(managed["p"], proc)
+
+    def test_stop_external_verifies_process_identity(self):
+        killed = []
+        pids = [4321, 4321, None]
+        scope = isolated(ROOT / "router.py", {"_stop_platform", "_stop_platform_locked", "_command_matches_engine"}, {
+            "_proc_lock": threading.Lock(), "_managed_procs": {},
+            "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
+            "os": __import__("os"), "time": time, "log": lambda *_: None,
+            "_port_listener_pid": lambda port, host=None: pids.pop(0) if pids else None,
+            "_platform_op_lock": lambda name: threading.Lock(),
+            "_process_command_line": lambda pid: "python qoder_proxy.py --port 8790",
+            "_engine_identity_tokens": lambda up: {"qoder_proxy.py"},
+            "subprocess": __import__("subprocess"),
+            "os_name": "nt",
+            "_kill_tree": lambda pid: killed.append(pid),
+            "_platform_op_lock": lambda name: threading.Lock()})
+        fn = scope["_stop_platform"]
+        out = fn({"name": "qoder", "base_url": "http://127.0.0.1:8790"},
+                 allow_external=True)
+        self.assertTrue(out["ok"])
+        self.assertEqual(killed, [4321])
+        killed.clear()
+        pids[:] = [4321, 4321]
+        scope["_process_command_line"] = lambda pid: "python other.py"
+        out = fn({"name": "qoder", "base_url": "http://127.0.0.1:8790"},
+                 allow_external=True)
+        self.assertFalse(out["ok"])
+        self.assertEqual(killed, [])
 
     def test_missing_result_ok_is_not_success(self):
         status=self.ns['_action_status']
@@ -258,6 +916,56 @@ class GatewayTests(unittest.TestCase):
             setattr(obj, name, Mock())
         return obj
 
+    def test_multipart_rejection_closes_unread_connection(self):
+        from unittest.mock import Mock
+        body = b'--boundary\r\nfile content\r\nGET /v1/models HTTP/1.1\r\n\r\n'
+        handler = self.post('/v1/images/edits', body)
+        handler.headers['Content-Type'] = 'multipart/form-data; boundary=boundary'
+        handler._media_post = Mock()
+        handler.do_POST()
+        handler._deny.assert_called_once()
+        self.assertEqual(handler._deny.call_args.args[0], 400)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(handler.rfile.tell(), 0)
+        handler._media_post.assert_not_called()
+
+    def test_raccoon_billing_link_preserves_title_and_relay(self):
+        import contextlib
+        from unittest.mock import Mock
+        for platform, path, title, stream in (
+                ('raccoon', '/v1/chat/completions', None, False),
+                ('raccoon', '/v1/chat/completions', None, True),
+                ('raccoon', '/v1/chat/completions', 'Client title', True),
+                ('raccoon', '/v1/responses', None, False),
+                ('qoder', '/v1/chat/completions', None, False)):
+            with self.subTest(platform=platform, path=path, title=title, stream=stream):
+                request = {'model': platform + '/m', 'messages': [], 'stream': stream}
+                if title is not None:
+                    request['title'] = title
+                forward = Mock(return_value=(200, {'X-Request-Id': 'engine-request'},
+                                             iter([b'data: [DONE]\n\n']) if stream else b'{}'))
+                record = Mock()
+                self.ns.update(resolve_model=lambda _: ({'name': platform}, 'm', platform + '/m', None),
+                               forward=forward, _record_raccoon_billing_link=record,
+                               _platform_inflight=lambda _: contextlib.nullcontext())
+                handler = self.post(path, json.dumps(request).encode())
+                handler._relay_json = Mock()
+                handler._relay_stream = Mock()
+                handler.do_POST()
+                forward.assert_called_once()
+                sent = json.loads(forward.call_args.args[3])
+                self.assertEqual(sent['model'], 'm')
+                self.assertEqual(sent['messages'], [])
+                if platform == 'raccoon' and path.endswith('/chat/completions') and title is None:
+                    self.assertRegex(sent['title'], r'^gw-[a-f0-9]{32}$')
+                    record.assert_called_once()
+                    self.assertEqual(record.call_args.args[:3], ('engine-request', sent['title'], 'm'))
+                else:
+                    self.assertEqual(sent.get('title'), title)
+                    record.assert_not_called()
+                (handler._relay_stream if stream else handler._relay_json).assert_called_once()
+                (handler._relay_json if stream else handler._relay_stream).assert_not_called()
+
     def test_invalid_bodies_never_dispatch(self):
         paths = ['/api/checkin/workbuddy', '/api/qwenwork/reimport',
                  '/api/tasks/run/workbuddy', '/api/login/start/qoder']
@@ -275,6 +983,39 @@ class GatewayTests(unittest.TestCase):
                         getattr(obj, name).assert_not_called()
                     if lengths is not None:
                         self.assertTrue(obj.close_connection)
+
+    def test_absolute_request_target_is_normalized(self):
+        from unittest.mock import Mock
+        self.ns['CONFIG'] = {'api_key': 'synthetic-only'}
+        handler = object.__new__(self.ns['Handler'])
+        handler.headers = {'x-api-key': 'synthetic-only'}
+        handler._models = Mock()
+        handler._deny = Mock()
+        handler.path = 'http://127.0.0.1:8787/v1/models?x=1'
+        handler.do_GET()
+        handler._models.assert_called_once()
+        handler._deny.assert_not_called()
+
+    def test_chunked_json_is_decoded_before_dispatch(self):
+        body = b'{}'
+        wire = f'{len(body):x}\r\n'.encode() + body + b'\r\n0\r\n\r\n'
+        obj = self.post('/api/checkin/workbuddy', wire, lengths=[], transfer='chunked')
+        obj.do_POST()
+        obj._api_checkin.assert_called_once_with('workbuddy')
+        obj._deny.assert_not_called()
+
+    def test_anthropic_auth_error_shape(self):
+        from unittest.mock import Mock
+        self.ns['CONFIG'] = {'api_key': 'synthetic-only'}
+        handler = self.post('/v1/messages', b'{}')
+        handler._authorized = lambda: False
+        handler._send_json = Mock()
+        handler._deny = self.ns['Handler']._deny.__get__(handler)
+        handler.do_POST()
+        code, payload = handler._send_json.call_args.args[:2]
+        self.assertEqual(code, 401)
+        self.assertEqual(payload.get('type'), 'error')
+        self.assertEqual(payload['error']['type'], 'authentication_error')
 
     def test_body_timeout_and_early_return(self):
         from unittest.mock import Mock
@@ -411,8 +1152,10 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(conn.closed)
 
     def test_media_model_resolution(self):
-        scope = isolated(ROOT / "router.py", {"resolve_media_model"}, {
+        scope = isolated(ROOT / "router.py", {"resolve_media_model", "_media_supports_tag"}, {
+            "_media_supports_tag": self.ns["_media_supports_tag"],
             "CONFIG": {"upstreams": [{"name": "workbuddy"}]},
+            "platform_enabled": lambda name: True,
             "public_media_catalog": lambda force=False: [
                 {"public": "kling-video-v3", "id": "kling-video-v3",
                  "tags": ["text-to-video"], "kind": "video", "available": True},
@@ -423,7 +1166,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(fn("workbuddy/kling-video-v3")[1], "kling-video-v3")
         self.assertEqual(fn("kling-video-v3")[2], "kling-video-v3")
         self.assertIn("隐藏", fn("workbuddy/hy-image-3.5")[3])
-        self.assertIn("只由 workbuddy", fn("qoder/kling-video-v3")[3])
+        self.assertIn("未知媒体平台", fn("qoder/kling-video-v3")[3])
         self.assertIn("未知媒体模型", fn("not-a-media-model")[3])
         up, upstream, facing, err = fn("")
         self.assertIs(up, scope["CONFIG"]["upstreams"][0])
@@ -435,7 +1178,164 @@ class GatewayTests(unittest.TestCase):
         scope["_model_hidden"] = lambda platform, model: True
         self.assertIsNone(fn("")[0])
 
-    def test_media_catalog_merges_realms(self):
+    def test_media_routes_raccoon_images(self):
+        scope = isolated(ROOT / "router.py", {"resolve_media_model", "_media_supports_tag"}, {
+            "_media_supports_tag": self.ns["_media_supports_tag"],
+            "CONFIG": {"upstreams": [{"name": "workbuddy"}, {"name": "raccoon"}]},
+            "platform_enabled": lambda name: True,
+            "public_media_catalog": lambda force=False: [
+                {"public": "wb-img", "platform": "workbuddy",
+                 "tags": ["text-to-image"], "kind": "image", "available": True},
+                {"public": "raccoon-image-gen", "platform": "raccoon",
+                 "tags": ["text-to-image", "image-to-image"], "kind": "image",
+                 "available": True,
+                 "aliases": ["raccoon-image-gen", "gpt-image-1"]}],
+            "_model_hidden": lambda platform, model: False})
+        fn = scope["resolve_media_model"]
+        up, wanted, facing, err = fn("raccoon/gpt-image-1", "text-to-image")
+        self.assertEqual((up["name"], wanted, facing, err),
+                         ("raccoon", "gpt-image-1", "raccoon/gpt-image-1", None))
+        up, wanted, facing, err = fn("raccoon/raccoon-image-gen", "image-to-image")
+        self.assertEqual((up["name"], wanted, err), ("raccoon", "raccoon-image-gen", None))
+        self.assertIn("不支持", fn("raccoon/raccoon-image-gen", "text-to-video")[3])
+
+    def test_raccoon_image_price_from_bills(self):
+        calls = []
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            calls.append(path)
+            if path.endswith("/overview"):
+                return {"accounts": [{"uid": "u1"}]}
+            return {"bills": [
+                {"created_at": "2026-11-19T01:38:52+08:00", "points": -20,
+                 "event_name": "任务消耗 · 图片生成"},
+                {"created_at": "2026-11-19T01:30:00+08:00", "points": -4,
+                 "event_name": "对话消耗"},
+            ]}
+
+        scope = isolated(ROOT / "router.py", {"_raccoon_image_price"}, {
+            "engine_request": fake,
+            "_raccoon_price_lock": threading.Lock(),
+            "_raccoon_price_cache": {"ts": 0.0, "price": None},
+            "RACCOON_PRICE_TTL": 300,
+            "quote": quote})
+        self.assertEqual(scope["_raccoon_image_price"]({"name": "raccoon"}), 20)
+        self.assertEqual(len(calls), 2)
+        # 缓存命中后不再打引擎
+        self.assertEqual(scope["_raccoon_image_price"]({"name": "raccoon"}), 20)
+        self.assertEqual(len(calls), 2)
+        # 没有图片账单时返回 None，不猜
+        scope["_raccoon_price_cache"].update(ts=0.0, price=None)
+        scope["engine_request"] = lambda *a, **k: (
+            {"accounts": [{"uid": "u1"}]} if str(a[2]).endswith("/overview")
+            else {"bills": [{"created_at": "2026-11-19T01:30:00+08:00",
+                             "points": -4, "event_name": "对话消耗"}]})
+        self.assertIsNone(scope["_raccoon_image_price"]({"name": "raccoon"}))
+
+    def test_raccoon_image_price_skips_failed_account(self):
+        calls = []
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            calls.append(path)
+            if path.endswith("/overview"):
+                return {"accounts": [{"uid": "u1"}, {"uid": "u2"}]}
+            if "/u1/" in path:
+                raise OSError("boom")
+            return {"bills": [{"created_at": "2026-11-19T01:38:52+08:00", "points": -20,
+                               "event_name": "任务消耗 · 图片生成"}]}
+
+        scope = isolated(ROOT / "router.py", {"_raccoon_image_price"}, {
+            "engine_request": fake,
+            "_raccoon_price_lock": threading.Lock(),
+            "_raccoon_price_cache": {"ts": 0.0, "price": None},
+            "RACCOON_PRICE_TTL": 300,
+            "quote": quote})
+        # 单账号账单失败只跳过该账号：不能中止整轮并把 None 缓存 5 分钟
+        self.assertEqual(scope["_raccoon_image_price"]({"name": "raccoon"}), 20)
+        self.assertEqual(sum(1 for p in calls if "/u1/" in p or "/u2/" in p), 2)
+
+    def test_raccoon_media_fetch_unreachable_and_aliases(self):
+        scope = isolated(ROOT / "router.py", {"_raccoon_media_fetch"}, {
+            "CONFIG": {"upstreams": [{"name": "raccoon"}]},
+            "platform_enabled": lambda name: True,
+            "_upstream_by_name": lambda name: {"name": "raccoon"},
+            "upstream_rows": lambda up: None,
+            "_raccoon_image_price": lambda up: None,
+            "_raccoon_media_lock": threading.Lock(),
+            "_raccoon_media_cache": {"ts": 0.0, "models": [], "errors": {}},
+            "RACCOON_MEDIA_TTL": 30})
+        # 引擎不可达（upstream_rows 返回 None）必须显式报错，而不是静默变空
+        models, errors = scope["_raccoon_media_fetch"](force=True)
+        self.assertEqual(models, [])
+        self.assertIn("不可达", errors.get("active", ""))
+        # 目录恢复：规范 id 排最前、其余保持引擎顺序；别名登记在规范行上供 fallback
+        scope["upstream_rows"] = lambda up: [
+            {"id": "dall-e-2", "capabilities": {"image": True}},
+            {"id": "raccoon-image-gen", "capabilities": {"image": True}},
+            {"id": "gpt-image-1", "capabilities": {"image": True}}]
+        models, errors = scope["_raccoon_media_fetch"](force=True)
+        self.assertEqual(errors, {})
+        self.assertEqual([m["id"] for m in models],
+                         ["raccoon-image-gen", "dall-e-2", "gpt-image-1"])
+        self.assertEqual(models[0]["aliases"], ["dall-e-2", "gpt-image-1"])
+        self.assertEqual(models[1]["aliases"], [])
+
+    def test_raccoon_image_count_is_not_silently_dropped(self):
+        from unittest.mock import Mock
+
+        handler = object.__new__(self.ns['Handler'])
+        handler.path = '/v1/images/generations'
+        handler.headers = {}
+        handler._send_json = Mock()
+        handler._relay_media_json = Mock()
+        forward = Mock(return_value=(200, {}, b'{"ok":true}'))
+        self.ns.update(resolve_media_model=lambda model, tag: (
+                           {'name': 'raccoon'}, 'gpt-image-1', model, None),
+                       forward=forward, log=lambda *_: None)
+        handler._post_body = {'model': 'raccoon/gpt-image-1', 'prompt': 'synthetic', 'n': 2}
+        handler._deny = Mock()
+        handler._media_post()
+        handler._deny.assert_called_once()
+        self.assertEqual(handler._deny.call_args.args[0], 400)
+        self.assertIn('不支持一次生成多张', handler._deny.call_args.args[1])
+        forward.assert_not_called()
+
+        handler._send_json.reset_mock()
+        handler._relay_media_json.reset_mock()
+        handler._deny.reset_mock()
+        handler._post_body = {'model': 'raccoon/gpt-image-1', 'prompt': 'synthetic', 'n': 1}
+        handler._media_post()
+        body = json.loads(forward.call_args.args[3])
+        self.assertNotIn('n', body)
+        self.assertEqual(handler._relay_media_json.call_args.args[0], 200)
+
+    def test_media_multipart_rejected(self):
+        fn = self.ns["_media_multipart_reject"]
+        self.assertTrue(fn("/v1/images/edits", "multipart/form-data; boundary=x"))
+        self.assertTrue(fn("/images/edits", "multipart/form-data"))
+        self.assertTrue(fn("/v1/videos", "multipart/form-data"))
+        self.assertFalse(fn("/v1/images/edits", "application/json"))
+        self.assertFalse(fn("/v1/chat/completions", "multipart/form-data"))
+        self.assertFalse(fn("/api/checkin/workbuddy", "multipart/form-data"))
+
+    def test_wb_claim_query_business_error_is_not_skipped(self):
+        accounts = [{"uid": "u", "realm": "cn", "enabled": True}]
+        def fake(up, method, path, body=None, **kwargs):
+            if path.startswith('/accounts'):
+                return {'accounts': accounts}
+            if path == '/tasks?uid=u':
+                return {'ok': False, 'error': '任务服务不可用'}
+            raise AssertionError(path)
+        scope = isolated(ROOT / 'router.py', {'Handler', '_num', '_action_status'},
+                         {'engine_request': fake, 'json': json, 'log': lambda *_: None})
+        obj = object.__new__(scope['Handler'])
+        result = scope['Handler']._wb_claim_all(obj, {}, {})
+        self.assertFalse(scope['_action_status'](result)['ok'])
+        self.assertEqual(result['accounts'][0]['error'], '任务服务不可用')
+        self.assertNotIn('skipped', result['accounts'][0])
+
+    def test_media_capability_stays_realm_specific(self):
+        import urllib.request  # ensure package submodule is available to isolated handler
         payloads = {
             "cn": {"models": [
                 {"id": "kling-video-v3", "name": "Kling", "tags": ["text-to-video"],
@@ -473,6 +1373,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(errors, {})
         self.assertEqual(by_id["kling-video-v3"]["realms"], ["cn", "intl"])
         self.assertEqual(by_id["kling-video-v3"]["kind"], "video")
+        self.assertEqual(by_id["kling-video-v3"]["tags_by_realm"], {
+            "cn": ["text-to-video"], "intl": ["image-to-video"]})
         self.assertEqual(by_id["hunyuan-image-alpha"]["realms"], ["cn"])
         self.assertEqual(by_id["hy-image-3.5"]["realms"], ["intl"])
         self.assertEqual(by_id["hy-image-3.5"]["kind"], "image")
@@ -580,6 +1482,124 @@ class GatewayTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_wb_session_key_prefers_explicit_id(self):
+        scope = isolated(ROOT / "router.py", {"_wb_session_key", "_wb_header"},
+                         {"hashlib": hashlib})
+        fn = scope["_wb_session_key"]
+        a = fn({"prompt_cache_key": "abc"}, "/v1/chat/completions", {}, "m")
+        b = fn({"prompt_cache_key": "abc"}, "/v1/chat/completions", {}, "m")
+        c = fn({"prompt_cache_key": "xyz"}, "/v1/chat/completions", {}, "m")
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        h1 = fn({"messages": [{"role": "system", "content": "sys"}], "tools": [{"x": 1}]},
+                "/v1/chat/completions", {}, "m")
+        h2 = fn({"messages": [{"role": "system", "content": "sys"}], "tools": [{"x": 1}]},
+                "/v1/chat/completions", {}, "m")
+        self.assertEqual(h1, h2)
+        self.assertIsNone(fn({"messages": [{"role": "user", "content": "hi"}]},
+                             "/v1/chat/completions", {}, "m"))
+
+    def test_wb_plan_prefers_sticky_then_health(self):
+        scope = isolated(ROOT / "router.py", {"_wb_plan"}, {
+            "_wb_account_realms": lambda _: ["cn", "intl"],
+            "_wb_model_realm": lambda _: None,
+            "_wb_session_key": lambda *_: "k",
+            "_wb_sticky_get": lambda _: "intl",
+            "_wb_dual_prefer": lambda: "cn",
+            "_wb_health_ok": lambda realm: realm != "intl"})
+        plan = scope["_wb_plan"]("m", {}, "/v1/chat/completions", {})
+        self.assertEqual(plan["order"], ["cn", "intl"])
+        self.assertEqual(plan["reason"], "sticky+health")
+        self.assertEqual(plan["sticky"], "intl")
+        self.assertEqual(plan["preferred"], "cn")
+        scope["_wb_model_realm"] = lambda _: "intl"
+        scope["_wb_account_realms"] = lambda _: ["intl"]
+        plan = scope["_wb_plan"]("m", {}, "/v1/chat/completions", {})
+        self.assertEqual(plan["order"], ["intl"])
+        self.assertEqual(plan["reason"], "fixed")
+        scope["_wb_account_realms"] = lambda _: []
+        self.assertEqual(scope["_wb_plan"]("m", {}, "/v1/chat/completions", {})["order"], [])
+
+    def test_wb_retryable_only_for_upstream_pressure(self):
+        scope = isolated(ROOT / "router.py", {"_wb_retryable"}, {
+            "WB_RETRY_STATUSES": {408, 425, 429, 500, 502, 503, 504}})
+        fn = scope["_wb_retryable"]
+        self.assertTrue(fn(429, b"{}"))
+        self.assertTrue(fn(500, b"{}"))
+        self.assertFalse(fn(400, b"{}"))
+        self.assertTrue(fn(403, b'{"code":10605,"isQueued":true}'))
+        self.assertFalse(fn(403, b'{"error":"content policy"}'))
+
+    def test_wb_health_cooldown_and_recovery(self):
+        scope = isolated(ROOT / "router.py",
+                         {"_wb_health_fail", "_wb_health_success", "_wb_health_ok"}, {
+                             "WB_HEALTH_BASE_COOLDOWN": 30.0,
+                             "WB_HEALTH_MAX_COOLDOWN": 300.0,
+                             "_wb_route_lock": threading.Lock(),
+                             "_wb_route_health": {},
+                             "log": lambda *_: None})
+        ok, fail, success = (scope["_wb_health_ok"], scope["_wb_health_fail"],
+                             scope["_wb_health_success"])
+        self.assertTrue(ok("cn"))
+        fail("cn", 429)
+        self.assertFalse(ok("cn"))
+        self.assertGreaterEqual(scope["_wb_route_health"]["cn"]["cooldown_until"],
+                                time.time() + 25)
+        success("cn")
+        self.assertTrue(ok("cn"))
+
+    def test_wb_sticky_set_get_clear(self):
+        scope = isolated(ROOT / "router.py",
+                         {"_wb_sticky_get", "_wb_sticky_set", "_wb_sticky_clear"}, {
+                             "WB_STICKY_TTL": 1800.0, "WB_STICKY_MAX": 4,
+                             "_wb_route_lock": threading.Lock(),
+                             "_wb_route_sticky": {}})
+        get, put, clear = (scope["_wb_sticky_get"], scope["_wb_sticky_set"],
+                           scope["_wb_sticky_clear"])
+        put("k", "cn")
+        self.assertEqual(get("k"), "cn")
+        clear("k")
+        self.assertIsNone(get("k"))
+
+    def test_wb_retries_alternate_realm_before_relay(self):
+        import contextlib
+        from unittest.mock import Mock
+        calls = []
+
+        def fake_forward(up, method, path, payload, headers, stream):
+            calls.append(dict(headers))
+            if len(calls) == 1:
+                return 429, {"Content-Type": "application/json"}, b'{"error":"rate limit"}'
+            return 200, {"Content-Type": "application/json"}, b'{"ok":true}'
+
+        fail, success = Mock(), Mock()
+        sticky = Mock()
+        self.ns.update(
+            CONFIG={"upstreams": [{"name": "workbuddy", "base_url": "http://127.0.0.1:8788"}]},
+            resolve_model=lambda _: (self.ns["CONFIG"]["upstreams"][0], "m", "m", None),
+            _wb_plan=lambda *_: {"order": ["cn", "intl"], "available": ["cn", "intl"],
+                                 "preferred": "cn", "sticky": None, "key": "k",
+                                 "reason": "prefer", "fixed": None},
+            forward=fake_forward,
+            _platform_inflight=lambda _: contextlib.nullcontext(),
+            _wb_health_fail=fail, _wb_health_success=success,
+            _wb_sticky_set=sticky, _wb_sticky_clear=Mock(),
+            _wb_retryable=lambda status, body: status == 429,
+            _wb_retry_after=lambda headers: 30,
+            _wb_log_route=Mock())
+        obj = self.post("/v1/chat/completions",
+                        raw=b'{"model":"workbuddy/m","messages":[]}')
+        obj._relay_json = Mock()
+        obj.do_POST()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].get("X-Realm"), "cn")
+        self.assertEqual(calls[1].get("X-Realm"), "intl")
+        fail.assert_called_once()
+        success.assert_called_once_with("intl")
+        sticky.assert_called_once_with("k", "intl")
+        obj._relay_json.assert_called_once()
+        self.assertEqual(obj._relay_json.call_args.args[0], 200)
+
     def test_dashboard_offline(self):
         import subprocess
         # Run the actual inline script with a synthetic DOM, transport and clock.
@@ -652,6 +1672,30 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  el('gate-input').value='bad';await run('tryGate()');
  assert.equal(el('gate-err').style.display,'block');assert.match(el('gate-err').textContent,/401/);
  store.set('gh_key','synthetic');
+ // Platform toggles: disabled platform renders, toggle posts the new state.
+ let platformPosts=[];
+ fetchImpl=async (p,opt)=>{
+   if(p==='/api/platforms'){
+     if(opt&&opt.method==='POST'){platformPosts.push(JSON.parse(opt.body));return reply({ok:true});}
+     return reply({ok:true,platforms:[
+       {name:'qoder',enabled:false,launch_configured:false,process:{managed:false,running:false,pid:null}},
+       {name:'workbuddy',enabled:true,launch_configured:true,process:{managed:true,running:true,pid:123}}]});
+   }
+   return reply({});
+ };
+ await run('loadPlatforms()');
+ assert.match(el('platform-list').innerHTML,/Qoder/);
+ assert.match(el('platform-list').innerHTML,/未运行/);
+ assert.match(el('platform-list').innerHTML,/网关托管/);
+ await run("togglePlatform('qoder',true)");
+ assert.equal(platformPosts.length,1);
+ assert.equal(platformPosts[0].name,'qoder');
+ assert.equal(platformPosts[0].enabled,true);
+ // CSV quoting covers CR/LF, commas and quotes exactly as CSV requires.
+ const cr=run('csvCell(String.fromCharCode(65,13,66))');assert.equal(cr.length,5);assert.equal(cr.charCodeAt(0),34);assert.equal(cr.charCodeAt(2),13);assert.equal(cr.charCodeAt(4),34);
+ const lf=run('csvCell(String.fromCharCode(65,10,66))');assert.equal(lf.length,5);assert.equal(lf.charCodeAt(2),10);
+ assert.equal(run('csvCell("A,B")'),'"A,B"');
+ assert.equal(run('csvCell("A\\\"B")'),'"A""B"');
  let rows=Array.from({length:25},(_,i)=>({model:'m',platform:'fake',total:10,at:i,outcome:'ok',credit:null}));
  fetchImpl=async p=>reply(p.startsWith('/api/usage')?{rows}:{items:[]});
  run('UPAGE=2');await run('loadUsage()');assert.equal(run('UPAGE'),2);
@@ -664,20 +1708,17 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.equal(run("VIEW_LOADED.has('usage')"),false);
  assert.match(el('load-state-usage').innerHTML,/加载失败/);
  fetchImpl=async p=>reply(p.startsWith('/api/usage')?{rows}:{items:[]});
- run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:null,known:0,total:1,models:[{model:'flash',balance_scope:'',model_balance:null,est_tokens:null,note:'余额待测，暂不估算',samples:0}]}]}};renderEstimate()");
+ run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:null,known:0,total:1,models:[{model:'qwen4-max',rate_per_mtok:null,rate_source:'unknown',est_tokens:null,note:'余额待测，暂不估算',samples:0}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/待测/);
  assert.match(el('overview-estimate').innerHTML,/已知 0\/1/);
  assert.doesNotMatch(el('overview-estimate').innerHTML,/0 分/);
- run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:0,known:1,total:1,models:[{model:'flash',balance_scope:'',model_balance:0,est_tokens:null,note:'',samples:0}]}]}};renderEstimate()");
+ run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:0,known:1,total:1,models:[{model:'qwen4-max',rate_per_mtok:51.02,rate_source:'anchored',est_tokens:0,note:'短样本相对价 × 钱包实测均价锚定',samples:3,sample_tokens:1000000,sample_hours:24}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/0 分/);
- run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'flash',balance_scope:'',model_balance:100,est_tokens:1000,est_tokens_opt:1500,cache_assumed:true,cache_hit_rate:0.9,est_tokens_floor:800,note:'短样本全价下限',samples:2}]}]}};renderEstimate()");
- assert.match(el('overview-estimate').innerHTML,/全未命中下限/);
- assert.match(el('overview-estimate').innerHTML,/800/);
- assert.match(el('overview-estimate').innerHTML,/乐观（90% 缓存假设）/);
- assert.match(el('overview-estimate').innerHTML,/1\.5k/);
- assert.match(el('overview-estimate').innerHTML,/短样本全价下限/);
- run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'flash',est_tokens:1000,note:'',samples:2}]}]}};renderEstimate()");
- assert.doesNotMatch(el('overview-estimate').innerHTML,/全未命中下限/);
+ assert.match(el('overview-estimate').innerHTML,/51\.02 分\/Mtok/);
+ run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'qwen4-max',rate_per_mtok:51.02,rate_source:'anchored',est_tokens:1960015,note:'短样本相对价 × 钱包实测均价锚定',samples:3,sample_tokens:1000000,sample_hours:24}]}]}};renderEstimate()");
+ assert.match(el('overview-estimate').innerHTML,/1\.96M/);
+ assert.match(el('overview-estimate').innerHTML,/锚定/);
+ assert.doesNotMatch(el('overview-estimate').innerHTML,/全未命中下限|乐观/);
  run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
  fetchImpl=async()=>reply({ok:false,platform:'qoder',checked:0,total:2,
    error:'0/2 个账号成功',result:{results:[{uid:'a'},{uid:'b'}]}});
@@ -688,6 +1729,20 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.match(el('usage-conv').innerHTML,/100\.0000/);
  assert.match(el('usage-conv').innerHTML,/积分覆盖 1\/2/);
  assert.match(el('usage-conv-note').textContent,/100\.0000/);
+ // Usage charts are part of the records view and must render on first load.
+ run("USAGE={rows:[{at:100,platform:'workbuddy',prompt:10,completion:4,total:14,cached:0},{at:200,platform:'trae',prompt:20,completion:5,total:25,cached:5}],usd_cny:null};renderUsage();");
+ assert.match(el('usage-charts').innerHTML,/Token 使用/);
+ assert.match(el('usage-cache').innerHTML,/缓存命中率/);
+ assert.equal(el('usage-statview').classList.contains('hidden'),true);
+ el('usage-records').classList.add('hidden');el('usage-statview').classList.remove('hidden');
+ run('renderUsage()');
+ assert.match(el('usage-cache').innerHTML,/缓存命中率/);
+ assert.match(el('usage-charts').innerHTML,/Trae/);
+ run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
+ run("renderUsageConversion([{platform:'raccoon',model:'sn-qwen4-max',total:1000,credit:null,cost_cny:null}])");
+ assert.match(el('usage-conv').innerHTML,/小浣熊/);
+ assert.match(el('usage-conv').innerHTML,/上游未提供逐条积分/);
+ assert.match(el('usage-conv-note').textContent,/积分未知/);
  assert.equal(run("balanceSummary([{enabled:true,remain:null}]).value"),null);
  assert.equal(run("balanceSummary([{enabled:true,remain:0}]).value"),0);
  run("renderUsageStats([{credit:0}])");assert.match(el('usage-stats').innerHTML,/0\.00/);
@@ -706,6 +1761,15 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.equal(el('media-video-opts').style.display,'flex');
  assert.equal(run("DAILY_STEPS.some(s=>s.platform==='workbuddy'&&s.path==='scheduler/trigger')"),true);
  assert.equal(run("mediaPrice({media:'image',credit_per_image:6})"),'6 积分/张（估）');
+ // Trae platform wiring: label, sidebar link, add-account card, filters, automation.
+ assert.equal(run("PLATFORM_LABEL.trae"),'Trae');
+ assert.equal(run("PF_COLOR.trae"),'#0dbd8b');
+ assert.equal(run("!!AUTO_BUTTONS.trae"),true);
+ assert.equal(run("AUTO_BUTTONS.trae[0].items.some(i=>i.k==='checkin/trae')"),true);
+ assert.equal(run("DAILY_STEPS.some(s=>s.platform==='trae'&&s.kind==='checkin')"),true);
+ assert.equal(html.includes('data-engine-link="trae"'),true);
+ assert.equal(html.includes('id="trae-start"'),true);
+ assert.equal(html.split('<option value="trae">Trae</option>').length-1,2);
  // Navigation paints immediately even when requests never settle.
  fetchImpl=()=>new Promise(()=>{});navs[1].onclick();
  assert.equal(views[1].classList.contains('active'),true);

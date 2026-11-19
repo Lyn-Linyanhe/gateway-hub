@@ -1,159 +1,260 @@
-# Gateway Hub · 多引擎聚合反代控制台
+# Gateway Hub · 多引擎聚合控制台
 
-把多个**本地 AI 网关引擎**（WorkBuddy / Qoder / 千问办公）聚合为**一个 OpenAI 兼容入口 + 一个统一 Web 看板**。
+把多个**本地 AI 网关引擎**聚合为一个 OpenAI 兼容入口和统一 Web 看板。仅供本机、个人账号使用；本仓库不包含上游引擎，也不提供第三方账号或额度。
 
-只做编排与展示：模型目录合并、按名字路由、SSE 透传、账号池/积分/用量聚合、自动化操作代理。真正的协议转换与账号维护仍在各引擎里完成。
+网关负责模型目录、按模型路由、流式响应转发、账号与用量展示、平台启停和管理操作代理。协议转换、账号维护和平台实际计费仍由各上游引擎负责。
 
+| 平台 | 配置名称／模型前缀 | 默认上游地址 |
+|---|---|---|
+| WorkBuddy | `workbuddy` | `http://127.0.0.1:8788` |
+| Qoder | `qoder` | `http://127.0.0.1:8790` |
+| 千问办公（Buddy2api） | `qwenwork` | `http://127.0.0.1:8792` |
+| 小浣熊（xhx2api） | `raccoon` | `http://127.0.0.1:7867` |
+| Trae | `trae` | `http://127.0.0.1:8791` |
+
+```text
+本地 WorkBuddy / Qoder / Buddy2api / xhx2api / Trae 引擎
+                         │
+                  Gateway Hub :8787
+                         │
+           OpenAI 兼容客户端（ZCode / Codex / …）
 ```
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│ workbuddy2api │   │ qoder2api-hub │   │   Buddy2api   │
-│    :8788      │   │    :8790      │   │    :8792      │
-└───────┬───────┘   └───────┬───────┘   └───────┬───────┘
-        │                   │                   │
-        └───────────────┬───┴───────────────────┘
-                        ▼
-              ┌───────────────────┐
-              │   Gateway Hub     │  ← 本仓库（router.py + dashboard.html）
-              │       :8787       │
-              └─────────┬─────────┘
-                        ▼
-        OpenAI 兼容客户端（ZCode / Codex / NextChat / …）
-        baseUrl: http://127.0.0.1:8787/v1
-```
 
-## 特性
+## 主要功能
 
-- **一个 URL、一个 Key 聚合三平台**：`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 按模型名路由，SSE 流式透传；非流式响应回显客户端请求的模型名。
-- **模型可见性管理**：控制哪些模型对外可见——隐藏的模型从 `/v1/models` 消失、调用被拒绝；支持批量勾选、整平台开关、收藏置顶。
-- **WorkBuddy 媒体生成**：生图 `/v1/images/generations`、改图 `/v1/images/edits`、异步生视频 `/v1/videos`（提交/状态/取消/产物直链），媒体模型清单 `/v1/media/models`（`workbuddy/hunyuan-image-alpha`、`kling-video-v3` 等）。媒体模型刻意不混入 `/v1/models`，避免聊天客户端误用；可见性与聊天模型共用隐藏表，控制台「媒体」页可直接试生成。
-- **统一带平台前缀**：`/v1/models` 只发 `平台/模型`（如 `workbuddy/glm-5.3`），一眼看出归属；裸名调用仍兼容（全网关唯一时）。
-- **双区临期调度（WorkBuddy）**：同名模型国内版/国际版都有时，按两区「最临期积分包」的紧迫度自动选择出口（`wb_dual_prefer: auto/cn/intl`）；选中区域对该模型有会员门槛且无付费账号时自动换区。
-- **PRO 会员锁定**：上游目录标注的付费专属模型，在账号池没有付费账号时自动从 `/v1/models` 隐藏并给出明确拒绝话术；会员账号入池后自动恢复。
-- **用量分析**：三平台请求合并明细（含输入/输出/缓存/推理强度/耗时/速度）；按平台分段的 token 时间曲线；各平台缓存命中率曲线；按模型汇总；**换算统计**（实测积分/千tok vs 目录倍率，WorkBuddy 附引擎参考成本）。
-- **自动化操作代理**：签到（WorkBuddy 国内签到+国际打卡合并）、国际网页通道补打卡、成长任务/全账号领奖/猫猫旅行/夜猫子/连登、Token 保活、积分刷新、额度窗口刷新、调度器触发/详情——白名单代理到各引擎。
-- **上游版本检测**：Qoder / Buddy2api 直查 GitHub Release tag（HEAD 302，不吃 API 配额），WorkBuddy 走引擎自带更新检查。
-- **零依赖**：router.py 仅用 Python 标准库（3.10+），单文件 5k 行以内；dashboard 是单文件静态页（无构建、无 CDN）。
+- **统一入口**：`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，按 `平台/模型` 路由；SSE 流式转发，非流式响应回显客户端模型名。接口是否支持以及协议转换质量取决于对应引擎。
+- **平台开关与进程**：设置页可启用或停用平台；停用后从总览、目录、路由和轮询中排除，并尝试停止引擎；启用后按已配置的 `launch` 自动启动。
+- **模型管理**：显示／隐藏、批量操作、收藏、模型规格与倍率展示；裸模型名仅在能唯一解析时兼容。
+- **WorkBuddy 双区路由**：依据可用区域、会员资格和临期积分选路；会话区域粘性、失败冷却、首字前换区重试。账号选择仍在引擎内完成。
+- **用量与额度**：汇总请求、token、已知缓存、扣费、耗时和错误；按时间／平台／模型筛选与导出。余额、成本或缓存字段缺失时保留未知状态。
+- **媒体**：WorkBuddy 图片／视频、小浣熊图片生成与改图；媒体目录与聊天目录分开，避免客户端误选。媒体调用会消耗对应平台额度。
+- **管理操作**：按平台白名单代理签到、保活、积分刷新、任务和调度器等操作；执行结果与奖励到账状态分开展示。
+- **版本检查**：查询上游引擎版本；社区镜像参照会单独标注。
+
+运行仅需 Python 3.10+ 标准库；看板为单文件 HTML，无构建步骤或 CDN 依赖。开发回归测试另外需要 Node.js。
 
 ## 快速开始
 
-1. **先自行部署三个上游引擎**（本仓库不含引擎）并记下各自的地址与 API Key / 面板密码：
-   - WorkBuddy 引擎（Telegram 分发，默认 `127.0.0.1:8788`）
-   - Qoder 引擎 [shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（默认 `8790`）
-   - Buddy2api [wicm84266964/Buddy2api](https://github.com/wicm84266964/Buddy2api)（qwenwork-only 模式，默认 `8792`）
-2. 复制配置并填入你的 Key：
+### 1. 部署需要的上游引擎
 
-   ```bash
-   cp config.example.json config.json
-   # 编辑 config.json：api_key / upstreams[].api_key / panel_password
-   ```
+不需要的平台可从配置删除，或在设置页停用。上游参考：
 
-3. 启动（任选其一）：
+- WorkBuddy：按引擎分发渠道自行部署。
+- Qoder：[shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)。
+- Buddy2api：[wicm84266964/Buddy2api](https://github.com/wicm84266964/Buddy2api)，使用 qwenwork 渠道。
+- 小浣熊：[rsfree/xhx2api](https://github.com/rsfree/xhx2api)。
+- Trae：[shuishuipingan/trae2api-hub](https://github.com/shuishuipingan/trae2api-hub)。
 
-   ```bash
-   python router.py           # 前台
-   run-router.bat             # Windows 静默后台（pythonw）
-   ```
+这些是独立项目，许可、安装要求和账号登录方式以各自仓库为准。
 
-4. 浏览器打开 <http://127.0.0.1:8787>，输入 `config.json` 里的 `api_key` 进入控制台。
+### 2. 创建本机配置
 
-### 一键更新
-
-朋友/其他机器不需要每次手动打开 GitHub：双击 `update.bat` 即可检查并更新到最新 Release。
-
-- 自动读取 GitHub 最新 release，版本不高于本机时直接退出。
-- 优先在干净的 git 仓库里 `git pull --ff-only`；否则下载 release 源码并只覆盖代码文件。
-- 不会覆盖 `config.json`、账号、日志和运行态文件。
-- 更新后自动做 Python 语法检查并重启 8787；失败会从 `backup-*` 恢复旧文件。
-- 只想检查不更新：`update.bat -CheckOnly`；不自动重启：`update.bat -NoRestart`。
-
-首次需要把 `update.bat`、`update.ps1` 放进网关目录（或直接使用 v1.8.1 及以上 Release 的源码包）；之后双击即可。
-
-### QwenWork 上游启动（可选）
-
-Buddy2api 放在网关同级的 `..\Buddy2api` 时，直接双击 `start-buddy2api.bat`；其它位置用：
-
-```bat
-start-buddy2api.bat 8792 D:\path\to\Buddy2api
+```bash
+cp config.example.json config.json
 ```
 
-它固定用仓库 `.venv\Scripts\python.exe`（含千问聊天必需的 `wasmtime`），并在启动进程里清空 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`、只把 `gateway.qwenwork.cn` 放进 `NO_PROXY`。这样即使系统里残留了已停止的 FlClash `127.0.0.1:7890`，也不会再出现 `All connection attempts failed` 的 502。若所在网络必须经代理访问千问，请改脚本显式配置代理。
+Windows 也可手动复制。编辑 `config.json` 中的引擎地址、API Key 和面板密码；示例值不能直接用于生产账号。网关入口 `api_key` 留空时在启动时生成，生成后的值保存在本机配置中。
 
-5. 客户端接入：
+**不要提交 `config.json`、上游账号目录、授权链接、日志或余额历史。** 示例配置不包含可用凭据；仓库忽略规则也不替代提交前检查。
 
-   ```
-   Base URL : http://127.0.0.1:8787/v1
-   API Key  : config.json 的 api_key（agg- 开头）
-   Model    : 平台/模型，如 workbuddy/glm-5.3-flash、qoder/Qwen3.8-Flash、qwenwork/qwen4-max
-   思考强度 : 按 OpenAI 规范传 reasoning_effort（low/medium/high/max/xhigh，见模型页规格行）
-   ```
+### 3. 启动网关
 
-## 配置说明（config.json）
+```bash
+python router.py
+```
+
+Windows 可双击 `run-router.bat` 使用 `pythonw.exe` 后台启动。浏览器打开 <http://127.0.0.1:8787>，输入本机配置中的网关 Key。启动脚本只提交启动请求，服务是否就绪应以看板或 `/health` 为准。
+
+### 4. 接入客户端
+
+```text
+Base URL: http://127.0.0.1:8787/v1
+API Key:  config.json 中的 api_key
+Model:    平台/模型，例如 raccoon/sn-qwen4-max
+```
+
+通过 `/v1/models` 获取当前可见模型，不应把文档示例当作上游始终可用的模型清单。
+
+## 平台启停与上游启动
+
+在看板**设置 → 平台开关与进程**中操作：
+
+- **启用**：恢复展示与路由；引擎未健康运行且配置了 `launch` 时自动启动。
+- **停用**：停止展示、路由及相关轮询，并尝试停止引擎进程。
+- **单独启动／停止**：操作引擎进程，不等同于切换平台启用状态。
+- **外部启动的进程**：停用平台时，仅在端口监听者身份可验证时停止；无法确认时返回原因，不任意强杀。
+
+`launch` 示例：
+
+```json
+{
+  "command": ["pythonw.exe", "D:\\engines\\example\\server.py"],
+  "cwd": "D:\\engines\\example",
+  "timeout": 30,
+  "env": {"EXAMPLE_OPTION": "1"}
+}
+```
+
+数组形式直接执行；字符串形式通过系统 shell 执行，只应使用自己信任的本机命令。平台启用状态会持久化；重启网关不会自动停止或拉起所有外部引擎。
+
+### 千问办公
+
+Buddy2api 放在网关同级的 `../Buddy2api` 时：
+
+```bat
+start-buddy2api.bat
+```
+
+其它位置：
+
+```bat
+start-buddy2api.bat 8792 D:\engines\Buddy2api
+```
+
+脚本使用引擎自己的 `.venv\Scripts\python.exe`，检查 `wasmtime`，并清空启动进程中的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`。若访问千问必须经过代理，需自行调整脚本；它不会修改系统代理设置。
+
+### 小浣熊
+
+部署 xhx2api 后手动运行示例：
+
+```bat
+cd /d D:\engines\xiaohuanxiong2api
+xhx2api.exe -config config.json
+```
+
+将引擎生成的 Key 配到网关 `name=raccoon` 的 `api_key`，通过 <http://127.0.0.1:7867/panel/> 登录自己的账号。账号凭据留在引擎目录中。网关读取账号概览、请求事件和只读积分账单；签到／保活等操作另走白名单代理。
+
+**思考档位使用顶层 `raccoon_thinking_level`**，不是旧的 `deepThink` 布尔字段。Chat 路径能否透传和其它入口是否丢字段，应按引擎版本区分。配置示例与已知边界见 [小浣熊思考档位](docs/raccoon-thinking.md)。
+
+### Trae
+
+手动启动示例：
+
+```bat
+cd /d D:\engines\trae2api-hub
+set QODER_DISABLE=1
+set TRAE_PROXY_DEFAULT_REALM=cn
+python trae_proxy.py --port 8791
+```
+
+浏览器打开 <http://127.0.0.1:8791/> 完成账号登录并配置面板密码。将引擎 API Key 和面板密码分别填写到网关的 `api_key` 和 `panel_password`。
+
+- `QODER_DISABLE=1` 用来关闭 Trae 引擎内置的 Qoder 通道，避免与独立 Qoder 引擎重复。
+- 上游引擎会读取代理环境变量。若系统残留已停止的本机代理，可在 `launch.env` 中清空三个代理变量并设置合适的 `NO_PROXY`；示例不代表当前机器已完成配置。
+- Trae 的 `reasoning_effort_level` 转换由 Trae 引擎按目录处理，网关本身只透传请求。
+- 逐请求扣费估值依赖上游明确记录 `credit_reported=true`；旧版没有该字段时继续待测。上游兼容要求见 [扣费与额度预估](docs/billing.md)。
+
+## 额度预估与计费边界
+
+每个模型按以下公式独立计算：
+
+```text
+预计 token = 该模型可用余额 ÷ 有效单价（分/Mtok）× 1,000,000
+```
+
+同平台模型通常共享余额，各行是“全部余额用于该模型”的不同情景，**不能相加**。模型倍率不等同于绝对单价；参考货币成本不替代实际积分。样本不足、余额不全或账单无法匹配时显示“待测”。
+
+WorkBuddy/Qoder 按逐请求实扣计价，千问办公用钱包均价校准短样本相对价，小浣熊只用唯一账单关联，Trae 只用明确报告的扣费。当前不会按思考档位分别标价，样本成本不代表固定官方报价。详细来源、样本门槛和限制见 [扣费与额度预估](docs/billing.md)。
+
+## 配置说明
 
 | 字段 | 说明 |
 |---|---|
-| `listen_port` | 监听端口，默认 8787（仅本机可访问） |
-| `api_key` | 聚合入口 Key，`agg-` 开头；留空启动时自动生成 |
-| `upstreams[]` | 上游引擎列表：`name` / `base_url` / `api_key` / `panel_password` / `repo`（更新检测用，可选） |
-| `upstreams[].base_url` | **仅支持本机回环地址**（`127.0.0.1` / `localhost` / `::1`）。网关对回环上游禁代理并禁止跟随重定向，避免面板凭证跨源；远程引擎地址未经该保护验证，当前不受支持。 |
-| `hidden_models` | 已隐藏模型（`平台/模型` 全名），由控制台维护 |
-| `favorite_models` | 收藏模型（置顶展示） |
-| `hide_pro_locked` | PRO 专属模型在无付费账号时自动隐藏，默认 `true` |
-| `wb_dual_prefer` | 双区模型出口偏好：`auto`（按临期紧迫度）/ `cn` / `intl` |
-| `wb_update_mirror` | 可选。WorkBuddy 官方 GitHub 仓库已下线时，用这个 `owner/repo` 镜像的 release tag 做版本参照；默认 `niyouqianma/workbuddy2api-hub`。镜像可能滞后，页面会标注“镜像参照” |
-| `custom_multipliers` / `auto_multipliers` | 手工倍率由控制台维护；旧 `auto_multipliers` 仅保留历史，不再自动更新或用作价格 |
-| `model_caps` | 实测能力补充表：`{"qwenwork/qwen4-max": {"vision": true}}`。上游目录不声明多模态/工具能力时（如 qwenwork 供应商列表），把实测结论写在这里；`/api/catalog` 与 `/v1/models` 的 `capabilities` 都会带上 |
+| `listen_port` | 网关端口，默认 8787；只监听本机回环地址 |
+| `api_key` | 网关入口 Key；留空时启动生成，勿使用公开占位值 |
+| `upstreams[]` | 引擎 `name`、`base_url`、`api_key`、`panel_password`、可选 `repo` 和 `launch` |
+| `upstreams[].base_url` | 仅支持回环地址 `127.0.0.1`、`localhost`、`::1`；回环请求禁代理及重定向 |
+| `upstreams[].launch` | 可选启动命令、工作目录、等待超时及环境变量；不保存账号凭据 |
+| `disabled_platforms` | 停用平台数组，如 `["qoder"]`；设置页维护 |
+| `hidden_models` | 隐藏模型的 `平台/模型` 全名 |
+| `favorite_models` | 收藏模型的 `平台/模型` 全名 |
+| `hide_pro_locked` | WorkBuddy 没有对应会员账号时隐藏会员专属模型，默认 true |
+| `wb_dual_prefer` | WorkBuddy 新会话偏好：`auto`／`cn`／`intl`；已有会话优先保持区域粘性 |
+| `wb_update_mirror` | 可选 WorkBuddy 社区镜像 release 参照；不保证与官方分发同步 |
+| `custom_multipliers` | 手工展示倍率；不能据此假设绝对计费单价 |
+| `auto_multipliers` | 历史兼容字段，不再自动标定价格 |
+| `model_caps` | 已验证能力补充，例如 `{"qwenwork/qwen4-max":{"vision":true}}` |
+| `qwenwork_reset_at` | 可选千问企业配额重置日期；由用户提供，不代表官方接口返回 |
 
 ## 常用接口
 
-| 接口 | 说明 |
+除健康检查、静态页面与受签名保护的媒体直链外，管理接口和聚合入口均需网关鉴权。
+
+| 接口 | 用途 |
 |---|---|
-| `GET /v1/models` | 聚合模型列表（已隐藏/PRO 锁定除外，均带平台前缀） |
-| `POST /v1/chat/completions` 等 | 按模型名路由到对应引擎 |
-| `POST /v1/images/generations` · `/v1/images/edits` | 生图/改图（WorkBuddy，同步；`model` 可写 `workbuddy/<id>` 或裸名，省略则用默认图片模型） |
-| `POST /v1/videos` | 提交异步生视频任务（返回 202 + 任务 id；支持 `wait=1` 阻塞到完成） |
-| `GET /v1/videos/{id}` | 查询视频任务状态（queued / in_progress / completed / failed） |
-| `GET /v1/videos/{id}/content` | 下载 MP4 产物（签名直链，不经网关 Key） |
-| `POST /v1/videos/{id}/cancel` | 取消仍在排队的视频任务 |
-| `GET /v1/media/models` | 媒体模型清单（`?tag=` / `?realm=cn|intl` 过滤；不进 `/v1/models`） |
-| `GET /api/media/models` | 控制台媒体目录（含隐藏标记与媒体价格） |
-| `GET /api/status` | 三平台健康、账号池、积分、即将过期积分 |
-| `GET /api/catalog` | 模型管理页数据（含可见性/倍率/规格/出口/媒体标记） |
-| `POST /api/models/visibility` | 隐藏/显示模型（`{id}`、`{ids}`、`{platform}`、`{visible:true}`） |
-| `GET /api/usage?limit=500` | 三平台用量合并（WorkBuddy 含国内+国际双区） |
-| `POST /api/checkin/{platform}` | 签到（WorkBuddy = 国内签到 + 国际打卡合并） |
-| `POST /api/tasks/{action}/{platform}` | 任务：run / claim（按全部国内账号领奖）/ travel / night / streak-bonus / daily-web |
-| `POST /api/engine` | 白名单引擎代理（保活/积分刷新/调度器/每日打卡） |
-| `GET /api/gwconfig` · `POST` | 网关自身开关（`hide_pro_locked`、`wb_dual_prefer`） |
-| `GET /api/updates?force=1` | 上游版本检测 |
-| `GET /health` | 健康检查（无鉴权） |
+| `GET /health` | 网关及启用平台健康 |
+| `GET /v1/models` | 当前可见聊天模型；带平台前缀 |
+| `POST /v1/chat/completions`、`/v1/responses`、`/v1/messages` | 转发对应平台接口 |
+| `GET /api/status` | 账号池、积分、健康及临期记录 |
+| `GET /api/catalog` | 模型规格、倍率、可见性 |
+| `GET /api/usage?limit=500` | 合并用量明细；未知字段保留为空 |
+| `GET /api/estimate` | 额度可用量预估与样本依据 |
+| `GET /api/platforms`、`POST /api/platforms` | 平台启用状态、启动配置和进程状态；POST 可产生进程或配置变更 |
+| `POST /api/models/visibility`、`/api/models/favorite`、`/api/models/rate` | 模型管理 |
+| `GET /api/gwconfig`、`POST /api/gwconfig` | 网关选项 |
+| `POST /api/checkin/{platform}` | 对应引擎签到；WorkBuddy 可能包含国际活跃打卡 |
+| `POST /api/tasks/{action}/{platform}` | 引擎支持的任务操作 |
+| `POST /api/engine` | 仅允许平台白名单中的管理路径 |
+| `GET /api/updates?force=1` | 检查上游版本 |
+| `GET /v1/media/models`、`GET /api/media/models` | 媒体目录；不混入聊天模型 |
+| `POST /v1/images/generations`、`/v1/images/edits` | WorkBuddy／小浣熊图片请求，接受 JSON；不支持 multipart |
+| `POST /v1/videos`、`GET /v1/videos/{id}` | WorkBuddy 异步视频提交与状态 |
+| `POST /v1/videos/{id}/cancel`、`GET /v1/videos/{id}/content` | 视频取消与签名下载 |
 
-媒体出口沿用 WorkBuddy 引擎的媒体号池和 Key 区域绑定；网关会标注当前出口可用性，不自动改引擎区域或账号归属。控制台生成表单提供文生图、文生视频；图生图通过 JSON `/v1/images/edits`（`image` 为图片 URL 或 data URL）调用，不支持 multipart 文件上传。省略 `model` 时只选当前出口可见且支持目标操作的模型。视频下载直链带独立签名，有效期最多一小时，网关重启后需重新查询任务获取链接。
+模型、媒体别名、输出额度和价格随上游目录变化。小浣熊图片别名可能共用同一通道，不能仅凭别名认定为不同底层模型；生成张数与格式限制以接口错误和上游支持为准。
 
-WorkBuddy 的“运行成长任务”包含上游支持的成长、小程序和运营活动流水线；定时巡检另管国内活跃上报、Buddy 盲盒、签到、旅行、连登、夜猫子和国际打卡。一键补做会在同步步骤之后提交一次补充巡检，提交成功不代表后台任务全部完成。手机 App 对话需在官方 App 完成；夜猫子受时间窗口限制。网关不伪造这些任务的完成状态。
+## 更新
 
-## 回归测试
+Windows：
 
-离线回归不读取凭证、不访问网络，覆盖流式边界、工具结果、鉴权与统计缺失值：
-
-```bash
-python test_regressions.py
+```bat
+update.bat -CheckOnly
+update.bat
+update.bat -NoRestart
 ```
 
-`audit_platform.py` 是只读在线巡检，检查健康、鉴权和目录，不调用模型、不签到、不导入账号或修改配置；失败返回非零退出码：
+更新器查询最新 GitHub Release。Git 干净工作区路径会拉取 `origin/main`；源码包路径只复制白名单代码文件并创建 `backup-*`。两者并非严格安装相同 tag，也不保证所有失败均能事务回滚。更新前备份本机配置和自有代码改动；有未提交修改时优先手动检查差异，不要把文件覆盖当作合并。
+
+仅将代码推送 GitHub 不会自动创建 Release，`update.bat` 也不会因此发现新的 Release 版本。
+
+## 开发与验证
+
+依赖：Python 3.10+；完整离线回归额外需要 Node.js 22+，用于执行真实看板内联脚本的合成 DOM 测试。
+
+```bash
+python -I -B -m py_compile router.py audit_platform.py test_regressions.py
+python -I -B test_regressions.py
+```
+
+离线测试使用合成请求、假上游及临时目录，不应读取真实账号或调用真实模型。GitHub Actions 执行同一检查。
+
+已有引擎启动且具备本机授权时，可运行：
 
 ```bash
 python audit_platform.py
 ```
 
-额度预估以实测扣费为准：优先用「Σ实扣积分 ÷ Σtoken」计算有效单价（天然包含缓存折扣），并给出「全未命中下限」（扣费 ÷ 非缓存计费 token，或目录全价）。没有扣费样本时不编数字——WorkBuddy/Qoder 的目录价只作零缓存下限并标注"未经本机校准"，千问办公用短样本全价作保守下限、缓存假设只作乐观参考。余额未知或单价缺失显示"待测"。国际活跃的执行记录与奖励到账状态分开展示。
+在线巡检只检查健康、鉴权和目录，不调用模型、签到或导入；它会读取本机网关配置以进行鉴权，不适合含真实配置的公开 CI。
 
-## 免责声明
+## 仓库结构
 
-- 本项目是**个人自用的聚合编排工具**，与任何官方产品无关；非官方、非商用。
-- 上游三个引擎均为第三方开源项目，请遵守其各自许可；账号与平台使用需遵守对应平台的服务条款。
-- **请勿公开部署或分享**：控制台与聚合入口默认只监听本机，配置中含密钥；泄露配置等于泄露账号。
-- 使用者对自己的账号、额度与合规性负全部责任，作者不承担任何连带风险。
+```text
+router.py                 聚合路由、看板 API、平台管理与额度估值
+dashboard.html            单文件看板（无构建步骤）
+config.example.json       无可用凭据的配置示例
+run-router.bat            Windows 网关后台启动
+start-buddy2api.bat        千问引擎启动辅助
+update.bat / update.ps1   Windows 更新辅助
+audit_platform.py         只读在线巡检
+test_regressions.py        离线回归与看板合成测试
+docs/                     协议与计费说明
+CHANGELOG.md              尚未发布及历史维护记录
+```
 
-## License
+## 使用边界
 
-[MIT](LICENSE)
+- 只使用自己的账号，遵守各平台条款和上游项目许可。
+- 不公开部署、不转售或分享网关 Key；控制台含进程和账号管理功能。
+- 本项目为非官方个人编排工具，与各平台无隶属关系。
+
+代码许可：[MIT](LICENSE)。

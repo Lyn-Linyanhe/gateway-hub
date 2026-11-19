@@ -3,7 +3,7 @@ setlocal
 title Buddy2api / QwenWork launcher
 rem Usage:
 rem   start-buddy2api.bat [port] [path-to-Buddy2api]
-rem Default port 8792; default engine path is ../../Buddy2api next to gateway-hub.
+rem Default port 8792; default engine path is ../Buddy2api next to gateway-hub.
 rem This launcher deliberately clears HTTP(S)_PROXY: a stale local proxy
 rem (e.g. FlClash on 127.0.0.1:7890 that is no longer running) makes every
 rem QwenWork request fail with "All connection attempts failed".
@@ -14,7 +14,7 @@ set "PORT=%~1"
 if "%PORT%"=="" set "PORT=8792"
 
 set "ENGINE=%~2"
-if "%ENGINE%"=="" set "ENGINE=%~dp0..\..\Buddy2api"
+if "%ENGINE%"=="" set "ENGINE=%~dp0..\Buddy2api"
 for %%I in ("%ENGINE%") do set "ENGINE=%%~fI"
 
 if not exist "%ENGINE%\server.py" (
