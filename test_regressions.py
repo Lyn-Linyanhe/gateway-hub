@@ -2083,13 +2083,13 @@ const copyButtons=[...html.matchAll(/data-media-copy="([^"]+)"/g)].map(m=>{
 });
 let copiedText='';
 navs[0].classList.add('active');views[0].classList.add('active');
-const store=new Map();
+const store=new Map(), scheduledTimers=[];
 let fetchImpl=async()=>({ok:true,status:200,json:async()=>({})});
-const context=vm.createContext({console,Map,Set,Date,Promise,JSON,Number,String,Math,Array,Object,Error,
+const context=vm.createContext({console,Map,Set,Date,Promise,JSON,Number,String,Math,Array,Object,Error,AbortController,
  document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:s==='[data-media-copy]'?copyButtons:[],querySelector:()=>null,
    documentElement:{attrs:{},setAttribute(k,v){this.attrs[k]=v;}}},
  localStorage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)},
- fetch:(...a)=>fetchImpl(...a),setInterval:()=>1,clearInterval(){},setTimeout:()=>1,clearTimeout(){},
+ fetch:(...a)=>fetchImpl(...a),setInterval:()=>1,clearInterval(){},setTimeout:(fn,ms)=>{scheduledTimers.push({fn,ms});return scheduledTimers.length;},clearTimeout(){},
  requestAnimationFrame(){},navigator:{clipboard:{writeText:async text=>{copiedText=text;}}},CSS:{escape:x=>x}});
 vm.runInContext(source,context);
 const run=s=>vm.runInContext(s,context);
@@ -2336,7 +2336,31 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  el('btn-theme').onclick();
  assert.equal(store.get('gh_theme'),'light');
  assert.equal(run("document.documentElement.attrs['data-theme']"),'light');
- console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation, self-update, theme passed');
+ // Startup must not force a full estimate recomputation on every page load.
+ run("globalThis.__refreshCalls=[];refreshView=(view,force)=>{__refreshCalls.push({view,force});return Promise.resolve(true)};loadAll()");
+ assert.equal(run('JSON.stringify(__refreshCalls)'),JSON.stringify([{view:'overview',force:false}]));
+ // Estimate is an independent panel: slow estimate must not hold status/recent rows loading.
+ run("const realApi=api;globalThis.__finishEstimate=null;loadStatus=async()=>true;loadEstimate=()=>new Promise(resolve=>__finishEstimate=resolve);api=async()=>({rows:[],errors:{}})");
+ let overviewDone=false;
+ const overviewPromise=run('loadOverview(false)').then(()=>{overviewDone=true;});
+ await new Promise(resolve=>setImmediate(resolve));
+ const overviewReturnedBeforeEstimate=overviewDone;
+ run('__finishEstimate()');
+ await overviewPromise;
+ assert.equal(overviewReturnedBeforeEstimate,true);
+ // Read APIs have a finite abort deadline; a stalled fetch must become a retryable error.
+ const timersBefore=scheduledTimers.length;
+ fetchImpl=(_p,opt)=>new Promise((resolve,reject)=>opt.signal.addEventListener('abort',()=>reject(Object.assign(new Error('Aborted'),{name:'AbortError'}))));
+ const slowResult=run("realApi('/api/slow')").then(()=>({ok:true}),e=>({ok:false,error:e.message}));
+ await new Promise(resolve=>setImmediate(resolve));
+ const timeoutMs=run('API_READ_TIMEOUT_MS');
+ const timeoutTimer=scheduledTimers.slice(timersBefore).find(t=>t.ms===timeoutMs);
+ assert.ok(timeoutTimer,'read API should schedule its timeout '+JSON.stringify({timeoutMs,timers:scheduledTimers.slice(timersBefore).map(t=>t.ms)}));
+ timeoutTimer.fn();
+ const timeoutResult=await slowResult;
+ assert.equal(timeoutResult.ok,false);
+ assert.match(timeoutResult.error,/超时/);
+ console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation, self-update, theme, load latency passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 '''
         result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,

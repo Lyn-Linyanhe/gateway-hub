@@ -923,27 +923,42 @@ function requestPolicy(p,opt){
   return {read:false,views};
 }
 const API_PENDING=new Map();
+const API_READ_TIMEOUT_MS=20000;
 let GATE_ATTEMPT=0, AUTH_EPOCH=0;
 async function api(p, opt={}) {
   const policy=requestPolicy(p,opt), read=policy.read;
-  const {allowError=false,probeAuth=false,...fetchOpt}=opt;
+  const {allowError=false,probeAuth=false,timeoutMs=API_READ_TIMEOUT_MS,...fetchOpt}=opt;
   const key=KEY(), epoch=AUTH_EPOCH;
   const authHeader=(fetchOpt.headers||{}).Authorization||('Bearer '+key);
-  const requestKey=key+' '+p+' '+(fetchOpt.body||'')+(probeAuth?' '+authHeader:'');
+  const requestKey=key+' '+p+' '+(fetchOpt.body||'')+(probeAuth?' '+authHeader:'')+(read?' t'+timeoutMs:'');
   if(read&&!probeAuth&&API_PENDING.has(requestKey)) return API_PENDING.get(requestKey);
   const request=(async()=>{
     const headers=Object.assign({'Authorization':'Bearer '+key},fetchOpt.headers||{});
-    const r=await fetch(p,{...fetchOpt,headers});
-    if(r.status===401){
-      if(!probeAuth&&epoch===AUTH_EPOCH){AUTH_EPOCH++;localStorage.removeItem('gh_key');showGate();}
-      const err=new Error('401 请重新输入控制台 Key');err.status=401;throw err;
+    let timeoutId=null, timedOut=false;
+    const controller=(read||probeAuth)&&typeof AbortController==='function'?new AbortController():null;
+    if((read||probeAuth)&&controller){
+      fetchOpt.signal=controller.signal;
+      timeoutId=setTimeout(()=>{timedOut=true;controller.abort();},probeAuth?8000:timeoutMs);
     }
-    const data=await r.json();
-    if(!r.ok){const err=new Error(errMsg(data)||'HTTP '+r.status);err.status=r.status;throw err;}
-    if(read&&!allowError&&(data?.ok===false||data?.error)) throw new Error(errMsg(data)||'读取失败');
-    if(epoch!==AUTH_EPOCH&&!probeAuth) throw new Error('认证信息已更新，请重试');
-    if(!read&&data?.ok===true) policy.views.forEach(view=>VIEW_LOADED.delete(view));
-    return data;
+    try{
+      const r=await fetch(p,{...fetchOpt,headers,signal:controller?controller.signal:fetchOpt.signal});
+      if(r.status===401){
+        if(!probeAuth&&epoch===AUTH_EPOCH){AUTH_EPOCH++;localStorage.removeItem('gh_key');showGate();}
+        const err=new Error('401 请重新输入控制台 Key');err.status=401;throw err;
+      }
+      const data=await r.json();
+      if(!r.ok){const err=new Error(errMsg(data)||'HTTP '+r.status);err.status=r.status;throw err;}
+      if(read&&!allowError&&(data?.ok===false||data?.error)) throw new Error(errMsg(data)||'读取失败');
+      if(epoch!==AUTH_EPOCH&&!probeAuth) throw new Error('认证信息已更新，请重试');
+      if(!read&&data?.ok===true) policy.views.forEach(view=>VIEW_LOADED.delete(view));
+      return data;
+    }catch(e){
+      if(timedOut||e&&e.name==='AbortError'){
+        const seconds=Math.round((probeAuth?8000:timeoutMs)/1000);
+        const err=new Error(`请求超时（${seconds} 秒），请稍后重试`);err.code='READ_TIMEOUT';throw err;
+      }
+      throw e;
+    }finally{ if(timeoutId!==null) clearTimeout(timeoutId); }
   })();
   if(read&&!probeAuth) API_PENDING.set(requestKey,request);
   try{return await request;}
@@ -2029,13 +2044,23 @@ let EST_CACHE={ts:0,data:null}, EST_REQUEST=0;
 async function loadEstimate(force){
   const request=++EST_REQUEST;
   if(force) EST_CACHE={ts:0,data:null};
-  if(!force && EST_CACHE.data && Date.now()-EST_CACHE.ts < 120000){ renderEstimate(); return; }
+  if(!force && EST_CACHE.data && Date.now()-EST_CACHE.ts < 120000){ renderEstimate(); return true; }
+  const tb=document.getElementById('overview-estimate');
+  const noteEl=document.getElementById('overview-estimate-note');
+  if(!EST_CACHE.data&&tb) tb.innerHTML='<tr><td colspan="5" class="empty">额度预估计算中…</td></tr>';
   try{
     const d=await api('/api/estimate'+(force?'?force=1':''));
-    if(request!==EST_REQUEST) return;
+    if(request!==EST_REQUEST) return true;
     EST_CACHE={ts:Date.now(),data:d};
     renderEstimate();
-  }catch(e){ if(request===EST_REQUEST) return viewFailure('overview',e); }
+    return true;
+  }catch(e){
+    if(request===EST_REQUEST){
+      if(tb&&!EST_CACHE.data) tb.innerHTML=`<tr><td colspan="5" class="empty">额度预估暂不可用：${esc(e.message)}（其他数据仍可使用）</td></tr>`;
+      if(noteEl) noteEl.textContent=EST_CACHE.data?'保留上次成功的额度预估；本次刷新失败：'+e.message:'';
+    }
+    return false;
+  }
 }
 function renderEstimate(){
   const tb=document.getElementById('overview-estimate');
@@ -2954,8 +2979,11 @@ async function loadOverview(force=false){
   if(LAST_STATUS) renderOverview(LAST_STATUS);
   if(RECENT_ROWS.length) renderRecent({rows:RECENT_ROWS});
   const request=++RECENT_REQUEST;
+  // 额度预估独立加载：慢估值不能让状态卡片和最近请求一直保持「加载中」。
+  // 普通首屏/轮询使用网关 2 分钟缓存；只有用户手动刷新才强制重算。
+  loadEstimate(force);
   const results=await Promise.all([
-    loadStatus(), loadEstimate(force),
+    loadStatus(),
     api('/api/usage?limit=100').then(d=>{
       if(request!==RECENT_REQUEST) return true;
       RECENT_ERRORS=d.errors||{};
@@ -2992,12 +3020,19 @@ document.getElementById('btn-refresh-top').onclick=()=>refreshView('overview',tr
 /* ── 启动 ── */
 function gateHidden(){return document.getElementById('gate').classList.contains('hidden');}
 (async function init(){
-  try{ const h=await fetch('/health').then(x=>x.json()); if(h.version) document.getElementById('brand-version').textContent='聚合控制台 · v'+h.version; }catch(e){}
-  if(!KEY()){showGate();return;}
-  try{const r=await api('/api/ping');if(r.ok){loadAll();}else showGate();}
-  catch(e){showGate();}
+  if(!KEY()){ showGate(); probeGatewayHealth(); return; }
+  probeGatewayHealth();
+  try{ const r=await api('/api/ping',{timeoutMs:8000}); if(r.ok) loadAll(); else showGate(); }
+  catch(e){ showGate(); }
 })();
-function loadAll(){refreshView('overview',true);}
+function probeGatewayHealth(){
+  const controller=typeof AbortController==='function'?new AbortController():null;
+  const timeout=controller?setTimeout(()=>controller.abort(),5000):null;
+  fetch('/health',controller?{signal:controller.signal}:{}).then(r=>r.json()).then(h=>{
+    if(h.version) document.getElementById('brand-version').textContent='聚合控制台 · v'+h.version;
+  }).catch(()=>{}).finally(()=>{if(timeout!==null)clearTimeout(timeout);});
+}
+function loadAll(){refreshView('overview',false);}
 /* 30 秒定时刷新只作用于当前视图：全量 loadAll 会重复请求 usage 并把
    用户没在看的数据也刷一遍；账号视图的签到执行期间不重绘（见 loadStatus 守卫） */
 setInterval(()=>{
