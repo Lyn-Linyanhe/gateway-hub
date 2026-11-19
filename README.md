@@ -250,7 +250,7 @@ update.bat -NoRestart
 ```bash
 python -I -B -m py_compile router.py gateway_update.py audit_platform.py test_regressions.py test_gateway_update.py
 python -I -B test_regressions.py
-python -I -B test_gateway_update.py
+python -I -B -m unittest discover -p 'test_gateway_update.py'
 ```
 
 离线测试使用合成请求、假上游及临时目录，不应读取真实账号或调用真实模型。GitHub Actions 执行同一检查。

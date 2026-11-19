@@ -32,6 +32,6 @@ jobs:
       - name: Run offline regressions
         run: python -I -B test_regressions.py
       - name: Run self-update regressions
-        run: python -I -B test_gateway_update.py
+        run: python -I -B -m unittest discover -p 'test_gateway_update.py'
       - name: Check whitespace
         run: git diff --check
