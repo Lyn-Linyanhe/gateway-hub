@@ -2086,7 +2086,8 @@ navs[0].classList.add('active');views[0].classList.add('active');
 const store=new Map();
 let fetchImpl=async()=>({ok:true,status:200,json:async()=>({})});
 const context=vm.createContext({console,Map,Set,Date,Promise,JSON,Number,String,Math,Array,Object,Error,
- document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:s==='[data-media-copy]'?copyButtons:[],querySelector:()=>null},
+ document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:s==='[data-media-copy]'?copyButtons:[],querySelector:()=>null,
+   documentElement:{attrs:{},setAttribute(k,v){this.attrs[k]=v;}}},
  localStorage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)},
  fetch:(...a)=>fetchImpl(...a),setInterval:()=>1,clearInterval(){},setTimeout:()=>1,clearTimeout(){},
  requestAnimationFrame(){},navigator:{clipboard:{writeText:async text=>{copiedText=text;}}},CSS:{escape:x=>x}});
@@ -2321,7 +2322,21 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  await run('loadGatewayUpdate()');
  assert.equal(el('btn-gw-update-deploy').disabled,true);
  assert.match(el('gw-update-info').innerHTML,/未提交改动/);
- console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation, self-update passed');
+ // Theme: default light without matchMedia; toggle persists an explicit choice.
+ assert.equal(run("document.documentElement.attrs['data-theme']"),'light');
+ assert.equal(el('theme-icon-moon').style.display,'block');
+ assert.equal(el('theme-icon-sun').style.display,'none');
+ assert.equal(el('btn-theme').title,'切换到深色模式');
+ el('btn-theme').onclick();
+ assert.equal(store.get('gh_theme'),'dark');
+ assert.equal(run("document.documentElement.attrs['data-theme']"),'dark');
+ assert.equal(el('theme-icon-sun').style.display,'block');
+ assert.equal(el('theme-icon-moon').style.display,'none');
+ assert.equal(el('btn-theme').title,'切换到浅色模式');
+ el('btn-theme').onclick();
+ assert.equal(store.get('gh_theme'),'light');
+ assert.equal(run("document.documentElement.attrs['data-theme']"),'light');
+ console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation, self-update, theme passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 '''
         result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
