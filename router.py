@@ -5477,7 +5477,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 
 def main():
