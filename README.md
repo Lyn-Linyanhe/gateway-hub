@@ -154,7 +154,7 @@ python trae_proxy.py --port 8791
 
 同平台模型通常共享余额，各行是“全部余额用于该模型”的不同情景，**不能相加**。模型倍率不等同于绝对单价；参考货币成本不替代实际积分。样本不足、余额不全或账单无法匹配时显示“待测”。
 
-WorkBuddy/Qoder 按逐请求实扣计价，千问办公用钱包均价校准短样本相对价，小浣熊只用唯一账单关联，Trae 只用明确报告的扣费。当前不会按思考档位分别标价，样本成本不代表固定官方报价。详细来源、样本门槛和限制见 [扣费与额度预估](docs/billing.md)。
+WorkBuddy/Qoder/小浣熊共用同模型「Σ实扣 ÷ Σtoken」的加权算法和样本门槛；小浣熊先将账单唯一关联到请求，未关联记录不参与计价。千问办公用钱包均价校准短样本相对价，Trae 优先用明确报告的扣费、否则用官方消费倍率 × 钱包快照反推的平台均价锚定。当前不会按思考档位分别标价，样本成本不代表固定官方报价。详细来源、样本门槛和限制见 [扣费与额度预估](docs/billing.md)。
 
 ## 配置说明
 
@@ -203,9 +203,35 @@ WorkBuddy/Qoder 按逐请求实扣计价，千问办公用钱包均价校准短�
 
 模型、媒体别名、输出额度和价格随上游目录变化。小浣熊图片别名可能共用同一通道，不能仅凭别名认定为不同底层模型；生成张数与格式限制以接口错误和上游支持为准。
 
+生图参数的生效范围按平台分开，不能混用：
+
+| 参数 | 小浣熊（`raccoon/*`） | WorkBuddy（`workbuddy/*`） |
+|---|---|---|
+| `size` | 最长边 ≤ 3840 且总像素 ≤ 8,294,400；方形最多 `2880x2880`；不传则上游自选比例 | 总像素 ≤ 4,194,304（`2560x1600` 是实测边界），超限上游直接拒绝且不降级 |
+| `quality` | 生效，`low` / `medium` / `high`，不传默认 `low`；`high` 会让 image tokens 涨 30 倍以上 | 引擎忽略该参数 |
+| `image`（改图） | 只收 `data:image/...;base64,...`，传外链 URL 会被上游 400 | 还接受公网 http(s) 图片 URL |
+| `n` | 只支持 1；上游收字符串会报 400，网关已剥掉该字段 | 只支持 1 |
+
+媒体页会按当前模型的平台自动切换尺寸档位与 `quality` 是否可用，避免给出必然失败的组合。
+
 ## 更新
 
-Windows：
+### 看板一键部署（推荐）
+
+设置页「网关自更新」卡片自动检测本仓库的 GitHub 官方正式版 Release（每 5 分钟缓存，可手动强制检查）。发现新版本后点击「一键部署」并确认，网关会：
+
+1. 预检：拉取该 Release 的 tag 提交、解包候选代码、校验版本与示例配置、在候选目录跑离线回归；
+2. 预检通过后拉起独立更新进程，网关本体优雅退出；
+3. 更新进程复核工作区仍干净、HEAD 未变，`git merge --ff-only` 到该 tag 提交，重新拉起网关并做健康检查；
+4. 任一步失败则 `git reset --keep` 回滚到原提交并恢复旧版网关。
+
+部署边界：只认稳定正式版（拒绝 draft/prerelease/非语义化 tag）；只允许官方 origin 的干净 `main` 检出，且只快进、不合并分叉；`config.json`、`accounts/`、`auths/`、日志与缓存永不覆盖。预检或部署失败会在卡片上显示原因，可重试。
+
+接口：`GET /api/gateway-update`（检测 + 任务状态）、`POST /api/gateway-update`（请求体 `{"confirm": true}`，返回 202 后轮询 job 字段）。
+
+### 手动更新
+
+Windows 仍可用旧版辅助脚本：
 
 ```bat
 update.bat -CheckOnly
@@ -213,17 +239,18 @@ update.bat
 update.bat -NoRestart
 ```
 
-更新器查询最新 GitHub Release。Git 干净工作区路径会拉取 `origin/main`；源码包路径只复制白名单代码文件并创建 `backup-*`。两者并非严格安装相同 tag，也不保证所有失败均能事务回滚。更新前备份本机配置和自有代码改动；有未提交修改时优先手动检查差异，不要把文件覆盖当作合并。
+`update.bat` 查询最新 GitHub Release。Git 干净工作区路径会拉取 `origin/main`；源码包路径只复制白名单代码文件并创建 `backup-*`。两者并非严格安装相同 tag，也不保证所有失败均能事务回滚。更新前备份本机配置和自有代码改动；有未提交修改时优先手动检查差异，不要把文件覆盖当作合并。
 
-仅将代码推送 GitHub 不会自动创建 Release，`update.bat` 也不会因此发现新的 Release 版本。
+仅将代码推送 GitHub 不会自动创建 Release，看板自更新与 `update.bat` 都不会因此发现新的 Release 版本。
 
 ## 开发与验证
 
 依赖：Python 3.10+；完整离线回归额外需要 Node.js 22+，用于执行真实看板内联脚本的合成 DOM 测试。
 
 ```bash
-python -I -B -m py_compile router.py audit_platform.py test_regressions.py
+python -I -B -m py_compile router.py gateway_update.py audit_platform.py test_regressions.py test_gateway_update.py
 python -I -B test_regressions.py
+python -I -B test_gateway_update.py
 ```
 
 离线测试使用合成请求、假上游及临时目录，不应读取真实账号或调用真实模型。GitHub Actions 执行同一检查。
@@ -240,13 +267,15 @@ python audit_platform.py
 
 ```text
 router.py                 聚合路由、看板 API、平台管理与额度估值
+gateway_update.py         官方正式版检测、预检、快进部署与回滚（独立更新进程入口）
 dashboard.html            单文件看板（无构建步骤）
 config.example.json       无可用凭据的配置示例
 run-router.bat            Windows 网关后台启动
 start-buddy2api.bat        千问引擎启动辅助
-update.bat / update.ps1   Windows 更新辅助
+update.bat / update.ps1   Windows 更新辅助（旧版手动路径）
 audit_platform.py         只读在线巡检
 test_regressions.py        离线回归与看板合成测试
+test_gateway_update.py     自更新决策边界离线测试
 docs/                     协议与计费说明
 CHANGELOG.md              尚未发布及历史维护记录
 ```
