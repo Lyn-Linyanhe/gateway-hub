@@ -51,11 +51,13 @@ class GatewayTests(unittest.TestCase):
             "_attach_raccoon_bills", "_record_raccoon_billing_link",
             "_raccoon_bill_link_for_request", "_raccoon_response_id",
             "_estimate_at", "_action_status", "_request_target",
-            "_media_supports_tag", "_trae_consumption_rate",
+            "_media_supports_tag", "_trae_consumption_rate", "_trae_spend_rate",
+            "_trae_consumed_amount",
             "_media_link_signature", "_media_download_allowed",
             "_media_multipart_reject"},
             {"QWEN_WALLET_HISTORY": "", "RACCOON_WALLET_HISTORY": "",
-             "TRAE_WALLET_HISTORY": "", "RACCOON_BILLING_LINKS": "",
+             "TRAE_WALLET_HISTORY": "", "TRAE_SPEND_HISTORY": "",
+             "RACCOON_BILLING_LINKS": "",
              "PLATFORM_BALANCE_UNIT": constant(ROOT / "router.py", "PLATFORM_BALANCE_UNIT"),
              "_estimate_context": type("EstimateContext", (), {})(),
              "os": __import__('os'), "HERE": str(ROOT),
@@ -133,6 +135,33 @@ class GatewayTests(unittest.TestCase):
                 None, 'qwenwork',
                 {'prompt_tokens':100,'total_tokens':100,'cached_tokens':value})
             self.assertEqual(row['cached'], expected)
+
+    def test_trae_unreported_cache_is_unknown_not_zero(self):
+        """引擎报 cached_reported=False 时，cached_tokens 的 0 是占位不是实测。
+
+        当成已知 0 会让看板算出 100% 覆盖 / 0% 命中，把「不知道」说成结论。
+        """
+        norm = self.ns['Handler']._norm_usage_row
+        unreported = norm(None, 'trae', {'prompt_tokens': 80000, 'total_tokens': 80000,
+                                         'cached_tokens': 0, 'cached_reported': False})
+        reported_zero = norm(None, 'trae', {'prompt_tokens': 80000, 'total_tokens': 80000,
+                                            'cached_tokens': 0, 'cached_reported': True})
+        reported_hit = norm(None, 'trae', {'prompt_tokens': 80000, 'total_tokens': 80000,
+                                           'cached_tokens': 64000, 'cached_reported': True})
+        legacy = norm(None, 'trae', {'prompt_tokens': 80000, 'total_tokens': 80000,
+                                     'cached_tokens': 0})
+        missing = norm(None, 'trae', {'usage_missing': True, 'prompt_tokens': 0,
+                                      'total_tokens': 0, 'cached_tokens': 0,
+                                      'cached_reported': False})
+        self.assertIsNone(unreported['cached'])
+        self.assertEqual(reported_zero['cached'], 0)
+        self.assertEqual(reported_hit['cached'], 64000)
+        self.assertEqual(legacy['cached'], 0)  # 旧行无该键：沿用历史语义
+        self.assertIsNone(missing['cached'])
+        # 其它平台不受 trae 的 cached_reported 语义影响
+        self.assertEqual(norm(None, 'qwenwork',
+                              {'prompt_tokens': 100, 'total_tokens': 100,
+                               'cached_tokens': 0})['cached'], 0)
 
     def test_bearer_scheme_is_case_insensitive(self):
         import email.message
@@ -508,6 +537,60 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(payload['rows'][0]['account'], 'User')
         self.assertIn('intl', payload['errors']['workbuddy'])
 
+    def test_trae_spend_rate_uses_consumed_counter_delta(self):
+        """Trae 的 Σ实扣来自累计计数器增量，不是余额差。
+
+        实测：引擎对每个请求都写 credit_reported=false，逐请求实扣拿不到；
+        但 entitlement.usage_summary.consumed_amount 单调递增（单次请求后
+        369.86 → 371.25），是平台结算的真实扣费。取增量 ÷ 同期 token 就是
+        WorkBuddy 同口径的 Σ实扣 ÷ Σtoken。
+        """
+        now = time.time()
+        history = [{'ts': now - 300, 'account': '4052', 'balance': 100.0},
+                   {'ts': now - 200, 'account': '4052', 'balance': 120.0},
+                   {'ts': now - 100, 'account': '4052', 'balance': 150.0},
+                   {'ts': now, 'account': '4052', 'balance': 200.0}]
+        rows = [{'at': now - 250, 'account': '1414412225494052', 'total_tokens': 100_000},
+                {'at': now - 150, 'account': '1414412225494052', 'total_tokens': 100_000},
+                {'at': now - 50, 'account': '1414412225494052', 'total_tokens': 100_000}]
+        rate, accounts, tokens, hours = self.ns['_trae_spend_rate'](rows, history)
+        self.assertEqual(accounts, 1)
+        self.assertEqual(tokens, 300_000)
+        # 三段增量 20+30+50 = 100 点，摊到 30 万 token
+        self.assertAlmostEqual(rate, 100 / 300_000 * 1_000_000, places=6)
+
+    def test_trae_spend_rate_ignores_flat_counter(self):
+        """计数器没动说明区间内没有结算，不能当成零成本样本。"""
+        now = time.time()
+        history = [{'ts': now - 300, 'account': '4052', 'balance': 100.0},
+                   {'ts': now - 200, 'account': '4052', 'balance': 100.0},
+                   {'ts': now - 100, 'account': '4052', 'balance': 100.0},
+                   {'ts': now, 'account': '4052', 'balance': 100.0}]
+        rows = [{'at': now - 250, 'account': '1414412225494052', 'total_tokens': 900_000}]
+        rate, accounts, tokens, hours = self.ns['_trae_spend_rate'](rows, history)
+        self.assertIsNone(rate)
+        self.assertEqual(accounts, 0)
+
+    def test_trae_spend_rate_requires_minimum_sample(self):
+        """不足 10 万 token 保持待测：单区间样本太薄，单价没有统计意义。"""
+        now = time.time()
+        history = [{'ts': now - 200, 'account': '4052', 'balance': 100.0},
+                   {'ts': now - 100, 'account': '4052', 'balance': 130.0},
+                   {'ts': now, 'account': '4052', 'balance': 170.0}]
+        rows = [{'at': now - 150, 'account': '1414412225494052', 'total_tokens': 1_000},
+                {'at': now - 50, 'account': '1414412225494052', 'total_tokens': 1_000}]
+        rate, accounts, tokens, hours = self.ns['_trae_spend_rate'](rows, history)
+        self.assertIsNone(rate)
+        self.assertEqual(tokens, 2_000)
+
+    def test_trae_consumed_amount_reads_entitlement(self):
+        read = self.ns['_trae_consumed_amount']
+        raw = {'entitlement': {'ent_usage': {'usage_summary': {'consumed_amount': 371.25}}}}
+        self.assertEqual(read(raw), 371.25)
+        self.assertIsNone(read({}))                       # 缺失不是 0
+        self.assertIsNone(read({'entitlement': {'ent_usage': {}}}))
+        self.assertIsNone(read({'entitlement': None}))
+
     def test_trae_consumption_rate_lookup(self):
         lookup = self.ns['_trae_consumption_rate']
         catalog = [
@@ -531,8 +614,9 @@ class GatewayTests(unittest.TestCase):
         self.assertIsNone(lookup(catalog, 'missing'))
 
     def test_trae_estimate_anchors_by_official_rate(self):
-        """Trae 无逐请求扣费时，用官方倍率 × 钱包均价锚定出单价。"""
+        """Trae 无逐请求扣费时，用官方倍率 × 平台实测均价锚定出单价。"""
         scope = isolated(ROOT / 'router.py', {'estimate_snapshot', '_trae_consumption_rate',
+                                              '_trae_spend_rate',
                                               '_wallet_rate', '_credit_rate',
                                               '_estimate_public_model', '_estimate_at',
                                               '_num', '_known_num'},
@@ -554,18 +638,21 @@ class GatewayTests(unittest.TestCase):
                                'account': 'a', 'at': 100.0, 'credit': None},
                               {'model': 'kimi', 'total_tokens': 100_000,
                                'account': 'a', 'at': 200.0, 'credit': None}],
-                          '_read_wallet_history': lambda *a, **k: [
-                              {'ts': 100.0, 'account': 'a', 'balance': 1010.0},
-                              {'ts': 200.0, 'account': 'a', 'balance': 1000.0}],
+                          '_read_wallet_history': lambda path=None, metric='balance': [
+                              {'ts': 100.0, 'account': 'a', 'balance': 1000.0},
+                              {'ts': 200.0, 'account': 'a', 'balance': 1010.0}],
                           '_model_hidden': lambda *a: False,
-                          'TRAE_WALLET_HISTORY': '',
+                          'TRAE_SPEND_HISTORY': '',
                           'QWEN_WALLET_HISTORY': '',
                           'PLATFORM_BALANCE_UNIT': constant(ROOT / 'router.py',
                                                             'PLATFORM_BALANCE_UNIT'),
                           '_wb_usable_realms': lambda *a: []})
         data = scope['estimate_snapshot'](True)
         platform = data['platforms'][0]
-        self.assertEqual(platform['rate_source'], 'wallet')
+        # 实扣取自累计计数器增量（1000→1010），不是余额差。区间是开区间
+        # (prev.ts, cur.ts]，所以 at=100.0 那条不计入，只剩 at=200.0 的 10 万 token。
+        self.assertEqual(platform['rate_source'], 'measured_credits')
+        self.assertAlmostEqual(platform['rate_per_mtok'], 10 / 100_000 * 1_000_000, places=4)
         models = {m['model']: m for m in platform['models']}
         flash, kimi = models['Flash'], models['Kimi']
         self.assertEqual(flash['rate_source'], 'anchored')
@@ -783,7 +870,7 @@ class GatewayTests(unittest.TestCase):
                 *[{"created_at":time.time(),"model":"m","total_tokens":1000,"credit":1,
                    "usage_missing":False,"credit_reported":True} for _ in range(3)]],
             _estimate_at=lambda r:r["created_at"], _model_hidden=lambda *_:False,
-            _read_wallet_history=lambda:[])
+            _read_wallet_history=lambda *a, **k:[])
         model=self.ns["estimate_snapshot"](True)["platforms"][0]["models"][0]
         self.assertEqual(model["rate_per_mtok"],1000.0)
         self.assertEqual(model["samples"],3)
@@ -1011,16 +1098,21 @@ class GatewayTests(unittest.TestCase):
 
         scope = isolated(ROOT / 'router.py',
                          {'platform_status', 'normalize_trae', '_known_num',
-                          '_epoch_seconds', '_expiry_row', '_trae_pack_name'},
+                          '_epoch_seconds', '_expiry_row', '_trae_pack_name',
+                          '_trae_consumed_amount'},
                          {'urllib': __import__('urllib.request'),
+                          'time': time,
                           'CONFIG': {'upstreams': [{'name': 'trae',
                                                     'base_url': 'http://127.0.0.1:8791'}]},
                           '_inflight': {}, 'NORMALIZERS': {},
                           'normalize_buddy': lambda a: a,
                           '_urlopen': lambda req, timeout: Resp(),
-                          '_append_wallet_snapshot': lambda *a: None,
+                          '_append_spend_snapshot': lambda *a, **k: None,
                           '_trae_wallet_account': lambda raw, row: "4052",
                           'os': __import__('os'), 'HERE': str(ROOT),
+                          'TRAE_SPEND_HISTORY': '',
+                          'TRAE_REFRESH_INTERVAL': 600.0,
+                          '_trae_refresh_at': {'ts': time.time()},
                           'engine_request': lambda up, method, path, body=None,
                                                     auth=None, timeout=None: {
                               "accounts": [account]}})
@@ -2125,6 +2217,21 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  run('renderUsage()');
  assert.match(el('usage-cache').innerHTML,/缓存命中率/);
  assert.match(el('usage-charts').innerHTML,/Trae/);
+ // Unreported cache (cached=null) must read as unknown, not 0% — and such a
+ // platform belongs in the "no curve" list instead of a flat 0% line.
+ run("USAGE={rows:[{at:100,platform:'workbuddy',prompt:10,completion:4,total:14,cached:0},{at:200,platform:'workbuddy',prompt:20,completion:5,total:25,cached:5},{at:300,platform:'trae',prompt:80000,completion:200,total:80200,cached:null}],usd_cny:null};renderUsage();");
+ assert.match(el('usage-cache').innerHTML,/Trae 上游不回传缓存，无曲线/);
+ assert.doesNotMatch(el('usage-cache').innerHTML,/— Trae/);
+ assert.match(el('usage-stats').innerHTML,/缓存数据覆盖 \d+%/);
+ const gwCoverage=run("(()=>{const rows=USAGE.rows;const known=rows.filter(r=>r.cached!=null).reduce((n,r)=>n+(r.prompt||0),0);const prompt=rows.reduce((n,r)=>n+(r.prompt||0),0);return Math.round(known/prompt*100);})()");
+ assert.equal(gwCoverage,0);
+ run("USAGE={rows:[{at:100,platform:'trae',prompt:80000,completion:200,total:80200,cached:null},{at:200,platform:'trae',prompt:90000,completion:300,total:90300,cached:null}],usd_cny:null};renderUsage();");
+ assert.doesNotMatch(el('usage-cache').innerHTML,/缓存命中率 [0-9]/);
+ assert.match(el('usage-cache').innerHTML,/无曲线/);
+ assert.match(el('usage-body').innerHTML,/缓存未知/);
+ assert.doesNotMatch(el('usage-body').innerHTML,/缓存 0%/);
+ run("USAGE={rows:[{at:100,platform:'trae',model:'m',prompt:1000,completion:5,total:1005,cached:null}],usd_cny:null};renderUsage();renderUsagePerModel(USAGE.rows)");
+ assert.match(el('usage-permodel').innerHTML,/未知/);
  run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
  run("renderUsageConversion([{platform:'raccoon',model:'sn-qwen4-max',total:1000,credit:null,cost_cny:null}])");
  assert.match(el('usage-conv').innerHTML,/小浣熊/);

@@ -2457,16 +2457,31 @@ def platform_status(up):
         norm = NORMALIZERS.get(name, normalize_buddy)
         out["accounts"] = [norm(a) for a in items if isinstance(a, dict)]
         if name == "trae":
-            # Trae 的 usage 行不带逐请求扣费（credit_reported 恒 false），只能靠
-            # 钱包余额快照差反推平台均价。引擎把 uid 脱敏成「…4052」，而 usage
-            # 行里是完整 uid（1414412225494052），所以统一用尾 4 位作匹配键。
+            # Trae 的 usage 行不带逐请求扣费（credit_reported 恒 false）。真正可用的
+            # 实扣来源是 entitlement 的 usage_summary.consumed_amount —— 平台自己
+            # 结算的累计已消耗积分，只增不减，不受充值/签到干扰。
+            #
+            # 但引擎 /accounts 返回的是缓存快照，只有 POST /accounts/credits 才会
+            # 去上游刷新。所以这里节流地主动刷新一次（默认 10 分钟），再记录
+            # 计数器快照；否则 consumed_amount 永远是旧值，区间增量恒为 0。
+            if time.time() - _trae_refresh_at.get("ts", 0.0) >= TRAE_REFRESH_INTERVAL:
+                try:
+                    engine_request(up, "POST", "/accounts/credits", body={}, timeout=90)
+                    _trae_refresh_at["ts"] = time.time()
+                    data = engine_request(up, "GET", "/accounts?realm=all")
+                    items = data.get("accounts") if isinstance(data, dict) else data
+                    items = items or []
+                    out["accounts"] = [norm(a) for a in items if isinstance(a, dict)]
+                except Exception as exc:
+                    # 刷新失败不影响账号展示：用缓存值继续，并把原因留在卡片上。
+                    out["credits_error"] = f"{type(exc).__name__}: {exc}"[:200]
             for raw, row in zip(items, out["accounts"]):
                 if not isinstance(raw, dict):
                     continue
+                # 快照键用 uid 尾 4 位：引擎 /accounts 脱敏成「…4052」，而 usage
+                # 行里是完整 uid（1414412225494052），两边只有后 4 位一致。
                 account_id = _trae_wallet_account(raw, row)
-                _append_wallet_snapshot(
-                    os.path.join(HERE, "trae_wallet_history.jsonl"),
-                    account_id, row.get("remain"))
+                _append_spend_snapshot(account_id, _trae_consumed_amount(raw))
         # 账号并发：wb 引擎逐账号给在飞数（/settings.account_inflight）+ 每账号
         # 上限（account_max_concurrent，0=不限）；qwenwork 只有全局 rate_limit 上限
         # （0=不限，Buddy2api 不暴露逐账号在飞数）；qoder 由引擎 account_views 附带。
@@ -2927,11 +2942,88 @@ def _estimate_at(row):
 
 
 QWEN_WALLET_HISTORY = os.path.join(HERE, "qwenwork_wallet_history.jsonl")
-TRAE_WALLET_HISTORY = os.path.join(HERE, "trae_wallet_history.jsonl")
+#: Trae 的累计实扣计数器历史（consumed_amount 快照）。
+#:
+#: trae2api-hub 对每个请求都写 credit_reported=false，逐请求实扣拿不到；但它
+#: 的 entitlement 里有一个单调递增的 usage_summary.consumed_amount（账号累计
+#: 已消耗积分），是平台自己结算出来的真实扣费。取相邻快照的增量 ÷ 同期
+#: token，就得到与 WorkBuddy 完全同口径的 Σ实扣 ÷ Σtoken，而且不像余额差
+#: 那样会被充值/签到包发放污染（consumed 只增不减）。
+TRAE_SPEND_HISTORY = os.path.join(HERE, "trae_spend_history.jsonl")
+#: Trae 积分刷新的节流状态与间隔（秒）。引擎 /accounts 只是缓存，必须主动
+#: 调 /accounts/credits 才会去上游拉最新的 consumed_amount；5 分钟一次既能
+#: 让估值在一个观测周期内收敛，又不会把上游打成刷新风暴。
+_trae_refresh_at = {"ts": 0.0}
+TRAE_REFRESH_INTERVAL = 300.0
 
 
-def _read_wallet_history(path=None):
-    """读取余额快照历史；坏行跳过，读不到返回空列表。"""
+def _trae_consumed_amount(raw_account):
+    """Trae 账号的累计实扣积分（entitlement.usage_summary.consumed_amount）。
+
+    这是平台自己结算的「已消耗积分」，单调递增，等价于 WorkBuddy 的逐请求
+    实扣求和。取不到时返回 None（不能拿 0 冒充「零消耗」）。
+    """
+    ent = (raw_account or {}).get("entitlement") or {}
+    usage = ent.get("ent_usage") if isinstance(ent.get("ent_usage"), dict) else {}
+    summary = usage.get("usage_summary") if isinstance(usage.get("usage_summary"), dict) else {}
+    return _known_num(summary.get("consumed_amount"))
+
+
+def _append_spend_snapshot(account, value, path=None):
+    """累计计数器快照：**只在值变化时**追加。
+
+    计数器是批量结算的——两次刷新之间平台可能已经扣了几十次请求，但
+    consumed_amount 只在刷新时跳一次。如果每轮询都写一条相同值的快照，那么
+    「上次变化」到「这次变化」之间的 token 会被切成两段：前一段所在区间的
+    增量是 0（被跳过），后一段的增量却包含了前一段的消费 → 单价虚高。
+
+    只在值变化时写，相邻快照就严格是「一次结算的完整边界」。
+    """
+    if not account or value is None:
+        return
+    path = path or TRAE_SPEND_HISTORY
+    try:
+        with _wallet_lock:
+            last = None
+            try:
+                with open(path, encoding="utf-8") as rf:
+                    for line in rf:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except ValueError:
+                            continue
+                        if str(item.get("account") or "") == str(account):
+                            last = item
+            except OSError:
+                last = None
+            if last is not None:
+                prev = _known_num(last.get("balance"))
+                if prev is not None and prev == value:
+                    return  # 计数器没动：不写，保持区间边界干净
+            with open(path, "a", encoding="utf-8") as wf:
+                wf.write(json.dumps({"ts": time.time(), "account": str(account),
+                                     "metric": "consumed", "balance": value},
+                                    ensure_ascii=False) + "\n")
+            if os.path.getsize(path) > 512 * 1024:
+                with open(path, encoding="utf-8") as rf:
+                    keep = rf.readlines()[-2000:]
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as wf:
+                    wf.writelines(keep)
+                os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _read_wallet_history(path=None, metric="balance"):
+    """读取余额快照历史；坏行跳过，读不到返回空列表。
+
+    metric 用于区分同一文件里的不同计量：Trae 的 `balance` 是余额、`consumed`
+    是累计实扣计数器。两种口径不能混算，读的时候必须只取一种。
+    """
     path = path or QWEN_WALLET_HISTORY
     rows = []
     try:
@@ -2949,9 +3041,11 @@ def _read_wallet_history(path=None):
                 ts = _known_num(item.get("ts"))
                 balance = _known_num(item.get("balance"))
                 account = str(item.get("account") or "")
-                metric = str(item.get("metric") or "balance")
+                row_metric = str(item.get("metric") or "balance")
+                if metric and row_metric != metric:
+                    continue
                 if ts and balance is not None and account:
-                    rows.append({"ts": ts, "account": account, "metric": metric,
+                    rows.append({"ts": ts, "account": account, "metric": row_metric,
                                  "balance": balance})
     except OSError:
         return []
@@ -3037,6 +3131,72 @@ def _wallet_rate(rows, history):
     return total_credit / total_tokens * 1_000_000, accounts, total_tokens, hours
 
 
+def _trae_spend_rate(rows, history):
+    """Trae 累计实扣计数器增量 ÷ 同期 token → (分/Mtok, 账号数, 样本 token, 覆盖小时)。
+
+    与 `_credit_rate` 同口径（Σ实扣 ÷ Σtoken），只是「实扣」不是逐请求字段，
+    而是平台自己维护的累计计数器 `usage_summary.consumed_amount`。取相邻快照
+    的增量即该区间的真实扣费。
+
+    为什么不用余额差（`_wallet_rate`）：Trae 的 remain 同时受扣费和发放影响，
+    签到 +100、福利包 +1500 都会进余额，「同区间既扣费又充值」无法识别。实测
+    一次 166 token 的区间里记了 10.66 积分，反推出 6.4 万 分/Mtok 的假单价。
+    consumed_amount 只增不减，不受发放影响。
+
+    门槛：至少 1 个有效区间、累计 10 万 token、总扣费为正。区间本身就是聚合
+    单位（一次刷新周期内可能包含上百个请求），所以不像 `_credit_rate` 那样
+    要求 3 条。
+    """
+    per_account = {}
+    for item in history:
+        per_account.setdefault(item["account"], []).append(item)
+    total_credit = 0.0
+    total_tokens = 0.0
+    accounts = 0
+    hours = 0.0
+    intervals = 0
+    for account, snapshots in per_account.items():
+        snapshots.sort(key=lambda item: item["ts"])
+        if len(snapshots) < 2:
+            continue
+        account_tokens = 0.0
+        account_credit = 0.0
+        account_hours = 0.0
+        account_intervals = 0
+        for prev, cur in zip(snapshots, snapshots[1:]):
+            spent = cur["balance"] - prev["balance"]
+            if spent <= 0:
+                continue  # 计数器没动：区间内没有结算，不能当成零成本样本
+            tokens = 0.0
+            for row in rows:
+                row_account = str(row.get("account_name") or row.get("account") or "")
+                if row_account != account:
+                    # 快照键是脱敏 uid 尾 4 位，usage 行是完整 uid；仅对短数字键
+                    # 做后缀匹配，避免把不同账号误合并。
+                    if not (len(account) == 4 and account.isdigit()
+                            and row_account.endswith(account)):
+                        continue
+                at = _estimate_at(row)
+                if at and prev["ts"] < at <= cur["ts"]:
+                    tokens += _num(row.get("total_tokens") or row.get("total"))
+            if tokens <= 0:
+                continue  # 扣了费但区间内没有 token 记录：来源不明，不用它算单价
+            account_credit += spent
+            account_tokens += tokens
+            account_hours += (cur["ts"] - prev["ts"]) / 3600
+            account_intervals += 1
+        if account_tokens <= 0 or account_credit <= 0:
+            continue
+        total_credit += account_credit
+        total_tokens += account_tokens
+        accounts += 1
+        intervals += account_intervals
+        hours = max(hours, account_hours)
+    if intervals < 1 or total_tokens < 100_000 or total_credit <= 0:
+        return None, accounts, total_tokens, hours
+    return total_credit / total_tokens * 1_000_000, accounts, total_tokens, hours
+
+
 def _trae_wallet_account(raw_account, normalized):
     """Trae 余额快照与 usage 行之间统一的账号匹配键。
 
@@ -3089,8 +3249,9 @@ def estimate_snapshot(force=False):
     预计 token = 模型可用余额 ÷ 单价 × 1,000,000。
     WorkBuddy/Qoder 用明确的逐请求扣费字段；模型样本不足时显示待测。
     千问办公没有逐请求扣费，按模型短样本相对价用钱包实测均价锚定；
-    Trae 同样没有逐请求扣费，用官方 consumption_rate 作模型间相对倍率，
-    乘上钱包快照反推的平台均价锚定系数；
+    Trae 同样没有逐请求扣费，但平台提供累计实扣计数器 consumed_amount，
+    取区间增量得到与 WorkBuddy 同口径的 Σ实扣 ÷ Σtoken，再用官方
+    consumption_rate 作模型间相对倍率分配；
     小浣熊只有唯一账单关联的聊天样本才参与估值，历史未关联请求保持待测。
     """
     now = time.time()
@@ -3161,29 +3322,39 @@ def estimate_snapshot(force=False):
                 rows, _read_wallet_history())
             platform_source = "wallet"
         elif name == "trae":
-            # Trae 的 usage 行不带逐请求扣费（credit_reported 恒 false），
-            # 无法用 Σ实扣 ÷ Σtoken。改用余额快照差 ÷ 同期 token 反推平台均价，
-            # 与千问办公同一口径（两者都没有逐请求扣费字段）。
+            # Trae 的 usage 行不带逐请求扣费（credit_reported 恒 false），所以
+            # 「Σ实扣 ÷ Σtoken」的实扣取自平台自己的累计计数器
+            # usage_summary.consumed_amount 的区间增量——与 WorkBuddy 同口径，
+            # 且不受充值/签到发放干扰。
             priced = [row for row in rows
                       if not row.get("usage_missing")
                       and row.get("credit_reported") is True
                       and row.get("credit") is not None]
             platform_rate, platform_samples, platform_tokens = _credit_rate(priced)
-            if platform_rate is None:
-                platform_rate, platform_samples, platform_tokens, platform_hours = _wallet_rate(
-                    rows, _read_wallet_history(TRAE_WALLET_HISTORY))
-                platform_source = "wallet"
-                if platform_rate is None:
-                    # 余额长期不变说明引擎没在刷新积分快照，此时任何「均价」都是
-                    # 把静止期摊进一次性扣费得来的假数字。明确告诉用户原因。
-                    item["rate_note"] = (
-                        "Trae 余额快照未观察到下降区间（引擎余额是缓存值，需强制刷新积分）"
-                        "，暂不估算")
-            else:
+            spend_history = _read_wallet_history(TRAE_SPEND_HISTORY, metric="consumed")
+            if platform_rate is not None:
                 first_at = min((_estimate_at(r) for r in priced if _estimate_at(r)), default=0.0)
                 platform_hours = (round(max(0.0, (now - first_at) / 3600), 1)
                                   if first_at else None)
                 platform_source = "measured_credits"
+            else:
+                platform_rate, platform_samples, platform_tokens, platform_hours = (
+                    _trae_spend_rate(rows, spend_history))
+                platform_source = "measured_credits"
+                if platform_rate is None:
+                    # 刻意不退回余额快照差：Trae 的 remain 混着签到/福利包发放，
+                    # 实测 166 token 的区间记了 10.66 积分，反推出 6.4 万 分/Mtok。
+                    # 宁可待测，也不给一个会让人误判的假单价。
+                    # 把采集进度说清楚，用户才知道这是「还在攒样本」而非故障。
+                    points = len(spend_history)
+                    if points < 2:
+                        item["rate_note"] = (
+                            "Trae 累计实扣计数器已记录 %d 个快照，还需一次余额刷新"
+                            "（每 %d 分钟）才能算出单价" % (points, int(TRAE_REFRESH_INTERVAL // 60)))
+                    else:
+                        item["rate_note"] = (
+                            "Trae 累计实扣计数器有 %d 个快照，但尚未观察到「扣费增长 + "
+                            "同期有 token 记录」的完整区间，继续采集" % points)
         else:
             platform_rate, platform_samples, platform_tokens = _credit_rate(rows)
             first_at = min((_estimate_at(r) for r in rows if _estimate_at(r)), default=0.0)
@@ -3197,7 +3368,9 @@ def estimate_snapshot(force=False):
             "sample_tokens": int(platform_tokens),
             "sample_hours": platform_hours,
             "note": (item.get("rate_note")
-                     or ("平台实测均价" if platform_rate is not None else "平台样本不足")),
+                     or ("平台实测均价（累计实扣计数器增量 ÷ 同期 token）"
+                         if platform_rate is not None and name == "trae"
+                         else ("平台实测均价" if platform_rate is not None else "平台样本不足"))),
         })
         item.pop("rate_note", None)
 
@@ -3226,7 +3399,8 @@ def estimate_snapshot(force=False):
                 qwen_anchor = platform_rate / (weighted / priced_tokens)
 
         # Trae：没有逐请求扣费，也没有「短样本相对价」。用官方 consumption_rate
-        # 作为模型间相对倍率，把钱包反推的平台均价按 token 加权缩放到各模型。
+        # 作为模型间相对倍率，把累计实扣计数器反推的平台均价按 token 加权缩放到
+        # 各模型。
         trae_anchor = None
         if name == "trae" and platform_rate is not None:
             weighted = 0.0
@@ -3307,7 +3481,8 @@ def estimate_snapshot(force=False):
                     sample_hours = mhours
                     note = f"按最近 {msamples} 条扣费样本：Σ实扣 ÷ Σtoken"
                 else:
-                    # 官方 consumption_rate（信用消费倍率）× 钱包锚定系数 → 分/Mtok。
+                    # 官方 consumption_rate（信用消费倍率）× 平台实测均价锚定系数
+                    # → 分/Mtok。锚定系数来自累计实扣计数器，与 WB 同口径。
                     factor = _trae_consumption_rate(catalog, entry["upstream"])
                     if factor is not None and trae_anchor is not None:
                         rate = factor * trae_anchor
@@ -3316,14 +3491,14 @@ def estimate_snapshot(force=False):
                         sample_tokens = int(sum(_num(r.get("total_tokens") or r.get("total"))
                                                 for r in mrows))
                         sample_hours = mhours
-                        note = (f"官方倍率 x{factor} × 钱包实测均价锚定"
+                        note = (f"官方倍率 x{factor} × 平台实测均价锚定"
                                 f"（k={trae_anchor:.4f}）")
                     elif factor is not None:
                         samples = len(mrows)
                         sample_tokens = int(sum(_num(r.get("total_tokens") or r.get("total"))
                                                 for r in mrows))
                         sample_hours = mhours
-                        note = "钱包快照样本不足，无法锚定"
+                        note = "累计实扣样本不足，无法锚定"
                     else:
                         note = "该模型无官方消费倍率，暂不估算"
             elif mrate is not None:
@@ -3356,7 +3531,7 @@ def estimate_snapshot(force=False):
         out.append(item)
     data = {"ok": True, "generated_at": int(now),
             "sample_basis": ("按模型 Σ实扣 ÷ Σtoken；千问用短样本相对价 × 钱包实测均价锚定；"
-                             "Trae 用官方消费倍率 × 钱包实测均价锚定"),
+                             "Trae 用累计实扣计数器增量 ÷ 同期 token，再按官方消费倍率分配到各模型"),
             "unit_note": ("各平台「分/Mtok」的分是平台自有积分单位，"
                           "跨平台的单价与余额都不可直接比较大小"),
             "platforms": out}
@@ -3485,11 +3660,12 @@ def tail_log(lines=120):
 _wallet_lock = threading.Lock()
 
 
-def _append_wallet_snapshot(path, account, balance):
+def _append_wallet_snapshot(path, account, balance, metric="balance"):
     """追加一条余额快照（并发安全 + 512KB 轮转到最近 2000 行）。
 
     千问办公与 Trae 共用：两者都没有逐请求扣费字段，只能靠「两次快照的
-    余额差 ÷ 同期真实消耗 token」反推平台实测均价。
+    余额差 ÷ 同期真实消耗 token」反推平台实测均价。Trae 另有一路
+    metric="consumed" 的累计实扣计数器快照（见 `_trae_spend_rate`）。
     """
     if not account or balance is None:
         return
@@ -3497,7 +3673,8 @@ def _append_wallet_snapshot(path, account, balance):
         with _wallet_lock:
             with open(path, "a", encoding="utf-8") as wf:
                 wf.write(json.dumps({"ts": time.time(), "account": str(account),
-                                     "balance": balance}, ensure_ascii=False) + "\n")
+                                     "metric": metric, "balance": balance},
+                                    ensure_ascii=False) + "\n")
             if os.path.getsize(path) > 512 * 1024:
                 with open(path, encoding="utf-8") as rf:
                     keep = rf.readlines()[-2000:]
@@ -4683,6 +4860,15 @@ class Handler(BaseHTTPRequestHandler):
             cost_cny = None if raw_cny is None else float(raw_cny)
         except (TypeError, ValueError):
             cost_cny = None
+        # 缓存口径与 credit 同构：引擎明确说「上游没报缓存」（cached_reported
+        # 为假）或整行 usage 缺失时，cached_tokens 里的 0 是占位而不是实测值。
+        # 当成已知 0 会让看板算出 100% 覆盖、0% 命中，把「不知道」伪装成结论。
+        # 旧行没有该键（None）沿用历史语义：视为已报。
+        cached = (_known_num(row.get("cached_tokens"))
+                  if row.get("cached_tokens") is not None else None)
+        if name == "trae" and (row.get("usage_missing")
+                               or row.get("cached_reported") is False):
+            cached = None
         return {
             "platform": name,
             "at": at,
@@ -4700,7 +4886,7 @@ class Handler(BaseHTTPRequestHandler):
             "stream": bool(row.get("stream")) if row.get("stream") is not None else None,
             "prompt": _num(row.get("prompt_tokens")),
             "completion": _num(row.get("completion_tokens")),
-            "cached": (_num(row["cached_tokens"]) if row.get("cached_tokens") is not None else None),
+            "cached": cached,
             "reasoning": _num(row.get("reasoning_tokens")),
             "total": _num(row.get("total_tokens")) or (_num(row.get("prompt_tokens")) + _num(row.get("completion_tokens"))),
             "credit": credit,
