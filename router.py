@@ -4881,7 +4881,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 
 
 def main():
