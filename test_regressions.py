@@ -51,11 +51,12 @@ class GatewayTests(unittest.TestCase):
             "_attach_raccoon_bills", "_record_raccoon_billing_link",
             "_raccoon_bill_link_for_request", "_raccoon_response_id",
             "_estimate_at", "_action_status", "_request_target",
-            "_media_supports_tag",
+            "_media_supports_tag", "_trae_consumption_rate",
             "_media_link_signature", "_media_download_allowed",
             "_media_multipart_reject"},
             {"QWEN_WALLET_HISTORY": "", "RACCOON_WALLET_HISTORY": "",
              "TRAE_WALLET_HISTORY": "", "RACCOON_BILLING_LINKS": "",
+             "PLATFORM_BALANCE_UNIT": constant(ROOT / "router.py", "PLATFORM_BALANCE_UNIT"),
              "_estimate_context": type("EstimateContext", (), {})(),
              "os": __import__('os'), "HERE": str(ROOT),
              "_config_lock": threading.RLock(),
@@ -72,7 +73,7 @@ class GatewayTests(unittest.TestCase):
         from unittest.mock import Mock, patch
         opener = Mock()
         scope = isolated(ROOT / 'router.py', {'_urlopen'},
-                         {'urllib': __import__('urllib'), 'urlsplit': urlsplit, '_local_opener': opener})
+                         {'urllib': __import__('urllib.request'), 'urlsplit': urlsplit, '_local_opener': opener})
         with patch('urllib.request.urlopen') as external:
             for url in ('http://127.0.0.1:8788/health', 'http://localhost:8790/health', 'http://[::1]:8792/health'):
                 scope['_urlopen'](urllib.request.Request(url), timeout=5)
@@ -264,6 +265,49 @@ class GatewayTests(unittest.TestCase):
         self.assertIsNone(by['thin']['rate_per_mtok'])
         self.assertIsNone(by['thin']['est_tokens'])
         self.assertIn('样本不足',by['thin']['note'])
+
+    def test_wallet_rate_ignores_stagnant_balance_window(self):
+        """余额是缓存值时，静止期不能被当成零成本。
+
+        实测场景：Trae 余额只在最初 5 秒从 1982.66 降到 1972.00，之后 2500 秒
+        一直是 1972.00，但 token 持续累积到 3422 万。用「首末快照」会把
+        10.66 点摊到 3422 万 token 上，算出 0.31 分/Mtok 这种假单价。
+        正确口径：只统计余额真正下降的那一对相邻快照。
+        """
+        now=time.time()
+        history=[{'ts':now-1000,'account':'a','balance':100.0},
+                 {'ts':now-990,'account':'a','balance':90.0},   # 真实扣费 10 点
+                 {'ts':now-500,'account':'a','balance':90.0},   # 静止
+                 {'ts':now,'account':'a','balance':90.0}]       # 静止
+        rows=[{'created_at':now-995,'account_name':'a','total_tokens':200_000},  # 下降区间内
+              {'created_at':now-400,'account_name':'a','total_tokens':5_000_000}, # 静止区间：必须排除
+              {'created_at':now-10,'account_name':'a','total_tokens':5_000_000}]
+        rate, accounts, tokens, hours = self.ns['_wallet_rate'](rows, history)
+        self.assertEqual(accounts, 1)
+        self.assertEqual(tokens, 200_000)          # 只算下降区间内的 token
+        self.assertAlmostEqual(rate, 50.0, places=6)  # 10 / 200000 * 1e6
+
+    def test_wallet_rate_requires_real_decline(self):
+        """余额全程不变：不能产出任何单价（引擎没在刷新积分快照）。"""
+        now=time.time()
+        history=[{'ts':now-1000,'account':'a','balance':90.0},
+                 {'ts':now,'account':'a','balance':90.0}]
+        rows=[{'created_at':now-500,'account_name':'a','total_tokens':900_000}]
+        rate, accounts, tokens, hours = self.ns['_wallet_rate'](rows, history)
+        self.assertIsNone(rate)
+        self.assertEqual(accounts, 0)
+
+    def test_estimate_reports_unit_and_incomparable_note(self):
+        """每个平台必须带自己的余额单位；顶层要说明跨平台不可比。"""
+        self.estimate([{'enabled':True,'remain':100}])
+        self.ns.update(CONFIG={'upstreams':[{'name':'raccoon'}]},
+            public_catalog=lambda:[{'platform':'raccoon','public':'m','upstream':'m','row':{}}],
+            _estimate_rows=lambda _: [],
+            _estimate_at=lambda r:0)
+        data=self.ns['estimate_snapshot'](True)
+        platform=data['platforms'][0]
+        self.assertEqual(platform['balance_unit'],'小浣熊积分点')
+        self.assertIn('不可直接比较', data['unit_note'])
 
     def test_wallet_rate_skips_topups_and_insufficient_samples(self):
         now=time.time()
@@ -464,6 +508,73 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(payload['rows'][0]['account'], 'User')
         self.assertIn('intl', payload['errors']['workbuddy'])
 
+    def test_trae_consumption_rate_lookup(self):
+        lookup = self.ns['_trae_consumption_rate']
+        catalog = [
+            {'platform': 'trae', 'public': 'DeepSeek-V4.1-Flash',
+             'upstream': 'deepseek-v4.1-flash',
+             'row': {'consumption_rate': 0.06}},
+            {'platform': 'trae', 'public': 'Kimi-K3', 'upstream': 'kimi-k3',
+             'row': {'consumption_rate': 1.83}},
+            {'platform': 'trae', 'public': 'NoRate', 'upstream': 'no-rate', 'row': {}},
+            {'platform': 'trae', 'public': 'Bool', 'upstream': 'bool-rate',
+             'row': {'consumption_rate': True}},
+            {'platform': 'workbuddy', 'public': 'Other', 'upstream': 'other',
+             'row': {'consumption_rate': 9.9}},
+        ]
+        self.assertEqual(lookup(catalog, 'deepseek-v4.1-flash'), 0.06)
+        self.assertEqual(lookup(catalog, 'DeepSeek-V4.1-Flash'), 0.06)
+        self.assertEqual(lookup(catalog, 'kimi-k3'), 1.83)
+        self.assertIsNone(lookup(catalog, 'no-rate'))
+        self.assertIsNone(lookup(catalog, 'bool-rate'))
+        self.assertIsNone(lookup(catalog, 'other'))
+        self.assertIsNone(lookup(catalog, 'missing'))
+
+    def test_trae_estimate_anchors_by_official_rate(self):
+        """Trae 无逐请求扣费时，用官方倍率 × 钱包均价锚定出单价。"""
+        scope = isolated(ROOT / 'router.py', {'estimate_snapshot', '_trae_consumption_rate',
+                                              '_wallet_rate', '_credit_rate',
+                                              '_estimate_public_model', '_estimate_at',
+                                              '_num', '_known_num'},
+                         {'time': time, 'json': json,
+                          'ESTIMATE_TTL': 120.0,
+                          '_estimate_lock': threading.Lock(),
+                          '_estimate_cache': {'ts': 0.0, 'data': None},
+                          'CONFIG': {'hidden_models': []},
+                          'active_upstreams': lambda: [{'name': 'trae'}],
+                          'public_catalog': lambda: [
+                              {'platform': 'trae', 'public': 'Flash',
+                               'upstream': 'flash', 'row': {'consumption_rate': 0.06}},
+                              {'platform': 'trae', 'public': 'Kimi',
+                               'upstream': 'kimi', 'row': {'consumption_rate': 1.83}}],
+                          'platform_status': lambda _: {'health': True, 'accounts': [
+                              {'enabled': True, 'remain': 1000.0, 'realm': 'cn'}]},
+                          '_estimate_rows': lambda _: [
+                              {'model': 'flash', 'total_tokens': 100_000,
+                               'account': 'a', 'at': 100.0, 'credit': None},
+                              {'model': 'kimi', 'total_tokens': 100_000,
+                               'account': 'a', 'at': 200.0, 'credit': None}],
+                          '_read_wallet_history': lambda *a, **k: [
+                              {'ts': 100.0, 'account': 'a', 'balance': 1010.0},
+                              {'ts': 200.0, 'account': 'a', 'balance': 1000.0}],
+                          '_model_hidden': lambda *a: False,
+                          'TRAE_WALLET_HISTORY': '',
+                          'QWEN_WALLET_HISTORY': '',
+                          'PLATFORM_BALANCE_UNIT': constant(ROOT / 'router.py',
+                                                            'PLATFORM_BALANCE_UNIT'),
+                          '_wb_usable_realms': lambda *a: []})
+        data = scope['estimate_snapshot'](True)
+        platform = data['platforms'][0]
+        self.assertEqual(platform['rate_source'], 'wallet')
+        models = {m['model']: m for m in platform['models']}
+        flash, kimi = models['Flash'], models['Kimi']
+        self.assertEqual(flash['rate_source'], 'anchored')
+        self.assertEqual(kimi['rate_source'], 'anchored')
+        # 官方倍率 1.83 / 0.06 ≈ 30.5，模型间相对关系必须保留
+        self.assertAlmostEqual(kimi['rate_per_mtok'] / flash['rate_per_mtok'],
+                               1.83 / 0.06, places=4)
+        self.assertIsNotNone(flash['est_tokens'])
+
     def test_trae_multiplier(self):
         self.assertEqual(self.ns['_row_multiplier']('trae', {'consumption_rate': 0.78}),
                          {'factor': 0.78})
@@ -557,6 +668,7 @@ class GatewayTests(unittest.TestCase):
                 ([dict(event)], [bill, {**bill, "bill_id": "bill-2"}], [link]),
                 ([dict(event)], [bill], [link, {**link, "request_id": "req-2"}]),
                 ([{**event, "uid": "other"}], [bill], [link]),
+                ([{**event, "uid": ""}], [bill], [link]),
                 ([{**event, "created_at": 5000.0}], [bill], [link]),
                 ([{**event, "id": "legacy"}], [bill], [link]),
                 ([{**event, "total_tokens": 0}], [bill], [link])):
@@ -572,6 +684,66 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(first["request_id"]), 32)
         self.assertTrue(first["marker"].startswith("gw-"))
         self.assertNotIn("prompt", first)
+
+    def test_raccoon_and_wb_use_identical_measured_estimates(self):
+        now=time.time()
+        rows=[
+            {'created_at':now-30,'model':'ds','total_tokens':100_000,
+             'credit':1,'credit_source':'matched_bill'},
+            {'created_at':now-20,'model':'ds','total_tokens':200_000,
+             'credit':3,'credit_source':'matched_bill'},
+            # A large request stays in the same token-weighted sample set.
+            {'created_at':now-10,'model':'ds','total_tokens':700_000,
+             'credit':6,'credit_source':'matched_bill'},
+            {'created_at':now-5,'model':'qwen','total_tokens':1_000_000,'credit':None},
+        ]
+        estimates=[]
+        for platform in ('workbuddy','raccoon'):
+            catalog=[{'platform':platform,'public':model,'upstream':model,'row':{}}
+                     for model in ('ds','qwen')]
+            item=self.estimate([{'enabled':True,'remain':100,'realm':'cn'}],rows,
+                               platform=platform,catalog=catalog)
+            models={m['model']:m for m in item['models']}
+            ds=models['ds']
+            # Ten credits buy one million sampled tokens: 100 credits buy ten million.
+            self.assertEqual(ds['rate_per_mtok'],10.0)
+            self.assertEqual(ds['est_tokens'],10_000_000)
+            self.assertEqual(ds['samples'],3)
+            self.assertEqual(ds['sample_tokens'],1_000_000)
+            self.assertEqual(ds['rate_source'],'measured')
+            self.assertIsNone(models['qwen']['rate_per_mtok'])
+            self.assertIsNone(models['qwen']['est_tokens'])
+            estimates.append(tuple(ds[k] for k in (
+                'rate_per_mtok','est_tokens','samples','sample_tokens','rate_source')))
+        self.assertEqual(estimates[0],estimates[1])
+
+    def test_raccoon_measured_rate_uses_only_unique_matched_bills(self):
+        """小浣熊按 WB 的 Σ实扣/Σtoken 汇总，只计入明确关联到账单的请求。"""
+        now=time.time()
+        rows=[
+            {'created_at':now-30,'model':'sn-deepseek-v4-1-flash-1017',
+             'total_tokens':1000,'credit':2,'credit_source':'matched_bill'},
+            {'created_at':now-20,'model':'sn-deepseek-v4-1-flash-1017',
+             'total_tokens':1000,'credit':1,'credit_source':'matched_bill'},
+            {'created_at':now-10,'model':'sn-deepseek-v4-1-flash-1017',
+             'total_tokens':1000,'credit':1,'credit_source':'matched_bill'},
+            # Numeric credit without the strict request↔bill marker link is untrusted.
+            {'created_at':now-5,'model':'sn-deepseek-v4-1-flash-1017',
+             'total_tokens':10_000,'credit':100,'credit_source':None},
+        ]
+        catalog=[{'platform':'raccoon','public':'sn-deepseek-v4-1-flash-1017',
+                  'upstream':'sn-deepseek-v4-1-flash-1017','row':{}}]
+        platform=self.estimate([{'enabled':True,'remain':18_420}],rows,
+                               platform='raccoon',catalog=catalog)
+        model=platform['models'][0]
+        expected=4/3000*1_000_000
+        self.assertEqual(platform['rate_per_mtok'],round(expected,4))
+        self.assertEqual(platform['samples'],3)
+        self.assertEqual(platform['sample_tokens'],3000)
+        self.assertEqual(model['rate_per_mtok'],round(expected,4))
+        self.assertEqual(model['samples'],3)
+        self.assertEqual(model['sample_tokens'],3000)
+        self.assertEqual(model['rate_source'],'measured')
 
     def test_raccoon_response_id_requires_success(self):
         scope = isolated(ROOT / "router.py", {"_raccoon_response_id"}, {"json": json})
@@ -684,14 +856,19 @@ class GatewayTests(unittest.TestCase):
             def __exit__(self, *args): return False
             def read(self): return b'{"status":"ok"}'
         scope = isolated(ROOT / 'router.py',
-                         {'platform_status', 'normalize_raccoon', '_shanghai_today', '_known_num'},
-                         {'urllib': __import__('urllib'),
+                         {'platform_status', 'normalize_raccoon', '_shanghai_today',
+                          '_known_num', '_raccoon_points_audit'},
+                         {'urllib': __import__('urllib.request'),
                           'CONFIG': {'upstreams': [{'name': 'raccoon',
                                                     'base_url': 'http://127.0.0.1:7867',
                                                     'api_key': 'synthetic'}]},
                           '_inflight': {}, 'NORMALIZERS': {},
                           'normalize_buddy': lambda a: a,
                           '_urlopen': lambda req, timeout: Resp(),
+                          '_raccoon_points_lock': threading.Lock(),
+                          '_raccoon_points_cache': {'ts': 0.0, 'by_uid': {}, 'fail_ts': 0.0},
+                          'RACCOON_POINTS_TTL': 300.0,
+                          'RACCOON_POINTS_FAIL_TTL': 60.0,
                           'engine_request': lambda up, method, path, body=None,
                                                     auth=None, timeout=None: {
                               'accounts': [{'uid': 'u1', 'nickname': 'nick',
@@ -704,6 +881,194 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(out['accounts']), 1)
         self.assertEqual(out['accounts'][0]['remain'], 5)
         self.assertTrue(out['accounts'][0]['checked_in'])
+
+    def test_expiry_helpers_normalize_units_and_keep_burn_separate(self):
+        scope = isolated(ROOT / "router.py",
+                         {"_epoch_seconds", "_expiry_row", "_trae_pack_name", "_known_num"})
+        epoch = scope["_epoch_seconds"]
+        self.assertEqual(epoch(1795622399), 1795622399.0)
+        # 毫秒（小浣熊 overview 的凭证 expires_at）归一成秒
+        self.assertEqual(epoch(1797606605000), 1797606605.0)
+        for bad in (None, "", 0, -5, True, "abc", 5e12, float("nan")):
+            self.assertIsNone(epoch(bad), bad)
+
+        now = time.time()
+        row = scope["_expiry_row"]("nick", "包", 100.004, now + 6.4 * 86400, 374.7)
+        self.assertEqual(row["remain"], 100.0)
+        self.assertEqual(row["days_left"], 6.4)
+        # 上游的 days_left（按燃烧速度）必须单独放，不能顶替距过期天数
+        self.assertEqual(row["burn_days"], 374.7)
+        self.assertNotEqual(row["days_left"], row["burn_days"])
+        self.assertRegex(row["expire"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertIsNone(scope["_expiry_row"]("a", "b", 1, now)["burn_days"])
+
+        name = scope["_trae_pack_name"]
+        self.assertEqual(name({"product_extra": {"package_extra":
+                                                 {"package_name": "福利积分"}}}), "福利积分")
+        self.assertEqual(name({"product_extra": {"subscription_extra":
+                                                 {"package_name": "订阅"}}}), "订阅")
+        self.assertEqual(name({}), "")
+
+    def test_raccoon_expiring_uses_point_expiry_not_burn_days(self):
+        import urllib.request
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"status":"ok"}'
+        expire = int(time.time() + 6.4 * 86400)
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            if path.endswith("/panel/api/points"):
+                return {"accounts": [{"uid": "u1", "audit": {
+                    "remain": 9421, "expire": expire, "days_left": 374.7}}]}
+            return {"accounts": [{"uid": "u1", "nickname": "nick", "credits": 9421,
+                                  "realm": "cn", "expires_at": 1797606605000}]}
+
+        scope = isolated(ROOT / 'router.py',
+                         {'platform_status', 'normalize_raccoon', '_shanghai_today',
+                          '_known_num', '_epoch_seconds', '_expiry_row',
+                          '_raccoon_points_audit'},
+                         {'urllib': __import__('urllib.request'),
+                          'CONFIG': {'upstreams': [{'name': 'raccoon',
+                                                    'base_url': 'http://127.0.0.1:7867'}]},
+                          '_inflight': {}, 'NORMALIZERS': {},
+                          'normalize_buddy': lambda a: a,
+                          '_urlopen': lambda req, timeout: Resp(),
+                          '_raccoon_points_lock': threading.Lock(),
+                          '_raccoon_points_cache': {'ts': 0.0, 'by_uid': {}, 'fail_ts': 0.0},
+                          'RACCOON_POINTS_TTL': 300.0,
+                          'RACCOON_POINTS_FAIL_TTL': 60.0,
+                          'engine_request': fake})
+        scope['NORMALIZERS']['raccoon'] = scope['normalize_raccoon']
+        out = scope['platform_status']({'name': 'raccoon',
+                                        'base_url': 'http://127.0.0.1:7867'})
+        self.assertEqual(len(out['expiring']), 1)
+        row = out['expiring'][0]
+        self.assertEqual(row['account'], 'nick')
+        self.assertEqual(row['remain'], 9421.0)
+        self.assertEqual(row['days_left'], 6.4)   # 积分到期，不是 374 天
+        self.assertEqual(row['burn_days'], 374.7)
+
+    def test_raccoon_expiring_survives_points_endpoint_failure(self):
+        import urllib.request
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"status":"ok"}'
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            if path.endswith("/panel/api/points"):
+                raise OSError("points endpoint down")
+            return {"accounts": [{"uid": "u1", "nickname": "nick", "credits": 5}]}
+
+        scope = isolated(ROOT / 'router.py',
+                         {'platform_status', 'normalize_raccoon', '_shanghai_today',
+                          '_known_num', '_epoch_seconds', '_expiry_row',
+                          '_raccoon_points_audit'},
+                         {'urllib': __import__('urllib.request'),
+                          'CONFIG': {'upstreams': [{'name': 'raccoon',
+                                                    'base_url': 'http://127.0.0.1:7867'}]},
+                          '_inflight': {}, 'NORMALIZERS': {},
+                          'normalize_buddy': lambda a: a,
+                          '_urlopen': lambda req, timeout: Resp(),
+                          '_raccoon_points_lock': threading.Lock(),
+                          '_raccoon_points_cache': {'ts': 0.0, 'by_uid': {}, 'fail_ts': 0.0},
+                          'RACCOON_POINTS_TTL': 300.0,
+                          'RACCOON_POINTS_FAIL_TTL': 60.0,
+                          'engine_request': fake})
+        scope['NORMALIZERS']['raccoon'] = scope['normalize_raccoon']
+        out = scope['platform_status']({'name': 'raccoon',
+                                        'base_url': 'http://127.0.0.1:7867'})
+        self.assertEqual(len(out['accounts']), 1)   # 账号聚合不受影响
+        self.assertEqual(out['accounts'][0]['remain'], 5)
+        self.assertEqual(out['expiring'], [])       # 只是缺临期行
+
+    def test_trae_expiring_lists_packs_with_remaining_credits(self):
+        import urllib.request
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"status":"ok"}'
+        now = time.time()
+
+        def pack(desc, expire_in, limit, used, hide=False):
+            return {"display_desc": desc, "expire_time": int(now + expire_in * 86400),
+                    "is_hide": hide,
+                    "entitlement_base_info": {"quota": {"credits_limit": limit}},
+                    "usage": ({"credits_amount": used} if used is not None else {})}
+
+        account = {"uid": "…4052", "uidHash": "hash", "realm": "cn", "enabled": True,
+                   "status": "ready", "account": {"username": "u***@example.com"},
+                   "credits": {"remain": 2100, "limit": 2100, "checked_in": True},
+                   "entitlement": {"ent_usage": {"user_entitlement_pack_list": [
+                       pack("每月登录赠送", 11.4, 500, 128.0048),
+                       pack("签到奖励", 30.4, 100, None),
+                       pack("已用尽", 5, 100, 100),
+                       pack("隐藏包", 3, 100, 0, hide=True),
+                       {"display_desc": "无到期", "entitlement_base_info":
+                        {"quota": {"credits_limit": 10}}},
+                   ]}}}
+
+        scope = isolated(ROOT / 'router.py',
+                         {'platform_status', 'normalize_trae', '_known_num',
+                          '_epoch_seconds', '_expiry_row', '_trae_pack_name'},
+                         {'urllib': __import__('urllib.request'),
+                          'CONFIG': {'upstreams': [{'name': 'trae',
+                                                    'base_url': 'http://127.0.0.1:8791'}]},
+                          '_inflight': {}, 'NORMALIZERS': {},
+                          'normalize_buddy': lambda a: a,
+                          '_urlopen': lambda req, timeout: Resp(),
+                          '_append_wallet_snapshot': lambda *a: None,
+                          '_trae_wallet_account': lambda raw, row: "4052",
+                          'os': __import__('os'), 'HERE': str(ROOT),
+                          'engine_request': lambda up, method, path, body=None,
+                                                    auth=None, timeout=None: {
+                              "accounts": [account]}})
+        scope['NORMALIZERS']['trae'] = scope['normalize_trae']
+        out = scope['platform_status']({'name': 'trae',
+                                        'base_url': 'http://127.0.0.1:8791'})
+        names = [r['name'] for r in out['expiring']]
+        # 隐藏包、已用尽包、无到期包都不进表
+        self.assertEqual(names, ['每月登录赠送', '签到奖励'])
+        self.assertEqual(out['expiring'][0]['account'], 'u***@example.com')
+        self.assertEqual(out['expiring'][0]['remain'], 372.0)   # 500 - 128.0048
+        self.assertEqual(out['expiring'][0]['days_left'], 11.4)
+        self.assertEqual(out['expiring'][1]['remain'], 100.0)   # 未消耗 = 全额
+        self.assertIsNone(out['expiring'][0]['burn_days'])
+
+    def test_raccoon_points_audit_is_cached_and_backs_off_on_failure(self):
+        calls = []
+        state = {"fail": False}
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            calls.append(path)
+            if state["fail"]:
+                raise OSError("points down")
+            return {"accounts": [{"uid": "u1", "audit": {"remain": 5, "expire": 1795622399}},
+                                 {"uid": "u2"},  # 没有 audit 的账号不进映射
+                                 "junk"]}
+
+        scope = isolated(ROOT / 'router.py', {'_raccoon_points_audit'}, {
+            'engine_request': fake, 'time': time,
+            '_raccoon_points_lock': threading.Lock(),
+            '_raccoon_points_cache': {'ts': 0.0, 'by_uid': {}, 'fail_ts': 0.0},
+            'RACCOON_POINTS_TTL': 300.0, 'RACCOON_POINTS_FAIL_TTL': 60.0})
+        audit = scope['_raccoon_points_audit']
+        self.assertEqual(list(audit({'name': 'raccoon'})), ['u1'])
+        audit({'name': 'raccoon'})
+        # 第二次命中缓存：慢端点（400-660ms）不能每轮询都打一次
+        self.assertEqual(len(calls), 1)
+        # 失败后退避 60 秒：端点挂掉时每轮轮询都等一次超时的代价更高
+        state["fail"] = True
+        scope['_raccoon_points_cache'].update(ts=0.0, by_uid={}, fail_ts=0.0)
+        self.assertEqual(audit({'name': 'raccoon'}), {})
+        self.assertEqual(audit({'name': 'raccoon'}), {})
+        self.assertEqual(len(calls), 2)
+        # 退避窗口过后仍会重试，恢复后重新写入缓存
+        scope['_raccoon_points_cache']['fail_ts'] = time.time() - 61
+        state["fail"] = False
+        self.assertEqual(list(audit({'name': 'raccoon'})), ['u1'])
+        self.assertEqual(len(calls), 3)
 
     def test_platform_toggle_filters_catalog_and_routing(self):
         scope = isolated(ROOT / "router.py", {
@@ -1719,6 +2084,28 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.match(el('overview-estimate').innerHTML,/1\.96M/);
  assert.match(el('overview-estimate').innerHTML,/锚定/);
  assert.doesNotMatch(el('overview-estimate').innerHTML,/全未命中下限|乐观/);
+ // Manual refresh must force the estimate; the 30s auto refresh must keep the 5-minute cache.
+ let estimateCalls=[];
+ fetchImpl=async p=>{
+   if(p==='/api/status') return reply({ok:true,platforms:[],expiring:[],
+     kpi:{platforms_ok:0,platforms_total:0,accounts:0,checked_in:0,checkable:0}});
+   if(p.startsWith('/api/estimate')){
+     estimateCalls.push(p);
+     return reply({ok:true,platforms:[],generated_at:Math.floor(Date.now()/1000),
+       unit_note:'单位不可比',sample_basis:'按模型实扣'});
+   }
+   if(p.startsWith('/api/usage')) return reply({ok:true,rows:[],errors:{}});
+   return reply({});
+ };
+ run("EST_CACHE={ts:0,data:null};VIEW_LOADED.delete('overview')");
+ await run("refreshView('overview', true)");
+ assert.equal(estimateCalls.length,1);
+ assert.match(estimateCalls[0],/force=1/);
+ assert.match(el('overview-estimate-note').textContent,/预估生成于/);
+ // Auto refresh: no force, estimate served from cache.
+ run("VIEW_LOADED.set('overview', Date.now()-20000)");
+ await run("refreshView('overview')");
+ assert.equal(estimateCalls.length,1);
  run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
  fetchImpl=async()=>reply({ok:false,platform:'qoder',checked:0,total:2,
    error:'0/2 个账号成功',result:{results:[{uid:'a'},{uid:'b'}]}});
@@ -1761,6 +2148,15 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.equal(el('media-video-opts').style.display,'flex');
  assert.equal(run("DAILY_STEPS.some(s=>s.platform==='workbuddy'&&s.path==='scheduler/trigger')"),true);
  assert.equal(run("mediaPrice({media:'image',credit_per_image:6})"),'6 积分/张（估）');
+ // Expiring table keeps "expires in" and "usable at current burn rate" apart.
+ run("renderExpiring([{platform:'raccoon',account:'nick',name:'积分',remain:9421,expire:'2026-11-25 23:59',days_left:6.4,burn_days:374.7},{platform:'trae',account:'u',name:'每月登录赠送',remain:372,expire:'2026-11-30 23:59',days_left:11.4,burn_days:null}])");
+ assert.match(el('expiring-list').innerHTML,/距过期/);
+ assert.match(el('expiring-list').innerHTML,/按当前速度可用/);
+ assert.match(el('expiring-list').innerHTML,/7 天/);        // 6.4 → ceil 7，不是 374
+ assert.match(el('expiring-list').innerHTML,/375 天/);      // 374.7 → ceil 375，只出现在速度列
+ assert.match(el('expiring-list').innerHTML,/12 天/);
+ run("renderExpiring([])");
+ assert.match(el('expiring-list').innerHTML,/暂无已知过期信息/);
  // Trae platform wiring: label, sidebar link, add-account card, filters, automation.
  assert.equal(run("PLATFORM_LABEL.trae"),'Trae');
  assert.equal(run("PF_COLOR.trae"),'#0dbd8b');
@@ -1774,12 +2170,159 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  fetchImpl=()=>new Promise(()=>{});navs[1].onclick();
  assert.equal(views[1].classList.contains('active'),true);
  assert.equal(views[0].classList.contains('active'),false);
- console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation passed');
+ // Gateway self-update card: render, confirm gate, preflight → restart → recovery.
+ run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
+ const gwSnap=(job,extra)=>Object.assign({ok:true,current:'1.10.0',
+   repo:{is_repo:true,clean:true,branch:'main',origin_ok:true},
+   latest:{tag:'v1.11.0',version:'1.11.0',commit:'c'.repeat(40)},
+   has_update:true,error:'',job:job||{status:'idle'}},extra||{});
+ let gwPosts=[];
+ const gwFetch=job=>async(p,opt)=>{
+   if(p==='/api/gateway-update'&&opt&&opt.method==='POST'){gwPosts.push(JSON.parse(opt.body));return reply({ok:true,status:'preflight'},202);}
+   if(p.startsWith('/api/gateway-update')) return reply(gwSnap(job));
+   return reply({});
+ };
+ fetchImpl=gwFetch({status:'idle'});
+ await run('loadGatewayUpdate()');
+ assert.match(el('gw-update-info').innerHTML,/v1\.10\.0/);
+ assert.match(el('gw-update-info').innerHTML,/v1\.11\.0/);
+ assert.equal(el('btn-gw-update-deploy').disabled,false);
+ run("globalThis.confirm=()=>false");
+ await el('btn-gw-update-deploy').onclick();
+ assert.equal(gwPosts.length,0);
+ run("globalThis.confirm=()=>true");
+ fetchImpl=gwFetch({status:'preflight',version:'1.11.0'});
+ await el('btn-gw-update-deploy').onclick();
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(gwPosts.length,1);
+ assert.deepEqual(gwPosts[0],{confirm:true});
+ assert.equal(el('btn-gw-update-deploy').disabled,true);
+ assert.match(el('gw-update-info').innerHTML,/预检中/);
+ fetchImpl=gwFetch({status:'scheduled',version:'1.11.0'});
+ await run('loadGatewayUpdate()');
+ assert.equal(run('gwUpdateRestarting'),true);
+ fetchImpl=async()=>{throw new Error('connection refused');};
+ await run('loadGatewayUpdate()');
+ assert.match(el('gw-update-info').textContent,/重启中/);
+ fetchImpl=async p=>p.startsWith('/api/gateway-update')
+   ?reply(gwSnap({status:'idle'},{current:'1.11.0',has_update:false})):reply({});
+ await run('loadGatewayUpdate()');
+ assert.equal(run('gwUpdateRestarting'),false);
+ assert.match(run("__toasts.join('|')"),/已更新到 v1\.11\.0/);
+ fetchImpl=async p=>p.startsWith('/api/gateway-update')
+   ?reply(gwSnap({status:'idle'},{repo:{is_repo:true,clean:false,branch:'main',origin_ok:true}})):reply({});
+ await run('loadGatewayUpdate()');
+ assert.equal(el('btn-gw-update-deploy').disabled,true);
+ assert.match(el('gw-update-info').innerHTML,/未提交改动/);
+ console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation, self-update passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 '''
         result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
                                 text=True, encoding='utf-8', capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_gateway_update_deploy_requires_confirm_and_update(self):
+        import sys
+        import types
+        from unittest.mock import Mock
+        calls = []
+        stub = types.ModuleType("gateway_update")
+        stub.schedule_update = lambda *a, **k: calls.append(a) or {
+            "ok": True, "status": "scheduled", "version": "1.11.0", "commit": "c" * 40}
+        shutdowns = []
+        server = type("S", (), {"shutdown": lambda self: shutdowns.append(1)})()
+        scope = isolated(ROOT / "router.py",
+                         {"Handler", "_gateway_update_deploy", "_gateway_update_deploy_thread",
+                          "_gateway_update_job_state", "_gateway_update_error"},
+                         {"threading": threading, "os": __import__("os"), "HERE": str(ROOT),
+                          "_gateway_update_lock": threading.Lock(),
+                          "_gateway_update_job": {"status": "idle", "version": "", "commit": "",
+                                                  "error": "", "ts": 0.0},
+                          "_SERVER": server,
+                          "_gateway_update_snapshot": lambda force=False: {
+                              "ok": True, "current": "1.10.0", "has_update": True,
+                              "latest": {"tag": "v1.11.0", "version": "1.11.0", "commit": "c" * 40}}})
+        old = sys.modules.get("gateway_update")
+        sys.modules["gateway_update"] = stub
+        try:
+            handler = scope["Handler"].__new__(scope["Handler"])
+            handler._send_json = Mock()
+            handler._deny = Mock()
+            handler._post_body = {}
+            handler._api_gateway_update_deploy()
+            handler._deny.assert_called_once()
+            self.assertEqual(handler._deny.call_args.args[0], 400)
+            self.assertEqual(calls, [])
+            handler._post_body = {"confirm": True}
+            handler._api_gateway_update_deploy()
+            handler._send_json.assert_called_once()
+            self.assertEqual(handler._send_json.call_args.args[0], 202)
+            deadline = time.time() + 5
+            while scope["_gateway_update_job_state"]()["status"] != "scheduled" and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(scope["_gateway_update_job_state"]()["status"], "scheduled")
+            self.assertEqual(len(calls), 1)
+            deadline = time.time() + 5
+            while not shutdowns and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(shutdowns, [1])
+            with self.assertRaises(ValueError):
+                scope["_gateway_update_deploy"]({"ok": True, "has_update": True,
+                                                 "latest": {"version": "1.11.0"}})
+        finally:
+            if old is None:
+                sys.modules.pop("gateway_update", None)
+            else:
+                sys.modules["gateway_update"] = old
+
+    def test_gateway_update_deploy_preflight_failure_is_retryable(self):
+        import sys
+        import types
+        from unittest.mock import Mock
+        attempts = []
+        stub = types.ModuleType("gateway_update")
+        def schedule(root, snapshot, parent_pid, **kw):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ValueError("candidate regression failed")
+            return {"ok": True, "status": "scheduled", "version": "1.11.0", "commit": "c" * 40}
+        stub.schedule_update = schedule
+        shutdowns = []
+        server = type("S", (), {"shutdown": lambda self: shutdowns.append(1)})()
+        scope = isolated(ROOT / "router.py",
+                         {"_gateway_update_deploy", "_gateway_update_deploy_thread",
+                          "_gateway_update_job_state", "_gateway_update_error"},
+                         {"threading": threading, "os": __import__("os"), "HERE": str(ROOT),
+                          "_gateway_update_lock": threading.Lock(),
+                          "_gateway_update_job": {"status": "idle", "version": "", "commit": "",
+                                                  "error": "", "ts": 0.0},
+                          "_SERVER": server})
+        snapshot = {"ok": True, "current": "1.10.0", "has_update": True,
+                    "latest": {"tag": "v1.11.0", "version": "1.11.0", "commit": "c" * 40}}
+        old = sys.modules.get("gateway_update")
+        sys.modules["gateway_update"] = stub
+        try:
+            with self.assertRaises(ValueError):
+                scope["_gateway_update_deploy"]({"ok": True, "has_update": False})
+            scope["_gateway_update_deploy"](snapshot)
+            deadline = time.time() + 5
+            while scope["_gateway_update_job_state"]()["status"] != "failed" and time.time() < deadline:
+                time.sleep(0.02)
+            state = scope["_gateway_update_job_state"]()
+            self.assertEqual(state["status"], "failed")
+            self.assertIn("candidate regression failed", state["error"])
+            self.assertEqual(shutdowns, [])
+            scope["_gateway_update_deploy"](snapshot)
+            deadline = time.time() + 5
+            while scope["_gateway_update_job_state"]()["status"] != "scheduled" and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(scope["_gateway_update_job_state"]()["status"], "scheduled")
+            self.assertEqual(len(attempts), 2)
+        finally:
+            if old is None:
+                sys.modules.pop("gateway_update", None)
+            else:
+                sys.modules["gateway_update"] = old
 
 
 if __name__ == '__main__':

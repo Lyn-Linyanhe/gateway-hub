@@ -28,8 +28,10 @@ jobs:
         with:
           node-version: '22'
       - name: Check Python syntax
-        run: python -I -B -m py_compile router.py audit_platform.py test_regressions.py
+        run: python -I -B -m py_compile router.py gateway_update.py audit_platform.py test_regressions.py test_gateway_update.py
       - name: Run offline regressions
         run: python -I -B test_regressions.py
+      - name: Run self-update regressions
+        run: python -I -B test_gateway_update.py
       - name: Check whitespace
         run: git diff --check

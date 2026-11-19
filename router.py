@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -1891,6 +1892,57 @@ def _known_num(v):
     return n
 
 
+def _epoch_seconds(value):
+    """epoch 秒；毫秒时间戳自动归一，非法值返回 None（不猜时间）。
+
+    各引擎的到期字段单位不统一：小浣熊的积分到期是秒、它的凭证 expires_at
+    是毫秒，Trae 的 expire_time 是秒。混着用会把 2026 年算成 5 万年以后，
+    所以统一在这里归一。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts != ts or ts <= 0:
+        return None
+    if ts > 4e9:
+        ts /= 1000.0
+    if not (0 < ts < 4e9):  # 越界值会让 localtime 在 Windows 抛错
+        return None
+    return ts
+
+
+def _expiry_row(account, name, remain, ts, burn_days=None):
+    """统一的临期行：days_left 一律由到期时间现算。
+
+    上游的「可用天数」多数是「按当前燃烧速度还能撑多久」（小浣熊
+    audit.days_left 就是 remain ÷ burn_per_day），跟「还有几天过期」是两件
+    事；直接塞进同一列会出现「还剩 374 天」而实际 6 天后清零。所以速度
+    预测单独放 burn_days，由前端另列展示。
+    """
+    burn = _known_num(burn_days)
+    return {"account": str(account or ""),
+            "name": str(name or "积分包"),
+            "remain": round(float(remain), 2),
+            "expire": time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+            "days_left": round((ts - time.time()) / 86400, 1),
+            "burn_days": (round(burn, 1) if burn is not None else None)}
+
+
+def _trae_pack_name(base):
+    """Trae 权益包的展示名：display_desc 偶尔为空，退回 product_extra 里的包名。"""
+    extra = (base or {}).get("product_extra")
+    if not isinstance(extra, dict):
+        return ""
+    for key in ("package_extra", "subscription_extra"):
+        inner = extra.get(key)
+        if isinstance(inner, dict) and inner.get("package_name"):
+            return str(inner["package_name"])
+    return ""
+
+
 def normalize_wb(a):
     c = a.get("credits") or {}
     ck = c.get("checkin") or {}
@@ -2085,10 +2137,99 @@ _updates_lock = threading.Lock()
 _updates_cache = {"ts": 0.0, "data": None}
 UPDATES_TTL = 3600.0
 
+# 小浣熊积分到期（/panel/api/points）比 overview 慢一个量级，单独缓存。
+# 失败也要短暂退避：否则端点挂掉时每轮 /api/status 都要等一次超时。
+_raccoon_points_lock = threading.Lock()
+_raccoon_points_cache = {"ts": 0.0, "by_uid": {}, "fail_ts": 0.0}
+RACCOON_POINTS_TTL = 300.0
+RACCOON_POINTS_FAIL_TTL = 60.0
+
 # 官方 wb 仓库已下线（GitHub 404），引擎自带检查因此永远拿不到 latest。
 # 回退到社区镜像的 release tag：只作参照，明确标注镜像可能滞后；可用
 # config.json 的 wb_update_mirror（owner/repo）覆盖这一默认值。
 WB_UPDATE_MIRRORS = ("niyouqianma/workbuddy2api-hub",)
+
+
+def _gateway_update_error(exc):
+    return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
+
+
+_gateway_update_lock = threading.Lock()
+_gateway_update_cache = {"ts": 0.0, "data": None}
+GATEWAY_UPDATE_TTL = 300.0
+# 部署任务状态：idle → preflight → scheduled（随后本网关退出，由独立更新进程接管）；
+# preflight 失败回到 failed，可重试。scheduled 之后进程即将退出，状态仅供退出前轮询。
+_gateway_update_job = {"status": "idle", "version": "", "commit": "", "error": "", "ts": 0.0}
+_SERVER = None  # main() 里赋值；自更新调度成功后用它优雅退出
+
+
+def _gateway_update_snapshot(force=False):
+    """Read-only official Release check; never touches the checkout."""
+    now = time.time()
+    with _gateway_update_lock:
+        if (not force and _gateway_update_cache["data"] is not None
+                and now - _gateway_update_cache["ts"] < GATEWAY_UPDATE_TTL):
+            return _gateway_update_cache["data"]
+    try:
+        import gateway_update
+        current = gateway_update.get_current_version(HERE)
+        status = gateway_update.repository_status(HERE)
+        latest = gateway_update.fetch_latest_release()
+        if latest.get("error"):
+            data = {"ok": True, "current": current, "repo": status,
+                    "latest": None, "has_update": None, "error": latest["error"]}
+        else:
+            data = {"ok": True, "current": current, "repo": status,
+                    "latest": latest, "has_update": gateway_update.is_newer(
+                        current, latest.get("version")), "error": ""}
+        with _gateway_update_lock:
+            _gateway_update_cache.update(ts=now, data=data)
+        return data
+    except Exception as exc:
+        data = {"ok": False, "current": None, "latest": None,
+                "has_update": None, "error": str(exc)[:240]}
+        with _gateway_update_lock:
+            _gateway_update_cache.update(ts=now, data=data)
+        return data
+
+
+def _gateway_update_job_state():
+    with _gateway_update_lock:
+        return dict(_gateway_update_job)
+
+
+def _gateway_update_deploy(snapshot):
+    """确认后才允许的一键部署：后台预检并拉起独立更新进程，随后本网关退出。"""
+    if not isinstance(snapshot, dict) or not snapshot.get("ok") or snapshot.get("has_update") is not True:
+        raise ValueError("没有可部署的更新：请先检查到更新的官方正式版 Release")
+    latest = snapshot.get("latest") or {}
+    with _gateway_update_lock:
+        if _gateway_update_job["status"] in ("preflight", "scheduled"):
+            raise ValueError("已有更新部署在进行中，请等待完成")
+        _gateway_update_job.update(status="preflight", version=latest.get("version", ""),
+                                   commit=latest.get("commit", ""), error="", ts=time.time())
+    threading.Thread(target=_gateway_update_deploy_thread, args=(snapshot,),
+                     name="gateway-update-deploy", daemon=True).start()
+    return {"ok": True, "status": "preflight"}
+
+
+def _gateway_update_deploy_thread(snapshot):
+    try:
+        import gateway_update
+        result = gateway_update.schedule_update(HERE, snapshot, os.getpid())
+        with _gateway_update_lock:
+            _gateway_update_job.update(status="scheduled", version=result["version"],
+                                       commit=result["commit"], error="", ts=time.time())
+        log(f"gateway self-update scheduled: {json.dumps(result, ensure_ascii=False)}；即将退出交给更新进程")
+        time.sleep(1.0)  # 让 202 响应先冲刷出去，再停 serve_forever
+        if _SERVER is not None:
+            _SERVER.shutdown()
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {str(exc)[:240]}"
+        with _gateway_update_lock:
+            _gateway_update_job.update(status="failed", error=message, ts=time.time())
+        log(f"gateway self-update preflight failed: {message}")
+
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 
 
@@ -2222,6 +2363,36 @@ def _collect_updates(force=False):
     return rows
 
 
+def _raccoon_points_audit(up):
+    """uid → audit（含积分到期 expire）。5 分钟缓存，失败返回空 dict。
+
+    该端点在引擎侧要聚合全部账号积分流水，实测 400-660ms；而 /api/status 被
+    前端高频轮询，直连会把总览拖慢。成功后缓存 5 分钟；失败退避 60 秒再重试，
+    避免端点挂掉时每轮轮询都卡一次超时。拿不到时只让临期行缺省，不影响余额
+    与账号展示。
+    """
+    now = time.time()
+    with _raccoon_points_lock:
+        cache = _raccoon_points_cache
+        if now - cache["ts"] < RACCOON_POINTS_TTL:
+            return cache["by_uid"]
+        if now - float(cache.get("fail_ts") or 0.0) < RACCOON_POINTS_FAIL_TTL:
+            return {}
+    try:
+        data = engine_request(up, "GET", "/panel/api/points", auth="bearer")
+    except Exception:
+        with _raccoon_points_lock:
+            _raccoon_points_cache["fail_ts"] = time.time()
+        return {}
+    by_uid = {}
+    for row in ((data.get("accounts") if isinstance(data, dict) else data) or []):
+        if isinstance(row, dict) and isinstance(row.get("audit"), dict):
+            by_uid[str(row.get("uid") or "")] = row["audit"]
+    with _raccoon_points_lock:
+        _raccoon_points_cache.update(ts=time.time(), by_uid=by_uid)
+    return by_uid
+
+
 def platform_status(up):
     """单个引擎的健康 + 账号池聚合。"""
     name = up["name"]
@@ -2256,26 +2427,11 @@ def platform_status(up):
                     if isinstance(res, dict) and res.get("remaining") is not None:
                         a["_resources"] = res
                         # 余额历史落盘：后续可用「两次快照差 ÷ 期间调用的 token」
-                        # 反推千问办公各模型的实测单价。超过 512KB 裁到最近 2000 行，
-                        # 否则 30s 一次的轮询会让它无限增长（~6900 行/天）。
-                        try:
-                            hist = os.path.join(HERE, "qwenwork_wallet_history.jsonl")
-                            with _wallet_lock:  # 并发 /api/status 下追加+轮转不能交错
-                                with open(hist, "a", encoding="utf-8") as wf:
-                                    wf.write(json.dumps({
-                                        "ts": time.time(),
-                                        "account": a.get("nickname") or str(a.get("id")),
-                                        "balance": res.get("remaining"),
-                                    }, ensure_ascii=False) + "\n")
-                                if os.path.getsize(hist) > 512 * 1024:
-                                    with open(hist, encoding="utf-8") as rf:
-                                        keep = rf.readlines()[-2000:]
-                                    tmp = hist + ".tmp"
-                                    with open(tmp, "w", encoding="utf-8") as wf:
-                                        wf.writelines(keep)
-                                    os.replace(tmp, hist)
-                        except OSError:
-                            pass
+                        # 反推千问办公各模型的实测单价。
+                        _append_wallet_snapshot(
+                            os.path.join(HERE, "qwenwork_wallet_history.jsonl"),
+                            a.get("nickname") or str(a.get("id")),
+                            res.get("remaining"))
                 except Exception:
                     pass
 
@@ -2285,6 +2441,14 @@ def platform_status(up):
             data = engine_request(up, "GET", "/panel/api/overview", auth="bearer")
             items = data.get("accounts") if isinstance(data, dict) else data
             items = items or []
+            # 积分到期只在 /panel/api/points 的 audit 里（overview 的 expires_at
+            # 是登录凭证过期，不是积分）。该端点单次要 400-660ms（overview 只有
+            # 15ms），而 /api/status 每轮询都走这里，所以单独缓存 5 分钟；失败
+            # 只让临期行缺省，不拖垮账号与余额聚合。
+            by_uid = _raccoon_points_audit(up)
+            for a in items:
+                if isinstance(a, dict) and by_uid:
+                    a["_audit"] = by_uid.get(str(a.get("uid") or ""))
         else:
             # hub 系 /accounts 默认只返回当前区域视图，realm=all 才是全池
             data = engine_request(up, "GET", "/accounts?realm=all")
@@ -2292,6 +2456,17 @@ def platform_status(up):
             items = items or []
         norm = NORMALIZERS.get(name, normalize_buddy)
         out["accounts"] = [norm(a) for a in items if isinstance(a, dict)]
+        if name == "trae":
+            # Trae 的 usage 行不带逐请求扣费（credit_reported 恒 false），只能靠
+            # 钱包余额快照差反推平台均价。引擎把 uid 脱敏成「…4052」，而 usage
+            # 行里是完整 uid（1414412225494052），所以统一用尾 4 位作匹配键。
+            for raw, row in zip(items, out["accounts"]):
+                if not isinstance(raw, dict):
+                    continue
+                account_id = _trae_wallet_account(raw, row)
+                _append_wallet_snapshot(
+                    os.path.join(HERE, "trae_wallet_history.jsonl"),
+                    account_id, row.get("remain"))
         # 账号并发：wb 引擎逐账号给在飞数（/settings.account_inflight）+ 每账号
         # 上限（account_max_concurrent，0=不限）；qwenwork 只有全局 rate_limit 上限
         # （0=不限，Buddy2api 不暴露逐账号在飞数）；qoder 由引擎 account_views 附带。
@@ -2339,7 +2514,8 @@ def platform_status(up):
                 row["concurrency_limit"] = limit
                 row["inflight"] = None
         # 即将过期的积分：wb 直接给 earliest_expiring（最临期包 + 已算好的天数），
-        # qoder 给整池 expires_at；qwenwork 上游不透出过期时间，如实缺省。
+        # qoder 给整池 expires_at；raccoon 的 audit.expire 是积分到期；
+        # trae 的每个权益包都带 expire_time。qwenwork 上游不透出过期时间，如实缺省。
         expiring = []
         if name == "workbuddy":
             for a in items:
@@ -2378,6 +2554,53 @@ def platform_status(up):
                                  "remain": _num(c.get("remain")),
                                  "expire": time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
                                  "days_left": round((ts - time.time()) / 86400, 1)})
+        elif name == "raccoon":
+            # audit.expire 是积分有效期（秒）；audit.days_left 是「按当前燃烧
+            # 速度还能用几天」，两者语义不同，分开给前端。
+            for a in items:
+                if not isinstance(a, dict):
+                    continue
+                audit = a.get("_audit") or {}
+                ts = _epoch_seconds(audit.get("expire"))
+                if not ts:
+                    continue
+                remain = _known_num(audit.get("remain"))
+                if remain is None or remain <= 0:
+                    continue
+                expiring.append(_expiry_row(
+                    a.get("nickname") or a.get("uid"), "积分（每日 + 奖励 + 充值）",
+                    remain, ts, audit.get("days_left")))
+        elif name == "trae":
+            # 每个权益包独立到期；is_hide 是上游标记为不展示的包，跳过。
+            for a in items:
+                if not isinstance(a, dict):
+                    continue
+                ent = a.get("entitlement") or {}
+                usage = ent.get("ent_usage") if isinstance(ent.get("ent_usage"), dict) else {}
+                packs = usage.get("user_entitlement_pack_list") or []
+                if not isinstance(packs, list):
+                    continue
+                for pack in packs:
+                    if not isinstance(pack, dict) or pack.get("is_hide"):
+                        continue
+                    ts = _epoch_seconds(pack.get("expire_time")
+                                        or pack.get("yearly_expire_time"))
+                    if not ts:
+                        continue
+                    base = pack.get("entitlement_base_info") or {}
+                    quota = base.get("quota") if isinstance(base.get("quota"), dict) else {}
+                    used = pack.get("usage") if isinstance(pack.get("usage"), dict) else {}
+                    limit = _known_num(quota.get("credits_limit"))
+                    if limit is None:
+                        continue  # 没有额度上限的包（如「免费」套餐）不可计量，不猜
+                    consumed = _known_num(used.get("credits_amount")) or 0.0
+                    remain = limit - consumed
+                    if remain <= 0:
+                        continue  # 已用尽的包不再提示，否则表里全是 0
+                    expiring.append(_expiry_row(
+                        (a.get("account") or {}).get("username") or a.get("uid"),
+                        pack.get("display_desc") or _trae_pack_name(base) or "权益包",
+                        remain, ts))
         elif name == "qwenwork":
             # 千问办公企业配额按月重置（客户端显示「配额下次重置时间」），
             # 上游 resources 不透出 valid_to，日期由 config qwenwork_reset_at 提供
@@ -2580,7 +2803,7 @@ def _attach_raccoon_bills(events, bills, links):
         link_at = _known_num(link.get("at")) or 0
         event_uid = str(event.get("uid") or "")
         bill_uid = str(bill.get("account") or "")
-        if ((event_uid and event_uid != bill_uid)
+        if ((not event_uid or event_uid != bill_uid)
                 or not bill_uid or not bill.get("bill_id") or not event.get("model")
                 or _num(event.get("total_tokens")) <= 0
                 or len(marker) < 20
@@ -2704,6 +2927,7 @@ def _estimate_at(row):
 
 
 QWEN_WALLET_HISTORY = os.path.join(HERE, "qwenwork_wallet_history.jsonl")
+TRAE_WALLET_HISTORY = os.path.join(HERE, "trae_wallet_history.jsonl")
 
 
 def _read_wallet_history(path=None):
@@ -2759,8 +2983,13 @@ def _credit_rate(rows):
 def _wallet_rate(rows, history):
     """钱包快照差 ÷ 同期 token → (分/Mtok, 账号数, 样本 token, 覆盖小时)。
 
-    每个账号只用首末快照覆盖的区间；余额增加（发放/充值）的账号跳过，
-    token 也只数同一区间，避免把窗口外的消耗算进来。
+    只使用**余额真正下降**的相邻快照对：上游余额常是缓存值，只有强制刷新
+    积分时才更新。若拿「首末快照」算，静止期（余额不变但 token 一直在涨）
+    会被当成零成本，把单价稀释到毫无意义（实测把 10.66 点摊到 3422 万
+    token 上，算出 0.31 分/Mtok 这种假单价）。
+
+    口径：把快照按时间排序，逐对相邻快照取 (prev.ts, cur.ts] 区间，只在该
+    区间余额下降时计入；token 也严格只数落在该区间内的请求。
     """
     per_account = {}
     for item in history:
@@ -2773,35 +3002,95 @@ def _wallet_rate(rows, history):
         snapshots.sort(key=lambda item: item["ts"])
         if len(snapshots) < 2:
             continue
-        first, last = snapshots[0], snapshots[-1]
-        spent = first["balance"] - last["balance"]
-        if spent <= 0:
+        account_tokens = 0.0
+        account_credit = 0.0
+        account_hours = 0.0
+        for prev, cur in zip(snapshots, snapshots[1:]):
+            spent = prev["balance"] - cur["balance"]
+            if spent <= 0:
+                continue  # 余额未变（缓存）或增加（发放/充值）：这一对不作样本
+            tokens = 0.0
+            for row in rows:
+                row_account = str(row.get("account_name") or row.get("account") or "")
+                if row_account != account:
+                    # Trae 的快照键是脱敏 uid 的尾 4 位（引擎 /accounts 只给「…4052」），
+                    # usage 行里是完整 uid；仅对短数字键做后缀匹配，避免误合并。
+                    if not (len(account) == 4 and account.isdigit()
+                            and row_account.endswith(account)):
+                        continue
+                at = _estimate_at(row)
+                if at and prev["ts"] < at <= cur["ts"]:
+                    tokens += _num(row.get("total_tokens") or row.get("total"))
+            if tokens <= 0:
+                continue  # 扣了费但区间内没有 token 记录：来源不明，不用它算单价
+            account_credit += spent
+            account_tokens += tokens
+            account_hours += (cur["ts"] - prev["ts"]) / 3600
+        if account_tokens <= 0 or account_credit <= 0:
             continue
-        tokens = 0.0
-        for row in rows:
-            row_account = (row.get("account_name") or row.get("account") or "")
-            if str(row_account) != account:
-                continue
-            at = _estimate_at(row)
-            if at and first["ts"] <= at <= last["ts"]:
-                tokens += _num(row.get("total_tokens") or row.get("total"))
-        if tokens <= 0:
-            continue
-        total_credit += spent
-        total_tokens += tokens
+        total_credit += account_credit
+        total_tokens += account_tokens
         accounts += 1
-        hours = max(hours, (last["ts"] - first["ts"]) / 3600)
+        hours = max(hours, account_hours)
     if accounts < 1 or total_tokens < 100_000 or total_credit <= 0:
         return None, accounts, total_tokens, hours
     return total_credit / total_tokens * 1_000_000, accounts, total_tokens, hours
+
+
+def _trae_wallet_account(raw_account, normalized):
+    """Trae 余额快照与 usage 行之间统一的账号匹配键。
+
+    引擎 /accounts 把 uid 脱敏成「…4052」，而 usage 行的 account 是完整 uid
+    （如 1414412225494052）。两边只有后 4 位一致，所以用 uid 尾段作键；
+    取不到时退回 uidHash（前端展示用的稳定标识）。
+    """
+    raw_uid = str((raw_account or {}).get("uid") or "").strip()
+    digits = "".join(ch for ch in raw_uid if ch.isdigit())
+    if len(digits) >= 4:
+        return digits[-4:]
+    if raw_uid and not raw_uid.startswith("…"):
+        return raw_uid
+    return str((normalized or {}).get("uid") or "")
+
+
+def _trae_consumption_rate(catalog, upstream_model):
+    """Trae 官方消费倍率（features.consumption_rate.data.rate）。
+
+    目录行里由 trae2api-hub 原样透传为 consumption_rate，如 DeepSeek-V4.1-Flash
+    是 0.06、Kimi-K3 是 1.83。它只是模型之间的相对倍率，不是「分/Mtok」，
+    必须乘上钱包反推的锚定系数才是单价。
+    """
+    for entry in catalog:
+        if entry["platform"] != "trae":
+            continue
+        if upstream_model not in (entry.get("upstream"), entry.get("public")):
+            continue
+        row = entry.get("row") or {}
+        value = row.get("consumption_rate")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if value > 0 else None
+    return None
+
+
+#: 各平台余额的计费单位说明。数值不可跨平台比较——它们不是同一种货币。
+PLATFORM_BALANCE_UNIT = {
+    "workbuddy": "WorkBuddy 积分",
+    "qoder": "Qoder 积分",
+    "qwenwork": "千问办公企业配额",
+    "raccoon": "小浣熊积分点",
+    "trae": "Trae 积分（信用）",
+}
 
 
 def estimate_snapshot(force=False):
     """额度预估：每个平台、每个模型分别按实测有效单价（分/Mtok）估算。
 
     预计 token = 模型可用余额 ÷ 单价 × 1,000,000。
-    WorkBuddy/Qoder/Trae 只用明确的逐请求扣费字段；模型样本不足时显示待测。
+    WorkBuddy/Qoder 用明确的逐请求扣费字段；模型样本不足时显示待测。
     千问办公没有逐请求扣费，按模型短样本相对价用钱包实测均价锚定；
+    Trae 同样没有逐请求扣费，用官方 consumption_rate 作模型间相对倍率，
+    乘上钱包快照反推的平台均价锚定系数；
     小浣熊只有唯一账单关联的聊天样本才参与估值，历史未关联请求保持待测。
     """
     now = time.time()
@@ -2852,12 +3141,19 @@ def estimate_snapshot(force=False):
                 "known": len(known_balances), "total": len(accounts),
                 "enabled": len(accounts),
                 "health": st["health"], "error": st.get("error", ""),
-                "realm_balances": realm_balances, "realm_known": realm_known}
+                "realm_balances": realm_balances, "realm_known": realm_known,
+                # 各平台的「分」是平台自有积分单位，彼此不可比：小浣熊 1 点 ≈ 2.1 万
+                # token，WorkBuddy 1 分 ≈ 67 万 token，数值大小没有跨平台含义。
+                "balance_unit": PLATFORM_BALANCE_UNIT.get(name, "积分")}
         try:
             rows = _estimate_rows(up)
         except Exception as exc:
             rows = []
             item["usage_error"] = type(exc).__name__
+        if name == "raccoon":
+            # 账单只补齐逐请求实扣来源；之后与 WorkBuddy 共用同一计价流程。
+            rows = [r for r in rows if r.get("credit_source") == "matched_bill"
+                    and r.get("credit") is not None]
 
         # 平台级实测均价：单模型样本不足时的回退，也是千问的对照值。
         if name == "qwenwork":
@@ -2865,15 +3161,29 @@ def estimate_snapshot(force=False):
                 rows, _read_wallet_history())
             platform_source = "wallet"
         elif name == "trae":
+            # Trae 的 usage 行不带逐请求扣费（credit_reported 恒 false），
+            # 无法用 Σ实扣 ÷ Σtoken。改用余额快照差 ÷ 同期 token 反推平台均价，
+            # 与千问办公同一口径（两者都没有逐请求扣费字段）。
             priced = [row for row in rows
                       if not row.get("usage_missing")
                       and row.get("credit_reported") is True
                       and row.get("credit") is not None]
             platform_rate, platform_samples, platform_tokens = _credit_rate(priced)
-            first_at = min((_estimate_at(r) for r in priced if _estimate_at(r)), default=0.0)
-            platform_hours = (round(max(0.0, (now - first_at) / 3600), 1)
-                              if first_at else None)
-            platform_source = "measured_credits"
+            if platform_rate is None:
+                platform_rate, platform_samples, platform_tokens, platform_hours = _wallet_rate(
+                    rows, _read_wallet_history(TRAE_WALLET_HISTORY))
+                platform_source = "wallet"
+                if platform_rate is None:
+                    # 余额长期不变说明引擎没在刷新积分快照，此时任何「均价」都是
+                    # 把静止期摊进一次性扣费得来的假数字。明确告诉用户原因。
+                    item["rate_note"] = (
+                        "Trae 余额快照未观察到下降区间（引擎余额是缓存值，需强制刷新积分）"
+                        "，暂不估算")
+            else:
+                first_at = min((_estimate_at(r) for r in priced if _estimate_at(r)), default=0.0)
+                platform_hours = (round(max(0.0, (now - first_at) / 3600), 1)
+                                  if first_at else None)
+                platform_source = "measured_credits"
         else:
             platform_rate, platform_samples, platform_tokens = _credit_rate(rows)
             first_at = min((_estimate_at(r) for r in rows if _estimate_at(r)), default=0.0)
@@ -2886,8 +3196,10 @@ def estimate_snapshot(force=False):
             "samples": platform_samples,
             "sample_tokens": int(platform_tokens),
             "sample_hours": platform_hours,
-            "note": ("平台实测均价" if platform_rate is not None else "平台样本不足"),
+            "note": (item.get("rate_note")
+                     or ("平台实测均价" if platform_rate is not None else "平台样本不足")),
         })
+        item.pop("rate_note", None)
 
         by_model = {}
         for r in rows:
@@ -2912,6 +3224,25 @@ def estimate_snapshot(force=False):
                 priced_tokens += tokens
             if priced_tokens > 0 and weighted > 0:
                 qwen_anchor = platform_rate / (weighted / priced_tokens)
+
+        # Trae：没有逐请求扣费，也没有「短样本相对价」。用官方 consumption_rate
+        # 作为模型间相对倍率，把钱包反推的平台均价按 token 加权缩放到各模型。
+        trae_anchor = None
+        if name == "trae" and platform_rate is not None:
+            weighted = 0.0
+            priced_tokens = 0.0
+            for model_name, model_rows in by_model.items():
+                factor = _trae_consumption_rate(catalog, model_name)
+                if factor is None:
+                    continue
+                tokens = sum(_num(r.get("total_tokens") or r.get("total"))
+                             for r in model_rows)
+                if tokens <= 0:
+                    continue
+                weighted += factor * tokens
+                priced_tokens += tokens
+            if priced_tokens > 0 and weighted > 0:
+                trae_anchor = platform_rate / (weighted / priced_tokens)
 
         models = []
         for entry in catalog:
@@ -2966,6 +3297,35 @@ def estimate_snapshot(force=False):
                     note = "钱包样本不足，无法锚定"
                 else:
                     note = "该模型无短样本价，暂不估算"
+            elif name == "trae":
+                if mrate is not None:
+                    # 上游若真给了逐请求扣费，实测优先，不用倍率推测。
+                    rate = mrate
+                    source = "measured"
+                    samples = msamples
+                    sample_tokens = int(mtokens)
+                    sample_hours = mhours
+                    note = f"按最近 {msamples} 条扣费样本：Σ实扣 ÷ Σtoken"
+                else:
+                    # 官方 consumption_rate（信用消费倍率）× 钱包锚定系数 → 分/Mtok。
+                    factor = _trae_consumption_rate(catalog, entry["upstream"])
+                    if factor is not None and trae_anchor is not None:
+                        rate = factor * trae_anchor
+                        source = "anchored"
+                        samples = len(mrows)
+                        sample_tokens = int(sum(_num(r.get("total_tokens") or r.get("total"))
+                                                for r in mrows))
+                        sample_hours = mhours
+                        note = (f"官方倍率 x{factor} × 钱包实测均价锚定"
+                                f"（k={trae_anchor:.4f}）")
+                    elif factor is not None:
+                        samples = len(mrows)
+                        sample_tokens = int(sum(_num(r.get("total_tokens") or r.get("total"))
+                                                for r in mrows))
+                        sample_hours = mhours
+                        note = "钱包快照样本不足，无法锚定"
+                    else:
+                        note = "该模型无官方消费倍率，暂不估算"
             elif mrate is not None:
                 rate = mrate
                 source = "measured"
@@ -2995,7 +3355,10 @@ def estimate_snapshot(force=False):
         item["models"] = models
         out.append(item)
     data = {"ok": True, "generated_at": int(now),
-            "sample_basis": "按模型 Σ实扣 ÷ Σtoken；千问用短样本相对价 × 钱包实测均价锚定",
+            "sample_basis": ("按模型 Σ实扣 ÷ Σtoken；千问用短样本相对价 × 钱包实测均价锚定；"
+                             "Trae 用官方消费倍率 × 钱包实测均价锚定"),
+            "unit_note": ("各平台「分/Mtok」的分是平台自有积分单位，"
+                          "跨平台的单价与余额都不可直接比较大小"),
             "platforms": out}
     with _estimate_lock:
         _estimate_cache.update(ts=now, data=data)
@@ -3120,6 +3483,30 @@ def tail_log(lines=120):
 # ---------------------------------------------------------------------------
 # 钱包历史写入锁；历史仅作余额观测，不自动推算模型单价。
 _wallet_lock = threading.Lock()
+
+
+def _append_wallet_snapshot(path, account, balance):
+    """追加一条余额快照（并发安全 + 512KB 轮转到最近 2000 行）。
+
+    千问办公与 Trae 共用：两者都没有逐请求扣费字段，只能靠「两次快照的
+    余额差 ÷ 同期真实消耗 token」反推平台实测均价。
+    """
+    if not account or balance is None:
+        return
+    try:
+        with _wallet_lock:
+            with open(path, "a", encoding="utf-8") as wf:
+                wf.write(json.dumps({"ts": time.time(), "account": str(account),
+                                     "balance": balance}, ensure_ascii=False) + "\n")
+            if os.path.getsize(path) > 512 * 1024:
+                with open(path, encoding="utf-8") as rf:
+                    keep = rf.readlines()[-2000:]
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as wf:
+                    wf.writelines(keep)
+                os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def _request_target(target):
@@ -3309,6 +3696,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/updates":
             force = "force=1" in query
             return self._send_json(200, {"ok": True, "rows": _collect_updates(force=force)})
+        if path == "/api/gateway-update":
+            data = dict(_gateway_update_snapshot(force="force=1" in query))
+            data["job"] = _gateway_update_job_state()
+            return self._send_json(200, data)
         if path == "/api/catalog":
             return self._api_catalog()
         if path == "/api/status":
@@ -3369,6 +3760,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_engine()
         if path == "/api/gwconfig":
             return self._api_gwconfig()
+        if path == "/api/gateway-update":
+            return self._api_gateway_update_deploy()
         if path in ("/api/platforms", "/api/platforms/process"):
             return self._api_platforms()
         if (path in MEDIA_POST_PATHS
@@ -4143,6 +4536,23 @@ class Handler(BaseHTTPRequestHandler):
         log(f"gwconfig 更新: {json.dumps(updates, ensure_ascii=False)}")
         self._send_json(200, {"ok": True, **updates})
 
+    def _api_gateway_update_deploy(self):
+        """POST /api/gateway-update：显式确认后一键部署官方正式版 Release。
+
+        预检（拉取 tag、解包候选、跑回归）在后台线程执行，接口立即返回 202；
+        前端轮询 GET /api/gateway-update 的 job 字段。预检通过并拉起独立更新
+        进程后，本网关优雅退出，由更新进程 fast-forward 并重新拉起网关。
+        """
+        body = self._post_body or {}
+        if body.get("confirm") is not True:
+            return self._deny(400, '部署需要显式确认：请求体 {"confirm": true}')
+        try:
+            snapshot = _gateway_update_snapshot(force=True)
+            result = _gateway_update_deploy(snapshot)
+        except Exception as exc:
+            return self._send_json(409, _gateway_update_error(exc))
+        self._send_json(202, result)
+
     def _api_platforms(self):
         """GET /api/platforms 读平台开关与进程状态；POST 切换启用或启停进程。
 
@@ -4881,10 +5291,11 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 
 def main():
+    global _SERVER
     # 内存优化：请求线程栈从默认 1-2MB 降到 512KB（处理器的调用深度很浅，
     # json/url 处理不会撞底），配合启动后立即回收一次。
     threading.stack_size(512 * 1024)
@@ -4899,10 +5310,13 @@ def main():
         server = Server(("127.0.0.1", port), Handler)
     except OSError as exc:
         raise SystemExit(f"端口 {port} 已被占用（可能已有 gateway-hub 在运行）: {exc}")
+    _SERVER = server
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
