@@ -95,6 +95,9 @@ input,select{font:inherit;color:var(--fg)}
 .kpi .num{font-size:26px;font-weight:800;letter-spacing:-.5px}
 .kpi .num.green{color:var(--green)}.kpi .num.orange{color:var(--orange)}.kpi .num.indigo{color:var(--accent)}
 .kpi .note{font-size:11px;color:var(--dim2);margin-top:4px}
+/* 用量「按模型汇总」的 token 占比条 */
+.sharebar{height:5px;border-radius:4px;background:var(--panel2);margin-top:5px;overflow:hidden;max-width:150px}
+.sharebar>div{height:100%;border-radius:4px;opacity:.85}
 
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
@@ -177,25 +180,27 @@ td.num,th.num{text-align:right}
   <button class="nav" data-view="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h7"/></svg>日志</button>
   <div class="grow"></div>
   <div class="sidefoot">
-    <a class="row" href="http://127.0.0.1:8788/" target="_blank">↗ WorkBuddy 引擎看板</a>
-    <a class="row" href="http://127.0.0.1:8790/" target="_blank">↗ Qoder 引擎看板</a>
-    <a class="row" href="http://127.0.0.1:8792/" target="_blank">↗ Buddy2api (QwenWork)</a>
+    <a class="row" data-engine-link="workbuddy" href="http://127.0.0.1:8788/" target="_blank">↗ WorkBuddy 引擎看板</a>
+    <a class="row" data-engine-link="qoder" href="http://127.0.0.1:8790/" target="_blank">↗ Qoder 引擎看板</a>
+    <a class="row" data-engine-link="qwenwork" href="http://127.0.0.1:8792/" target="_blank">↗ Buddy2api (QwenWork)</a>
+    <a class="row" data-engine-link="raccoon" href="http://127.0.0.1:7867/panel/" target="_blank">↗ 小浣熊 引擎面板</a>
+    <a class="row" data-engine-link="trae" href="http://127.0.0.1:8791/" target="_blank">↗ Trae 引擎看板</a>
     <div class="status" id="foot-status"><span class="dot g"></span>网关运行中 · 端口 8787</div>
   </div>
 </aside>
 
 <main class="main">
   <div id="view-overview" class="view active">
-    <div class="pagerow"><div><div class="pagetitle">总览</div><div class="pagesub">三平台积分、调用量与最近请求一屏看完。</div></div>
+    <div class="pagerow"><div><div class="pagetitle">总览</div><div class="pagesub">全平台积分、调用量与最近请求一屏看完。</div></div>
       <div class="grow"></div><button class="btn sec mini" id="btn-refresh-top">刷新数据</button></div>
     <div class="grid3" id="realm-cards"></div>
     <div class="kpis" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
-      <h3>额度可用量预估 <span class="sub">实测扣费优先（含缓存表现）；无样本时目录/短样本价只给保守下限，未知不估算</span></h3>
+      <h3>额度可用量预估 <span class="sub">分/Mtok：WorkBuddy/Qoder/Trae 按明确的逐请求实扣积分 ÷ token；千问按短样本相对价 × 钱包实测均价锚定；小浣熊只采用唯一账单关联，样本不足显示待测</span></h3>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr>
-          <th>平台</th><th class="num">余额</th><th>模型</th><th class="num">预计 token 数量</th>
-        </tr></thead><tbody id="overview-estimate"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody></table>
+          <th>平台</th><th class="num">余额</th><th>模型</th><th>实测单价</th><th class="num">预计 token 数量</th>
+        </tr></thead><tbody id="overview-estimate"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody></table>
       </div>
     </div>
     <div class="card" style="margin-bottom:16px">
@@ -204,6 +209,7 @@ td.num,th.num{text-align:right}
     </div>
     <div class="card">
       <h3>最近请求 <span class="sub">全平台合并 · 最新 10 条</span></h3>
+      <div id="recent-errors" class="sub" style="margin-top:6px"></div>
       <div class="tblwrap" style="margin-top:10px">
         <table><thead><tr><th>时间</th><th>平台</th><th>模型</th><th>账号</th><th class="num">总 TOKEN</th><th class="num">积分</th><th class="num">耗时</th><th>结果</th></tr></thead>
         <tbody id="recent-body"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody></table>
@@ -212,7 +218,7 @@ td.num,th.num{text-align:right}
   </div>
 
   <div id="view-accounts" class="view">
-    <div class="pagetitle">账号</div><div class="pagesub">三平台账号池统一视图；区域标签按引擎返回的 realm（千问办公按登录域名后缀判定）。签到调度仍在各引擎内自动运行。</div>
+    <div class="pagetitle">账号</div><div class="pagesub">全平台账号池统一视图；区域标签按引擎返回的 realm（千问办公按登录域名后缀判定）。签到调度仍在各引擎内自动运行。</div>
     <div class="toolbar" style="margin-bottom:12px">
       <select id="acc-realm-filter" class="btn sec" style="min-height:34px">
         <option value="">全部区域</option><option value="cn">仅国内版</option><option value="intl">仅国际版</option>
@@ -250,6 +256,31 @@ td.num,th.num{text-align:right}
       </div>
       <div id="qw-status" class="empty"></div>
     </div>
+    <div class="card">
+      <h3>小浣熊 Raccoon <span class="sub">xiaohuanxiong.com</span></h3>
+      <div class="toolbar">
+        <button class="btn mini" id="raccoon-start">生成授权链接</button>
+        <span id="raccoon-login-status" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div id="raccoon-link" class="empty">点「生成授权链接」，在新窗口完成登录；本页每 3 秒自动轮询</div>
+      <div class="toolbar" style="margin-top:10px">
+        <button class="btn sec mini" id="raccoon-scan">扫描本机客户端</button>
+        <span id="raccoon-status" style="font-size:12px;color:var(--dim)">也可以直接导入本机官方客户端的登录态</span>
+      </div>
+      <div id="raccoon-accounts" class="empty" style="display:none"></div>
+    </div>
+    <div class="card">
+      <h3>Trae <span class="sub">trae.com.cn（国内版；国际版在引擎面板切换）</span></h3>
+      <div class="toolbar">
+        <select id="trae-realm" class="btn sec" style="min-height:34px">
+          <option value="cn">国内版 (trae.com.cn)</option>
+          <option value="intl">国际版 (trae.ai)</option>
+        </select>
+        <button class="btn mini" id="trae-start">生成授权链接</button>
+        <span id="trae-login-status" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div id="trae-link" class="empty">选择版本后点「生成授权链接」，在新窗口完成登录；本页每 3 秒自动轮询</div>
+    </div>
   </div>
 
   <div id="view-models" class="view">
@@ -261,6 +292,7 @@ td.num,th.num{text-align:right}
         <select id="model-filter">
           <option value="">全部平台</option><option value="workbuddy">WorkBuddy</option>
           <option value="qoder">Qoder</option><option value="qwenwork">千问办公</option>
+          <option value="raccoon">小浣熊</option><option value="trae">Trae</option>
         </select>
         <select id="model-visfilter">
           <option value="visible" selected>仅显示中</option><option value="hidden">仅已隐藏</option><option value="">全部状态</option>
@@ -278,7 +310,7 @@ td.num,th.num{text-align:right}
         <span style="font-size:12px;color:var(--dim)">跨平台批量操作</span>
       </div>
       <div id="model-groups"></div>
-      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits；Qoder = price_factor（峰/谷）；千问办公目录不暴露单价，使用短样本参考价并标注缓存假设，不再按余额差自动推算。PRO 专属模型在账号池没有付费账号时自动从 /v1/models 隐藏（config.json hide_pro_locked）。</div>
+      <div class="sub" style="margin-top:10px">倍率口径：WorkBuddy = 官方 credits；Qoder = price_factor（峰/谷）；Trae = 官方 consumption_rate（信用消费倍率）；千问办公目录不暴露单价，使用短样本参考价并标注缓存假设，不再按余额差自动推算。PRO 专属模型在账号池没有付费账号时自动从 /v1/models 隐藏（config.json hide_pro_locked）。</div>
     </div>
   </div>
 
@@ -436,12 +468,18 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
 
   <div id="view-usage" class="view">
     <div class="pagetitle">用量</div>
-    <div class="pagesub">三平台请求记录（各取最近 500–1000 条，workbuddy 含国内+国际双区）；曲线与统计跟随当前筛选。</div>
+    <div class="pagesub">全平台请求记录（各取最近 500–1000 条，workbuddy 含国内+国际双区）；时间筛选与平台/模型筛选同样作用于 KPI、曲线、汇总表和 CSV 导出。</div>
     <div class="toolbar" style="margin-bottom:12px">
       <button class="btn sec mini usage-tab active" data-utab="records">使用记录</button>
       <button class="btn sec mini usage-tab" data-utab="stats">统计</button>
       <span style="flex:1"></span>
       <span class="sub" id="usage-range"></span>
+      <select id="usage-since">
+        <option value="">全部时间</option>
+        <option value="today">今天</option>
+        <option value="24h">最近 24 小时</option>
+        <option value="7d">最近 7 天</option>
+      </select>
       <button class="btn sec mini" id="btn-usage-export">导出 CSV</button>
       <button class="btn sec mini" id="btn-usage-refresh">刷新</button>
     </div>
@@ -455,6 +493,7 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
           <select id="usage-filter">
             <option value="">全部平台</option><option value="workbuddy">WorkBuddy</option>
             <option value="qoder">Qoder</option><option value="qwenwork">千问办公</option>
+            <option value="raccoon">小浣熊</option><option value="trae">Trae</option>
           </select>
           <select id="usage-model"><option value="">全部模型</option></select>
           <select id="usage-account"><option value="">全部账号</option></select>
@@ -480,7 +519,7 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
     <div id="usage-statview" class="hidden">
       <div id="usage-cache" class="usage-chart-grid"></div>
       <div class="card" style="margin-bottom:14px">
-        <h3>换算统计 <span class="sub">平台 × 模型 · 实扣口径：实测积分/千tok = 实扣积分 ÷ 总token × 1000；缓存命中会拉低实测值；「参考成本」仅 wb 上游提供</span></h3>
+        <h3>换算统计 <span class="sub">平台 × 模型 · 实扣口径：实测积分/千tok = 实扣积分 ÷ 总token × 1000；缓存命中会拉低实测值；WorkBuddy 另有「参考成本」；千问办公/小浣熊上游只回 token，积分列显示 —</span></h3>
         <div class="tblwrap" style="margin-top:10px">
           <table><thead><tr>
             <th>平台</th><th>模型</th><th class="num">请求</th><th class="num">总 tok</th><th class="num">实扣积分</th><th class="num">实测 积分/千tok</th><th class="num">目录倍率</th><th class="num">倍率换算</th><th class="num">参考成本 ¥</th>
@@ -503,7 +542,7 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
     <div class="pagetitle">自动化</div><div class="pagesub">签到、成长任务、每日活跃与凭证保活的手动执行入口；定时调度仍在各引擎内自动运行。</div>
     <div class="card">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <div><h3>每日一键</h3><div class="sub">按顺序跑完三平台签到/打卡与全部成长任务；已完成的动作引擎会返回「已完成」，重复点不会重复领。</div></div>
+        <div><h3>每日一键</h3><div class="sub">按顺序跑完全平台签到/打卡与全部成长任务；已完成的动作引擎会返回「已完成」，重复点不会重复领。</div></div>
         <span style="flex:1"></span>
         <button class="btn sec" id="btn-checkin-all">仅签到（全部平台）</button>
         <button class="btn" id="btn-daily-all">一键全自动（签到 + 全部任务）</button>
@@ -587,7 +626,12 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
       <div class="sub" style="margin-top:4px">双区模型 = 同名模型在国内版和国际版都有（glm-5.3、kimi-k3.1-pro 等）。自动模式看各区「最临期积分包」的剩余天数：更紧急的一区优先消耗；若选中区域对该模型有 PRO 门槛且无付费账号，自动避开（如 kimi-k3.1-pro 国际版要会员，会走国内）。</div>
     </div>
     <div class="card">
-      <h3>上游版本与更新 <span class="sub">检测三个引擎网关是否有新版本</span></h3>
+      <h3>平台开关与进程 <span class="sub">停用的平台不会出现在总览、模型列表和调用路由中</span></h3>
+      <div id="platform-list" class="sub" style="margin-top:8px">加载中…</div>
+      <div class="sub" style="margin-top:6px">打开开关会自动启动引擎，关闭开关会停止引擎进程（先确认端口上的进程属于该平台，确认不了不会强杀）。启动命令可在每个平台行里配置，命令按 shell 执行，适合直接填引擎自带的 <span class="mono">start-*.bat</span>。</div>
+    </div>
+    <div class="card">
+      <h3>上游版本与更新 <span class="sub">检测已启用的上游引擎是否有新版本</span></h3>
       <div id="updates-list" class="sub" style="margin-top:8px">加载中…</div>
       <div class="toolbar" style="margin-top:8px">
         <button class="btn sec mini" id="btn-updates-refresh">检查更新</button>
@@ -596,7 +640,7 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
     </div>
     <div class="card">
       <h3>引擎面板密码</h3>
-      <div class="sub">config.json 中各上游的 <span class="mono">panel_password</span> 字段（当前 admin）。改了引擎看板密码后要同步这里，控制台才能聚合到该平台的账号池。</div>
+      <div class="sub">config.json 中各上游的 <span class="mono">panel_password</span> 字段应与引擎面板中设置的密码一致。请使用自己的强密码；修改引擎密码后同步此字段，控制台才能继续聚合账号池。</div>
     </div>
   </div>
 
@@ -622,8 +666,10 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
 
 <script>
 const KEY = () => localStorage.getItem('gh_key') || '';
-const PLATFORM_LABEL = {workbuddy:'WorkBuddy', qoder:'Qoder', qwenwork:'千问办公'};
-const PF_COLOR={workbuddy:'var(--accent)', qoder:'#0891b2', qwenwork:'var(--orange)'};
+const PLATFORM_LABEL = {workbuddy:'WorkBuddy', qoder:'Qoder', qwenwork:'千问办公', raccoon:'小浣熊', trae:'Trae'};
+const PF_COLOR={workbuddy:'var(--accent)', qoder:'#0891b2', qwenwork:'var(--orange)', raccoon:'#7c3aed', trae:'#0dbd8b'};
+/* 平台遍历统一用这份顺序：新接平台只改这里，避免图表/汇总漏掉某个平台 */
+const PF_ORDER=['workbuddy','qoder','qwenwork','raccoon','trae'];
 function showGate(){ document.getElementById('gate').classList.remove('hidden'); const e=document.getElementById('gate-err'); if(e) e.style.display='none'; }
 function toast(msg, ms=2800){
   const t=document.getElementById('toast');
@@ -736,7 +782,7 @@ function briefForCheckin(r, rowLabel='签到'){
       // 成功数 + 真正到账的积分 + 「今日已完成」+ 下次窗口：
       // 只报「N/N 成功」会让「今天早就领过了」看起来像点了个寂寞
       const rows=raw.filter(x=>x&&typeof x==='object');
-      const okN=rows.filter(x=>x.ok).length;
+    const okN=rows.filter(x=>x.ok).length;
       const done=rows.filter(x=>x.state==='already'
         ||/已签|已完成|已领取|已打卡/.test(String(x.message||x.msg||''))).length;
       const earned=rows.reduce((s,x)=>s+(Number(x.earned_credit)||0),0);
@@ -781,32 +827,47 @@ function requestPolicy(p,opt){
   return {read:false,views};
 }
 const API_PENDING=new Map();
+let GATE_ATTEMPT=0, AUTH_EPOCH=0;
 async function api(p, opt={}) {
   const policy=requestPolicy(p,opt), read=policy.read;
-  const key=KEY();
-  const requestKey=key+' '+p+' '+(opt.body||'');
-  if(read&&API_PENDING.has(requestKey)) return API_PENDING.get(requestKey);
+  const {allowError=false,probeAuth=false,...fetchOpt}=opt;
+  const key=KEY(), epoch=AUTH_EPOCH;
+  const authHeader=(fetchOpt.headers||{}).Authorization||('Bearer '+key);
+  const requestKey=key+' '+p+' '+(fetchOpt.body||'')+(probeAuth?' '+authHeader:'');
+  if(read&&!probeAuth&&API_PENDING.has(requestKey)) return API_PENDING.get(requestKey);
   const request=(async()=>{
-    const headers=Object.assign({'Authorization':'Bearer '+key},opt.headers||{});
-    const r=await fetch(p,{...opt,headers});
-    if(r.status===401){localStorage.removeItem('gh_key');const err=new Error('401 请重新输入控制台 Key');err.status=401;showGate();throw err;}
+    const headers=Object.assign({'Authorization':'Bearer '+key},fetchOpt.headers||{});
+    const r=await fetch(p,{...fetchOpt,headers});
+    if(r.status===401){
+      if(!probeAuth&&epoch===AUTH_EPOCH){AUTH_EPOCH++;localStorage.removeItem('gh_key');showGate();}
+      const err=new Error('401 请重新输入控制台 Key');err.status=401;throw err;
+    }
     const data=await r.json();
     if(!r.ok){const err=new Error(errMsg(data)||'HTTP '+r.status);err.status=r.status;throw err;}
-    if(read&&(data?.ok===false||data?.error)) throw new Error(errMsg(data)||'读取失败');
+    if(read&&!allowError&&(data?.ok===false||data?.error)) throw new Error(errMsg(data)||'读取失败');
+    if(epoch!==AUTH_EPOCH&&!probeAuth) throw new Error('认证信息已更新，请重试');
     if(!read&&data?.ok===true) policy.views.forEach(view=>VIEW_LOADED.delete(view));
     return data;
   })();
-  if(read) API_PENDING.set(requestKey,request);
+  if(read&&!probeAuth) API_PENDING.set(requestKey,request);
   try{return await request;}
-  finally{if(read&&API_PENDING.get(requestKey)===request) API_PENDING.delete(requestKey);}
+  finally{if(read&&!probeAuth&&API_PENDING.get(requestKey)===request) API_PENDING.delete(requestKey);}
 }
 
 /* ── 门禁 ── */
 async function tryGate(){
   const v=document.getElementById('gate-input').value.trim(); if(!v) return;
-  localStorage.setItem('gh_key', v);
-  try{ const r=await api('/api/ping'); if(r.ok){document.getElementById('gate').classList.add('hidden');loadAll();} }
-  catch(e){ document.getElementById('gate-err').style.display='block'; document.getElementById('gate-err').textContent=e.message; localStorage.removeItem('gh_key'); }
+  const attempt=++GATE_ATTEMPT;
+  try{
+    const r=await api('/api/ping',{headers:{'Authorization':'Bearer '+v},probeAuth:true});
+    if(attempt!==GATE_ATTEMPT) return;
+    if(r.ok){localStorage.setItem('gh_key',v);AUTH_EPOCH++;document.getElementById('gate').classList.add('hidden');loadAll();}
+  }catch(e){
+    if(attempt!==GATE_ATTEMPT) return;
+    document.getElementById('gate-err').style.display='block';
+    document.getElementById('gate-err').textContent=e.message;
+    if(KEY()===v)localStorage.removeItem('gh_key');
+  }
 }
 document.getElementById('gate-btn').onclick=tryGate;
 document.getElementById('gate-input').addEventListener('keydown',e=>{if(e.key==='Enter')tryGate();});
@@ -968,12 +1029,12 @@ function renderModels(){
       const spec=[];
       if(caps.ctx) spec.push('上下文 '+fk(caps.ctx)+(caps.ctx_windows&&caps.ctx_windows.length>1?'（档 '+caps.ctx_windows.map(fk).join('/')+'）':''));
       if(caps.max_out) spec.push('最大输出 '+fk(caps.max_out));
-      if(caps.efforts&&caps.efforts.length) spec.push('思考 '+caps.efforts.join('/')+(caps.effort_default?`（默认 ${esc(caps.effort_default)}）`:'')+(caps.can_disable===false?'·不可关':''));
+      if(caps.efforts&&caps.efforts.length) spec.push('思考 '+caps.efforts.map(v=>esc(v)).join('/')+(caps.effort_default?`（默认 ${esc(caps.effort_default)}）`:'')+(caps.can_disable===false?'·不可关':''));
       else if(caps.reasoning===false) spec.push('不支持思考');
       if(caps.vision) spec.push('视觉');
       if(caps.tools) spec.push('工具');
       if(m.media){
-        const mtags=(m.tags||[]).map(t=>TAG_LABEL[t]||t).join('/');
+        const mtags=(m.tags||[]).map(t=>esc(TAG_LABEL[t]||t)).join('/');
         spec.push((m.media==='video'?'视频生成':'图片生成')+(mtags?` · ${mtags}`:''));
       }
       const specHtml=spec.length?`<div class="sub-cell mono" style="color:var(--dim)">▣ ${spec.join(' · ')}</div>`:'';
@@ -1044,7 +1105,7 @@ document.getElementById('model-search').oninput=renderModels;
 document.getElementById('model-filter').onchange=renderModels;
 document.getElementById('model-visfilter').onchange=renderModels;
 /* ── 媒体（生图 / 生视频） ── */
-let MEDIA={items:[],errors:{}}, MEDIA_POLL=null;
+let MEDIA={items:[],errors:{}}, MEDIA_POLL=null, MEDIA_TASK_SEQ=0, MEDIA_TASK_ID=null;
 const TAG_LABEL={'text-to-image':'文生图','image-to-image':'图生图','text-to-video':'文生视频','image-to-video':'图生视频'};
 async function loadMedia(force){
   try{
@@ -1085,7 +1146,7 @@ function renderMedia(){
       </div>
       <button class="btn ${m.hidden?'':'sec'} mini" data-media-vis="${esc(m.id)}" data-v="${m.hidden?'1':'0'}">${m.hidden?'恢复显示':'隐藏'}</button>
     </div>`;
-  }).join(''):'<div class="empty">没有媒体模型（确认 WorkBuddy 引擎在线且账号有生图权限）</div>';
+  }).join(''):'<div class="empty">没有媒体模型（确认 WorkBuddy 或小浣熊引擎在线且账号有生图权限）</div>';
   if(sel){
     sel.innerHTML=generatable.length?generatable.map(m=>`<option value="${esc(m.id)}">${m.kind==='video'?'视频 · ':'图片 · '}${esc(m.model)}</option>`).join('')
       :'<option value="">（当前出口无可用生成模型）</option>';
@@ -1111,15 +1172,18 @@ async function setMediaVisible(id,visible,btn){
   }catch(e){toast('失败: '+e.message);}
   if(btn)btn.disabled=false;
 }
-function stopMediaPoll(){if(MEDIA_POLL){clearInterval(MEDIA_POLL);MEDIA_POLL=null;}}
+function stopMediaPoll(){MEDIA_TASK_SEQ++;if(MEDIA_POLL){clearInterval(MEDIA_POLL);MEDIA_POLL=null;}}
 function mediaResult(html){const el=document.getElementById('media-result');if(el)el.innerHTML=html;}
 async function mediaGenerate(){
+  stopMediaPoll();
+  const seq=++MEDIA_TASK_SEQ;
+  MEDIA_TASK_ID=null;
   const m=currentMediaModel();
   const prompt=document.getElementById('media-prompt').value.trim();
   if(!m){toast('没有可用的媒体模型');return;}
   if(!prompt){toast('请先写提示词');return;}
   const btn=document.getElementById('btn-media-gen');
-  btn.disabled=true;stopMediaPoll();
+  btn.disabled=true;
   mediaResult('<div class="sub">提交中…</div>');
   try{
     if(m.kind==='image'){
@@ -1127,6 +1191,7 @@ async function mediaGenerate(){
       const size=document.getElementById('media-size').value;
       if(size) body.size=size;
       const r=await api('/v1/images/generations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      if(seq!==MEDIA_TASK_SEQ) return;
       const item=(r.data||[])[0]||{};
       const url=item.url||(item.b64_json?'data:image/png;base64,'+item.b64_json:'');
       mediaResult(url
@@ -1137,19 +1202,27 @@ async function mediaGenerate(){
       const secs=parseInt(document.getElementById('media-seconds').value,10);
       if(secs>0) body.seconds=secs;
       const r=await api('/v1/videos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      if(seq!==MEDIA_TASK_SEQ) return;
+      MEDIA_TASK_ID=r.id||null;
       renderVideoTask(r,m.id);
       if(r.status!=='completed'&&r.status!=='failed'&&r.id){
         MEDIA_POLL=setInterval(async()=>{
           try{
-            const t=await api('/v1/videos/'+encodeURIComponent(r.id));
+            const t=await api('/v1/videos/'+encodeURIComponent(r.id),{allowError:true});
+            if(seq!==MEDIA_TASK_SEQ) return;
+            if(t.status==='failed' && t.error){
+              stopMediaPoll();
+              renderVideoTask(t,m.id);
+              return;
+            }
             renderVideoTask(t,m.id);
             if(t.status==='completed'||t.status==='failed')stopMediaPoll();
-          }catch(e){stopMediaPoll();viewFailure('media',e);}
+          }catch(e){if(seq===MEDIA_TASK_SEQ){stopMediaPoll();viewFailure('media',e);}}
         },5000);
       }
     }
-  }catch(e){mediaResult('<div class="empty">失败: '+esc(e.message)+'</div>');}
-  btn.disabled=false;
+  }catch(e){if(seq===MEDIA_TASK_SEQ) mediaResult('<div class="empty">失败: '+esc(e.message)+'</div>');}
+  if(seq===MEDIA_TASK_SEQ) btn.disabled=false;
 }
 function renderVideoTask(t,model){
   const st=t.status||'?';
@@ -1158,8 +1231,9 @@ function renderVideoTask(t,model){
   if(t.queue_position!=null) html+=` · 队列第 ${esc(String(t.queue_position))} 位`;
   if(t.credit!=null) html+=` · 扣 ${esc(String(t.credit))} 积分`;
   html+='</div>';
+  const taskError=(t.error&&t.error.message)||(typeof t.error==='string'?t.error:'');
   if(t.status==='completed'&&t.url) html+=`<video src="${esc(t.url)}" controls preload="metadata"></video><div class="sub"><a href="${esc(t.url)}" target="_blank" rel="noopener">下载 MP4</a>${t.hint?' · '+esc(t.hint):''}</div>`;
-  else if(t.status==='failed') html+=`<div class="empty">失败: ${esc((t.error&&t.error.message)||'上游未给出原因')}</div>`;
+  else if(t.status==='failed') html+=`<div class="empty">失败: ${esc(taskError||'上游未给出原因')}</div>`;
   else html+=`<div class="sub">每 5 秒自动轮询，完成后显示视频。</div>`;
   mediaResult(html);
 }
@@ -1178,12 +1252,20 @@ document.getElementById('acc-realm-filter').onchange=()=>{ if(ACC_PLATFORMS) ren
   document.getElementById('usage-key').onchange=()=>{UPAGE=1;renderUsage();};
 
 
+/* 左下角引擎看板链接：只显示启用平台；停用后跟着隐藏。 */
+function applyEngineLinks(platforms){
+  const enabled=new Set((platforms||[]).filter(p=>p.enabled!==false).map(p=>p.name));
+  document.querySelectorAll('[data-engine-link]').forEach(a=>{
+    a.classList.toggle('hidden', !enabled.has(a.dataset.engineLink));
+  });
+}
 /* ── 总览 + 账号池 ── */
-let LAST_STATUS=null;
+let LAST_STATUS=null, RECENT_ROWS=[], RECENT_ERRORS={}, RECENT_REQUEST=0;
 async function loadStatus(){
   try{
     const d=await api('/api/status'); LAST_STATUS=d;
-    if(EST_CACHE.rows) renderEstimate();   // 余额到货后刷新预估（用量数据 5 分钟缓存）
+    applyEngineLinks(d.platforms);
+    if(EST_CACHE.data) renderEstimate();   // 余额到货后刷新预估（用量数据 5 分钟缓存）
     if(document.getElementById('view-overview').classList.contains('active')) renderOverview(d);
     // 有签到在跑时不重绘账号表：重绘会把「签到中…」的禁用按钮换回可用状态，
     // 用户容易再点一次造成重复执行
@@ -1237,7 +1319,7 @@ function renderOverview(d){
   document.getElementById('realm-cards').innerHTML=cards;
   document.getElementById('kpis').innerHTML=`
     <div class="kpi"><div class="label">平台在线</div><div class="num indigo">${d.kpi.platforms_ok}<span style="font-size:14px;color:var(--dim2)">/${d.kpi.platforms_total}</span></div><div class="note">引擎健康检查</div></div>
-    <div class="kpi"><div class="label">账号总数</div><div class="num">${d.kpi.accounts}</div><div class="note">三平台合计</div></div>
+    <div class="kpi"><div class="label">账号总数</div><div class="num">${d.kpi.accounts}</div><div class="note">全平台合计</div></div>
     <div class="kpi"><div class="label">今日签到</div><div class="num orange">${d.kpi.checked_in}<span style="font-size:14px;color:var(--dim2)">/${Math.max(d.kpi.checkable,d.kpi.checked_in)}</span></div><div class="note">国内签到 + 国际执行记录</div></div>`;
 }
 let ACC_PLATFORMS=null;                 // 账号页最近一次数据：切换区域筛选时复用，不重新请求
@@ -1274,7 +1356,7 @@ function renderPlatforms(platforms){
           :(a.daily_chat_error
             ?'<span class="pill red" title="'+esc(a.daily_chat_error)+'">打卡失败</span>'
             :'<span class="pill orange">待打卡</span>'))
-        :(a.checked_in===null?'<span class="pill green">上游自动</span>'
+        :(a.checked_in===null?(p.name==='qwenwork'?'<span class="pill green">上游自动</span>':'<span class="pill gray">无签到</span>')
         :a.checked_in?'<span class="pill green">今日已签</span>'
         :(a.can_checkin?'<span class="pill orange">待签</span>':'<span class="pill gray">—</span>'));
       const st=!a.enabled?'<span class="pill red">停用</span>':'<span class="pill green">启用</span>';
@@ -1355,6 +1437,13 @@ async function loadUsage(){
     return true;
   }catch(e){ return viewFailure('usage',e); }
 }
+function usageSince(){
+  const v=document.getElementById('usage-since').value;
+  if(v==='today'){ const d=new Date(); d.setHours(0,0,0,0); return d.getTime()/1000; }
+  if(v==='24h') return Date.now()/1000-86400;
+  if(v==='7d') return Date.now()/1000-7*86400;
+  return 0;
+}
 function usageFiltered(){
   const q=document.getElementById('usage-search').value.trim().toLowerCase();
   const pf=document.getElementById('usage-filter').value;
@@ -1362,8 +1451,10 @@ function usageFiltered(){
   const mm=document.getElementById('usage-model').value;
   const ac=document.getElementById('usage-account').value;
   const ky=document.getElementById('usage-key').value;
+  const since=usageSince();
   return USAGE.rows.filter(r=>
     (!pf||r.platform===pf) &&
+    (!since||(r.at>0&&r.at>=since)) &&
     (!mm||r.model===mm) &&
     (!ac||(r.account||'')===ac) &&
     (!ky||(r.key_name||'')===ky) &&
@@ -1382,9 +1473,17 @@ function renderUsageStats(rows){
   const okN=rows.filter(r=>!isBad(r.outcome)).length;
   const creditRows=rows.filter(r=>knownNumber(r.credit)!==null);
   const credit=creditRows.reduce((s,r)=>s+knownNumber(r.credit),0);
-  const bypf={};
-  for(const r of rows){ const c=(r.credit==null||isNaN(Number(r.credit)))?0:Number(r.credit); if(c) bypf[r.platform]=(bypf[r.platform]||0)+c; }
-  const pfNote=Object.entries(bypf).map(([p,v])=>`${PLATFORM_LABEL[p]||p} ${v.toFixed(1)}`).join(' · ')||'当前筛选范围';
+  // 按平台汇总时保留「有请求但积分未知」的平台：上游只回 token 时不能整块消失。
+  const pfAgg={};
+  for(const r of rows){
+    const p=pfAgg[r.platform]||(pfAgg[r.platform]={n:0,credit:0,known:0});
+    p.n++;
+    const c=knownNumber(r.credit);
+    if(c!==null){ p.credit+=c; p.known++; }
+  }
+  const pfChips=Object.entries(pfAgg).sort((a,b)=>b[1].n-a[1].n).map(([p,v])=>
+    `<span class="pill" style="color:${PF_COLOR[p]||'var(--accent)'};background:var(--panel2);border-color:var(--line)">${esc(PLATFORM_LABEL[p]||p)} ${v.n} 次${v.known?` · ${v.credit.toFixed(1)} 分`:' · 积分未知'}</span>`
+  ).join(' ')||'<span class="sub-cell">当前筛选范围</span>';
   const prompt=sum('prompt'), completion=sum('completion'), cached=sum('cached'), total=sum('total');
   const knownPrompt=rows.filter(r=>r.cached!=null).reduce((n,r)=>n+(r.prompt||0),0);
   const hit=knownPrompt>0?Math.round(cached/knownPrompt*100):null;
@@ -1393,7 +1492,7 @@ function renderUsageStats(rows){
   document.getElementById('usage-stats').innerHTML=`
     <div class="kpi"><div class="label">请求数</div><div class="num indigo">${rows.length}</div><div class="note">成功 ${okN} · 成功率 ${rows.length?Math.round(okN/rows.length*100)+'%':'—'}</div></div>
     <div class="kpi"><div class="label">总 Token</div><div class="num">${fmtTok(total)}</div><div class="note">↓ ${fmtTok(prompt)} · ↑ ${fmtTok(completion)} · 缓存 ${fmtTok(cached)}${hit!==null?`（已知样本 ${hit}%）`:'（未知）'} · 缓存数据覆盖 ${cacheCoverage}%</div></div>
-    <div class="kpi"><div class="label">积分消耗</div><div class="num orange">${creditRows.length?credit.toFixed(2):'未知'}</div><div class="note">${esc(pfNote)} · 已知 ${creditRows.length}/${rows.length}</div></div>
+    <div class="kpi"><div class="label">积分消耗</div><div class="num orange">${creditRows.length?credit.toFixed(2):'未知'}</div><div class="note" style="white-space:normal">${pfChips}<div style="margin-top:3px">积分覆盖 ${creditRows.length}/${rows.length}</div></div></div>
     <div class="kpi"><div class="label">平均耗时</div><div class="num">${avg?(avg/1000).toFixed(2)+' s':'—'}</div><div class="note">${rows.length} 条请求</div></div>`;
 }
 /* 用量曲线（多平台）：时间分桶的 token 堆叠柱（桶内按平台分段）+ 各平台缓存命中率折线 */
@@ -1416,7 +1515,6 @@ function renderUsageCharts(rows){
     const pf=(b.pf[r.platform]=b.pf[r.platform]||{tin:0,tout:0,tca:0,knownTin:0,n:0});
     b.n++; pf.n++; pf.tin+=r.prompt||0; pf.tout+=r.completion||0; pf.tca+=r.cached||0; if(r.cached!=null) pf.knownTin+=r.prompt||0;
   }
-  const PF_ORDER=['workbuddy','qoder','qwenwork'];
   const present=PF_ORDER.filter(p=>B.some(b=>(b.pf[p]||{}).n>0));
   const pfSum=(b,p,k)=>((b.pf[p]||{})[k]||0);
   const W=900, Hp=200, padL=52, padR=10, padT=12, padB=24;
@@ -1507,13 +1605,17 @@ function renderUsagePerModel(rows){
     if(!isBad(r.outcome)) e.ok++;
   }
   const list=Object.values(agg).sort((a,b)=>b.count-a.count);
+  const grand=list.reduce((s,e)=>s+e.total,0);
   document.getElementById('usage-permodel').innerHTML=list.length?list.map(e=>{
     const rate=e.count?Math.round(e.ok/e.count*100)+'%':'—';
     const price=e.cnyN?'¥'+e.cny.toFixed(4):'未知';
+    const pct=grand>0?e.total/grand*100:0;
     return `<tr><td><span class="pill indigo">${esc(PLATFORM_LABEL[e.platform]||e.platform)}</span></td>
       <td class="mono">${esc(e.model)}</td><td class="num">${e.count}</td>
       <td class="num">${fmtTok(e.prompt)}</td><td class="num">${fmtTok(e.completion)}</td><td class="num">${e.cacheKnown?fmtTok(e.cached)+(e.cacheKnown<e.count?'（部分）':''):'未知'}</td>
-      <td class="num" style="font-weight:700">${fmtTok(e.total)}</td>
+      <td class="num" style="font-weight:700">${fmtTok(e.total)}
+        <div class="sharebar" title="占当前筛选总 token ${pct.toFixed(1)}%"><div style="width:${Math.max(2,pct).toFixed(1)}%;background:${PF_COLOR[e.platform]||'var(--accent)'}"></div></div>
+        <div class="sub-cell">${pct.toFixed(1)}%</div></td>
       <td class="num" style="color:${e.credit?'var(--orange)':'inherit'}">${e.creditN?e.credit.toFixed(2):'未知'}</td>
       <td class="num">${price}</td><td class="num">${rate}</td></tr>`;
   }).join(''):'<tr><td colspan="10" class="empty">—</td></tr>';
@@ -1534,16 +1636,16 @@ function renderUsage(){
     tokSub.push(cachedPct==null?'缓存未知':'缓存 '+cachedPct+'%');
     const meta=[];
     if(r.reasoning_effort) meta.push(`<span class="pill purple">${esc(r.reasoning_effort)}</span>`);
-    if(r.stream!==null) meta.push(r.stream?'流式':'非流式');
+    if(r.stream!=null) meta.push(r.stream?'流式':'非流式');
 
-    return `<tr>
+    return `<tr${bad?' style="background:rgba(220,38,38,.07)"':''}>
       <td class="mono" title="${esc(r.iso||'')}">${esc(String(r.iso||'').slice(5).replace('T',' '))}</td>
       <td><span class="pill" style="color:${PF_COLOR[r.platform]||'var(--accent)'};background:var(--panel2);border-color:var(--line)">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
       <td><span class="mono">${esc(r.model)}</span>${meta.length?`<div class="sub-cell">${meta.join(' · ')}</div>`:''}</td>
       <td>${esc(r.account||'—')}</td>
       <td class="num"><b>${fmtTok(r.total)}</b>${tokSub.length?`<div class="sub-cell">${tokSub.join(' · ')}</div>`:''}</td>
       <td class="num" style="color:${cr?'var(--orange)':'inherit'}">${cr==null?'—':cr.toFixed(2)}${price?`<div class="sub-cell">${price}</div>`:''}</td>
-      <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}${r.ttft_ms?`<div class="sub-cell">首字 ${(r.ttft_ms/1000).toFixed(2)} s</div>`:''}</td>
+      <td class="num">${r.elapsed_ms?(r.elapsed_ms/1000).toFixed(2)+' s':'—'}${r.ttft_ms?`<div class="sub-cell">首字 ${(r.ttft_ms/1000).toFixed(2)} s</div>`:''}${Number(r.speed)>0?`<div class="sub-cell">${Number(r.speed).toFixed(0)} tok/s</div>`:''}</td>
       <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td></tr>`;
   }).join('') : '<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
   document.getElementById('usage-pageinfo').textContent=`共 ${rows.length} 条 · 第 ${UPAGE}/${pages} 页`;
@@ -1552,15 +1654,17 @@ function renderUsage(){
   if(range){
     if(ats.length){
       const spanH=(Math.max(...ats)-Math.min(...ats))/3600;
-      range.textContent=`数据范围：最近 ${spanH<1?Math.round(spanH*60)+' 分钟':spanH.toFixed(1)+' 小时'} · ${USAGE.rows.length} 条`;
+      const sinceV=document.getElementById('usage-since').value;
+      const sinceLabel={today:'今天','24h':'最近 24 小时','7d':'最近 7 天'}[sinceV];
+      range.textContent=`数据范围：最近 ${spanH<1?Math.round(spanH*60)+' 分钟':spanH.toFixed(1)+' 小时'} · ${USAGE.rows.length} 条${sinceLabel?` · 筛选：${sinceLabel}`:''}`;
     } else range.textContent='';
   }
   fillUsageOptions('usage-model',[...new Set(USAGE.rows.map(r=>r.model||''))].filter(Boolean));
   fillUsageOptions('usage-account',[...new Set(USAGE.rows.map(r=>r.account||''))].filter(Boolean));
   fillUsageOptions('usage-key',[...new Set(USAGE.rows.map(r=>r.key_name||''))].filter(Boolean));
   renderUsageStats(rows);
+  renderUsageCharts(rows); // 图表属于记录视图，首次加载也要生成；切到统计页时同数据仍可见
   if(!document.getElementById('usage-statview').classList.contains('hidden')){
-    renderUsageCharts(rows);
     renderUsageConversion(rows);
     renderUsagePerModel(rows);
   }
@@ -1581,9 +1685,10 @@ function costSamples(rows){
 function renderUsageConversion(rows){
   const tb=document.getElementById('usage-conv');
   const note=document.getElementById('usage-conv-note');
-  const list=costSamples(rows).filter(e=>e.creditN||e.cnyN).sort((a,b)=>b.credit-a.credit);
+  // 所有有请求的组合都展示；没有逐条积分的平台保留 token 列并明确标注未知。
+  const list=costSamples(rows).filter(e=>e.n>0).sort((a,b)=>(b.credit-a.credit)||(b.tok-a.tok));
   if(!list.length){
-    tb.innerHTML='<tr><td colspan="9" class="empty">当前筛选范围没有带计费数据的请求</td></tr>';
+    tb.innerHTML='<tr><td colspan="9" class="empty">当前筛选范围没有请求记录</td></tr>';
     note.textContent=''; return;
   }
   tb.innerHTML=list.map(e=>{
@@ -1592,17 +1697,17 @@ function renderUsageConversion(rows){
     const cat=USAGE_RATE[key];
     const factor=cat?cat.factor:null;
     const ratio=null; // 相对倍率与积分/千tok量纲不同，不相除。
-    const pfColor={workbuddy:'var(--accent)',qoder:'#0891b2',qwenwork:'var(--orange)'}[e.platform]||'var(--accent)';
+    const pfColor=PF_COLOR[e.platform]||'var(--accent)';
     return `<tr>
       <td><span class="pill" style="color:${pfColor};background:var(--panel2);border-color:var(--line)">${esc(PLATFORM_LABEL[e.platform]||e.platform)}</span></td>
       <td class="mono">${esc(e.model)}</td>
       <td class="num">${e.n}</td>
       <td class="num">${fmtTok(e.tok)}</td>
       <td class="num" style="color:${e.creditN&&e.credit?'var(--orange)':'inherit'}">${e.creditN?e.credit.toFixed(3):'—'}</td>
-      <td class="num" style="font-weight:600">${rate!==null?rate.toFixed(4):'—'}<div class="sub-cell">积分覆盖 ${e.creditN}/${e.n} · ${fmtTok(e.creditTok)} tok</div></td>
+      <td class="num" style="font-weight:600">${rate!==null?rate.toFixed(4):'—'}<div class="sub-cell">${e.creditN?`积分覆盖 ${e.creditN}/${e.n} · ${fmtTok(e.creditTok)} tok`:'上游未提供逐条积分'}</div></td>
       <td class="num">${factor!=null?('x'+factor+(cat.source?` <span class="sub-cell">${esc(cat.source)}</span>`:'')):'—'}</td>
       <td class="num" style="color:${ratio!=null?(ratio>1.15?'var(--red)':(ratio<0.85?'var(--green)':'inherit')):'inherit'}">${ratio!=null?ratio.toFixed(2):'—'}</td>
-      <td class="num">${e.cnyN?'¥'+e.cny.toFixed(4):'—'}<div class="sub-cell">成本覆盖 ${e.cnyN}/${e.n} · ${fmtTok(e.cnyTok)} tok</div></td></tr>`;
+      <td class="num">${e.cnyN?'¥'+e.cny.toFixed(4):'—'}<div class="sub-cell">${e.cnyN?`成本覆盖 ${e.cnyN}/${e.n} · ${fmtTok(e.cnyTok)} tok`:'上游未提供参考成本'}</div></td></tr>`;
   }).join('');
   // 平台级汇总行
   const bypf={};
@@ -1612,56 +1717,58 @@ function renderUsageConversion(rows){
   }
   const summary=Object.entries(bypf).map(([p,v])=>{
     const rate=v.creditTok>0&&v.creditN?v.credit/v.creditTok*1000:null;
-    return `${PLATFORM_LABEL[p]||p}: ${v.n} 次 · ${fmtTok(v.tok)} tok · ${v.creditN?v.credit.toFixed(2):'未知'} 分（${rate!==null?rate.toFixed(4):'—'}/千tok，积分覆盖 ${v.creditN}/${v.n}）${v.cnyN?` · 参考 ¥${v.cny.toFixed(2)}，成本覆盖 ${v.cnyN}/${v.n}`:''}`;
+    return `${PLATFORM_LABEL[p]||p}: ${v.n} 次 · ${fmtTok(v.tok)} tok · ${v.creditN?v.credit.toFixed(2)+` 分（${rate!==null?rate.toFixed(4):'—'}/千tok，积分覆盖 ${v.creditN}/${v.n}）`:`积分未知（覆盖 ${v.creditN}/${v.n}，上游未提供逐条扣费）`}${v.cnyN?` · 参考 ¥${v.cny.toFixed(2)}，成本覆盖 ${v.cnyN}/${v.n}`:''}`;
   }).join('　|　');
   note.textContent='平台汇总（当前筛选）→ '+summary;
 }
-/* 额度可用量预估（总览页）：余额 ÷ 单价 → 预计可用 token。
-   单价优先用「Σ实扣积分 ÷ Σtoken」的实测值（天然含缓存折扣）；
-   没有扣费样本时，目录全价/千问短样本价只作零缓存保守下限，
-   缓存假设只作乐观参考；余额未知显示待测，不按 0 估算。 */
-let EST_CACHE={ts:0,data:null};
+/* 额度可用量预估（总览页）：余额 ÷ 实测有效单价 → 预计可用 token。
+   单价统一为「分/Mtok」：WorkBuddy/Qoder 用 Σ实扣 ÷ Σtoken，
+   千问办公用钱包快照差 ÷ 同期 token；无样本或余额未知显示待测。 */
+let EST_CACHE={ts:0,data:null}, EST_REQUEST=0;
 async function loadEstimate(force){
+  const request=++EST_REQUEST;
+  if(force) EST_CACHE={ts:0,data:null};
+  if(force) EST_CACHE={ts:0,data:null};
   if(!force && EST_CACHE.data && Date.now()-EST_CACHE.ts < 300000){ renderEstimate(); return; }
   try{
     const d=await api('/api/estimate'+(force?'?force=1':''));
+    if(request!==EST_REQUEST) return;
     EST_CACHE={ts:Date.now(),data:d};
     renderEstimate();
-  }catch(e){ return viewFailure('overview',e); }
+  }catch(e){ if(request===EST_REQUEST) return viewFailure('overview',e); }
 }
 function renderEstimate(){
   const tb=document.getElementById('overview-estimate');
   if(!tb) return;
   const d=EST_CACHE.data;
   if(!d||!Array.isArray(d.platforms)){
-    tb.innerHTML='<tr><td colspan="4" class="empty">预估加载中…</td></tr>';
+    tb.innerHTML='<tr><td colspan="5" class="empty">预估加载中…</td></tr>';
     return;
   }
   let html='';
   for(const p of d.platforms){
-    const label=`<span class="pill indigo">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>`;
+    const errors=[p.error, p.usage_error?`用量读取失败：${p.usage_error}`:''].filter(Boolean);
+    const label=`<span class="pill indigo">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>`
+      +errors.map(error=>`<div class="sub-cell">${esc(error)}</div>`).join('');
     const known=p.known??p.enabled??0, total=p.total??p.enabled??0;
     const coverage=`<div class="sub-cell">已知 ${known}/${total} 个启用账号</div>`;
     const bal=p.balance!=null?fmt(p.balance)+' 分'+coverage:`待测${coverage}`;
     const models=(p.models||[]);
     if(!models.length){
-      html+=`<tr><td>${label}</td><td class="num">${bal}</td><td class="sub-cell">暂无实测单价</td><td class="num">—</td></tr>`;
+      html+=`<tr><td>${label}</td><td class="num">${bal}</td><td class="sub-cell">暂无模型</td><td>—</td><td class="num">—</td></tr>`;
       continue;
     }
     models.forEach((m,i)=>{
       const scope=m.balance_scope
         ?`<div class="sub-cell">${esc(m.balance_scope)}${m.model_balance!=null?` · 可用 ${fmt(m.model_balance)} 分`:' · 余额待测'}</div>`:'';
-      const range=`<div class="sub-cell">${esc(m.note||'样本估算')} · ${m.samples||0} 条样本${m.sample_hours!=null?` · 覆盖 ${m.sample_hours}h`:''}</div>`;
-      const floor=(m.est_tokens_floor!=null && m.est_tokens_floor!==m.est_tokens)
-        ? `<div class="sub-cell">全未命中下限 ${fmtTok(m.est_tokens_floor)}</div>`:'';
-      const opt=(m.est_tokens_opt!=null && m.cache_assumed)
-        ? `<div class="sub-cell">乐观（${Math.round((m.cache_hit_rate||0)*100)}% 缓存假设） ${fmtTok(m.est_tokens_opt)}</div>`:'';
+      const rate=m.rate_per_mtok!=null?`${Number(m.rate_per_mtok).toFixed(2)} 分/Mtok`:'待测';
+      const detail=`<div class="sub-cell">${esc(m.note||'样本估算')}${m.samples?` · ${m.samples} 条样本`:''}${m.sample_tokens?` · ${fmtTok(m.sample_tokens)} tok`:''}${m.sample_hours!=null?` · 覆盖 ${m.sample_hours}h`:''}</div>`;
       html+=`<tr>${i===0
         ? `<td rowspan="${models.length}" style="vertical-align:top">${label}</td><td rowspan="${models.length}" class="num" style="vertical-align:top">${bal}</td>`
-        : ''}<td class="mono">${esc(m.model)}${scope}${range}${floor}${opt}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'待测'}</td></tr>`;
+        : ''}<td class="mono">${esc(m.model)}${scope}</td><td>${rate}${detail}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'待测'}</td></tr>`;
     });
   }
-  tb.innerHTML=html||'<tr><td colspan="4" class="empty">暂无数据</td></tr>';
+  tb.innerHTML=html||'<tr><td colspan="5" class="empty">暂无数据</td></tr>';
 }
 document.getElementById('btn-usage-refresh').onclick=loadUsage;
 /* 使用记录 / 统计 切换：只切显示，不重新拉数据 */
@@ -1672,18 +1779,24 @@ document.querySelectorAll('.usage-tab').forEach(b=>b.onclick=()=>{
   if(b.dataset.utab==='stats') renderUsage();
 });
 /* 导出当前筛选结果为 CSV（与表格同口径） */
+function csvCell(v){
+  const t=String(v==null?'':v);
+  const quoted=t.indexOf('"')>=0||t.indexOf(',')>=0
+    ||t.indexOf(String.fromCharCode(10))>=0||t.indexOf(String.fromCharCode(13))>=0;
+  return quoted?'"'+t.replace(/"/g,'""')+'"':t;
+}
 document.getElementById('btn-usage-export').onclick=()=>{
   const rows=usageFiltered();
   if(!rows.length){ toast('当前筛选没有可导出的记录'); return; }
   const head=['时间','平台','模型','账号','推理强度','模式','结果','输入','输出','缓存','总token','积分','成本CNY','耗时ms','首字ms','速度','Key'];
-  const cell=v=>{const t=String(v==null?'':v);const q=t.indexOf('"')>=0||t.indexOf(',')>=0||t.indexOf(String.fromCharCode(10))>=0;return q?'"'+t.replace(/"/g,'""')+'"':t;};
+  const cell=v=>{const t=String(v==null?'':v);const q=t.indexOf('"')>=0||t.indexOf(',')>=0||t.indexOf(String.fromCharCode(10))>=0||t.indexOf(String.fromCharCode(13))>=0;return q?'"'+t.replace(/"/g,'""')+'"':t;};
   const lines=[head.join(',')];
   for(const r of rows){
     lines.push([r.iso||'',r.platform||'',r.model||'',r.account||'',r.reasoning_effort||'',
       r.stream==null?'':(r.stream?'stream':'non-stream'),r.outcome||'',
       r.prompt||0,r.completion||0,r.cached??'',r.total||0,
       r.credit==null?'':r.credit,r.cost_cny==null?'':r.cost_cny,
-      r.elapsed_ms||'',r.ttft_ms||'',r.speed==null?'':r.speed,r.key_name||''].map(cell).join(','));
+      r.elapsed_ms||'',r.ttft_ms||'',r.speed==null?'':r.speed,r.key_name||''].map(csvCell).join(','));
   }
   const blob=new Blob([String.fromCharCode(0xFEFF)+lines.join(String.fromCharCode(10))],{type:'text/csv;charset=utf-8'});
   const a=document.createElement('a');
@@ -1696,9 +1809,10 @@ document.getElementById('btn-usage-export').onclick=()=>{
 document.getElementById('usage-filter').onchange=()=>{UPAGE=1;renderUsage();};
 document.getElementById('usage-outcome').onchange=()=>{UPAGE=1;renderUsage();};
 document.getElementById('usage-pagesize').onchange=()=>{UPAGE=1;renderUsage();};
+document.getElementById('usage-since').onchange=()=>{UPAGE=1;renderUsage();};
 document.getElementById('btn-usage-reset').onclick=()=>{
   document.getElementById('usage-search').value='';
-  for(const id of ['usage-filter','usage-model','usage-account','usage-key','usage-outcome']){
+  for(const id of ['usage-filter','usage-model','usage-account','usage-key','usage-outcome','usage-since']){
     const el=document.getElementById(id); if(el) el.value='';
   }
   UPAGE=1; renderUsage();
@@ -1715,12 +1829,13 @@ async function autoView(){
 async function loadExpiringWindow(){
   const info=document.getElementById('wb-expiring-info');
   const input=document.getElementById('wb-expiring-days');
+  const editing=document.activeElement===input;
   try{
     const r=await api('/api/engine',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({platform:'workbuddy',path:'settings',method:'GET',body:{}})});
     const lim=(r.result||{}).limits||{};
     const ew=lim.expiring_window_days||{};
-    input.value=ew.global??'';
+    if(!editing) input.value=ew.global??'';
     const parts=[];
     if(ew.global!==null&&ew.global!==undefined) parts.push('全局 '+ew.global+' 天');
     if(ew.intl!==null&&ew.intl!==undefined) parts.push('国际版 '+ew.intl+' 天');
@@ -1779,6 +1894,26 @@ const AUTO_BUTTONS={
        run:b=>runEngine({platform:'qwenwork',path:'admin/accounts/keepalive-all',body:{channels:['qwenwork']}},b)},
     ]},
   ],
+  raccoon:[
+    {g:'每日', items:[
+      {t:'签到', d:'领取小浣熊每日积分（今天已领过的账号会跳过）', k:'checkin/raccoon', run:b=>doCheckin('raccoon',b), primary:true},
+    ]},
+    {g:'维护', items:[
+      {t:'积分刷新', d:'重新拉取各账号积分余额', k:'engine/raccoon/panel/api/balance_all', run:b=>runEngine({platform:'raccoon',path:'panel/api/balance_all'},b)},
+      {t:'Token 保活', d:'刷新账号凭证，避免过期掉线', k:'engine/raccoon/panel/api/keepalive_all', run:b=>runEngine({platform:'raccoon',path:'panel/api/keepalive_all'},b)},
+    ]},
+  ],
+  trae:[
+    {g:'每日', items:[
+      {t:'签到', d:'国内版每日签到领取积分（国际版无签到接口，会自动跳过）', k:'checkin/trae', run:b=>doCheckin('trae',b), primary:true},
+      {t:'领取 Pro 福利包', d:'批量领取官方国内版 Pro 福利（仅国内版账号）', k:'task/travel/trae', run:b=>runTask('travel','trae',b)},
+    ]},
+    {g:'维护', items:[
+      {t:'Token 保活', d:'刷新账号凭证（refreshToken）', k:'engine/trae/accounts/refresh', run:b=>runEngine({platform:'trae',path:'accounts/refresh'},b)},
+      {t:'积分刷新', d:'逐号强刷官方 entitlement 与积分快照', k:'engine/trae/accounts/credits', run:b=>runEngine({platform:'trae',path:'accounts/credits'},b)},
+      {t:'立即巡检一轮', d:'让引擎调度器马上跑一轮签到/保活', k:'engine/trae/scheduler/trigger', run:b=>runEngine({platform:'trae',path:'scheduler/trigger'},b)},
+    ]},
+  ],
 };
 function renderAutoCards(){
   const el=document.getElementById('auto-cards');
@@ -1795,7 +1930,9 @@ function renderAutoCards(){
     const punch=intlAccs.filter(a=>!intlPunched(a)).length;
     let foot;
     if(p.name==='qwenwork') foot='每日积分由上游发放；保活执行结果与奖励到账分别确认。凭证或余额状态异常时，请检查官方客户端及账号状态。';
+    else if(p.name==='raccoon') foot=`已签 ${signed}/${accs.length} · 每日积分由小浣熊上游发放，签到按钮用于领取当日额度。`;
     else if(p.name==='workbuddy') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际已确认 ${intlDone}/${intlAccs.length}${intlUnverified?` · 到账待确认 ${intlUnverified}`:''}${punch?` · 待打卡 ${punch}`:''} · 定时调度器每天自动执行，按钮用于立即补做。`;
+    else if(p.name==='trae') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际版没有签到接口，不计入分母；积分来自官方 entitlement 快照，签到用于领当日积分。`;
     else foot=`已签 ${signed}/${accs.length} · 定时 09:00 / 10:05 / 21:00 自动签到，按钮用于补做。`;
     const groups=(AUTO_BUTTONS[p.name]||[]).map((g,gi)=>
       `<div class="auto-group">
@@ -1908,7 +2045,7 @@ document.getElementById('btn-checkin-all').onclick=async function(){
   let cur='一键签到…', okN=0, failN=0;
   await withBtn(this, async()=>{
     // 千问办公没有签到（每日积分上游自动发放），不放进循环免得每次白等超时
-    const names=['workbuddy','qoder'];
+    const names=['workbuddy','qoder','trae','raccoon'];
     for(let i=0;i<names.length;i++){
       const n=names[i];
       cur=`(${i+1}/${names.length}) ${PLATFORM_LABEL[n]||n}…`;
@@ -1923,7 +2060,7 @@ document.getElementById('btn-checkin-all').onclick=async function(){
       }catch(e){ failN++; pushHistory('签到 · '+(PLATFORM_LABEL[n]||n), false, e.message,''); }
       runDone(key);
     }
-    toast(`一键签到完成：成功 ${okN} 个平台${failN?`，失败 ${failN} 个`:''}（千问办公无需签到，积分上游自动发放），详见操作结果`, failN?6000:3600);
+    toast(`一键签到完成：成功 ${okN} 个平台${failN?`，失败 ${failN} 个`:''}（千问办公无需签到，Trae 国际版无签到接口），详见操作结果`, failN?6000:3600);
     loadAuto(); loadStatus();
   }, ()=>cur).finally(()=>runDone('checkin-all'));
 };
@@ -1940,6 +2077,9 @@ const DAILY_STEPS=[
   {label:'Qoder · 签到', kind:'checkin', platform:'qoder'},
   {label:'Qoder · 领取全部福利', kind:'task', action:'run', platform:'qoder'},
   {label:'Qoder · 猫猫旅行', kind:'task', action:'travel', platform:'qoder'},
+  {label:'Trae · 签到', kind:'checkin', platform:'trae'},
+  {label:'Trae · 领取 Pro 福利包', kind:'task', action:'travel', platform:'trae'},
+  {label:'小浣熊 · 签到', kind:'checkin', platform:'raccoon'},
   {label:'WorkBuddy · 提交补充巡检（国内活跃 / Buddy 盲盒 / 保活）', kind:'engine', platform:'workbuddy', path:'scheduler/trigger'},
 ];
 document.getElementById('btn-daily-all').onclick=async function(){
@@ -2062,7 +2202,7 @@ async function loadTasksStatus(){
   el.textContent='加载中…';
   const parts=[];
   let failed=false;
-  for(const p of ['workbuddy','qoder']){
+  for(const p of ['workbuddy','qoder','trae']){
     try{
       const d=await api('/api/tasks/'+p);
       if(d.ok===false){ parts.push(`${PLATFORM_LABEL[p]}: ${errMsg(d)||'状态获取失败'}`); continue; }
@@ -2117,6 +2257,7 @@ async function startLogin(platform,realmSel,statusId,linkId,btn){
 }
 document.getElementById('wb-start').onclick=function(){startLogin('workbuddy','wb-realm','wb-login-status','wb-link',this);};
 document.getElementById('qoder-start').onclick=function(){startLogin('qoder','qoder-realm','qoder-login-status','qoder-link',this);};
+document.getElementById('trae-start').onclick=function(){startLogin('trae','trae-realm','trae-login-status','trae-link',this);};
 document.getElementById('qw-reimport').onclick=async function(){
   this.disabled=true;const st=document.getElementById('qw-status');st.textContent='检测中…';
   try{
@@ -2126,8 +2267,201 @@ document.getElementById('qw-reimport').onclick=async function(){
   }catch(e){st.textContent='失败: '+e.message;}
   this.disabled=false;
 };
+/* 小浣熊：生成官方浏览器授权链接 → 轮询入池（与 WorkBuddy/Qoder 同体验） */
+async function startRaccoonLogin(){
+  const btn=document.getElementById('raccoon-start');
+  const st=document.getElementById('raccoon-login-status');
+  const lk=document.getElementById('raccoon-link');
+  if(btn) btn.disabled=true; st.textContent='生成中…'; lk.textContent='';
+  try{
+    const r=await api('/api/raccoon/login/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!r.ok){ st.textContent='失败: '+(errMsg(r)||'未知'); if(btn) btn.disabled=false; return; }
+    lk.innerHTML=`<a href="${esc(r.authUrl)}" target="_blank">${esc(r.authUrl)}</a><div class="sub-cell">点链接在新窗口完成登录，本页每 3 秒自动轮询</div>`;
+    st.textContent='等待授权…';
+    const state=r.state;
+    const started=Date.now();
+    let misses=0, busy=false;
+    const timer=setInterval(async()=>{
+      // 5 分钟上限：用户放弃登录/授权过期时不无限轮询
+      if(Date.now()-started>300000){
+        clearInterval(timer); st.textContent='等待超时：5 分钟内未完成授权，请重新生成链接';
+        if(btn) btn.disabled=false; return;
+      }
+      if(busy) return;
+      busy=true;
+      try{
+        const p=await api('/api/raccoon/login/poll?state='+encodeURIComponent(state));
+        const res=p.result||{};
+        misses=0;
+        st.textContent=res.status||(res.done?'已入池':'等待授权…');
+        if(res.done){
+          clearInterval(timer);
+          st.textContent='✓ 授权完成，账号已入库';
+          if(btn) btn.disabled=false;
+          loadStatus();
+          scanRaccoon();
+        }
+      }catch(e){
+        // 计数的是失败的 HTTP 请求，不是等待中的多个轮询 tick。
+        if(++misses>=3){ clearInterval(timer); st.textContent='轮询失败: '+e.message; if(btn) btn.disabled=false; }
+      }finally{busy=false;}
+    },3000);
+  }catch(e){ st.textContent='失败: '+e.message; if(btn) btn.disabled=false; }
+}
+document.getElementById('raccoon-start').onclick=startRaccoonLogin;
+/* 小浣熊：扫描本机客户端登录态 → 勾选 → 导入（凭证由引擎读取，不进网关） */
+async function scanRaccoon(){
+  const st=document.getElementById('raccoon-status');
+  const host=document.getElementById('raccoon-accounts');
+  host.style.display='';
+  st.textContent='扫描中…';
+  try{
+    const r=await api('/api/raccoon/scan');
+    if(!r.ok){ st.textContent='失败: '+(errMsg(r)||'未知'); return; }
+    const items=r.items||[];
+    if(!items.length){
+      host.innerHTML='<div class="empty">没有发现本机小浣熊客户端登录态。请先在官方客户端登录，或打开 7867 面板用浏览器授权。</div>';
+      st.textContent=''; return;
+    }
+    host.innerHTML=items.map((it,i)=>{
+      const name=esc(it.nickname||it.uid||('候选 '+(i+1)));
+      const meta=[it.phone,it.token_masked,it.path].filter(Boolean).map(esc).join(' · ');
+      const bad=it.verify_error||it.error;
+      const note=it.already_imported?'已在账号池':(bad?('不可导入: '+bad):(it.note||''));
+      return `<label style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)">
+        <input type="checkbox" data-rpath="${esc(it.path)}" ${(bad||it.already_imported)?'disabled':''} ${(!bad&&!it.already_imported)?'checked':''}>
+        <span><b>${name}</b>${note?` <span class="sub-cell">${esc(note)}</span>`:''}<div class="sub-cell mono">${meta}</div></span>
+      </label>`;
+    }).join('')+`<div class="toolbar" style="margin-top:8px"><button class="btn mini" id="raccoon-import">导入选中</button><span class="sub-cell">只导入勾选的客户端凭证；凭证留在小浣熊引擎里</span></div>`;
+    document.getElementById('raccoon-import').onclick=importRaccoon;
+    st.textContent=`发现 ${items.length} 个候选`;
+  }catch(e){ st.textContent='失败: '+e.message; }
+}
+async function importRaccoon(){
+  const btn=document.getElementById('raccoon-import');
+  const st=document.getElementById('raccoon-status');
+  const paths=[...document.querySelectorAll('#raccoon-accounts [data-rpath]:checked:not(:disabled)')].map(x=>x.dataset.rpath);
+  if(!paths.length){ toast('先勾选要导入的账号'); return; }
+  if(btn) btn.disabled=true; st.textContent='导入中…';
+  try{
+    const r=await api('/api/raccoon/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths})});
+    if(r.ok){
+      st.textContent=`✓ 已导入 ${r.imported||0} 个账号`;
+      loadStatus();
+      scanRaccoon(); // 重扫刷新候选行的「已在账号池」状态，防止同一批重复导入
+    }else{
+      const errs=(r.results||[]).filter(x=>x.error).map(x=>x.error).join('；');
+      st.textContent='导入失败: '+(errs||errMsg(r)||'未知');
+    }
+  }catch(e){ st.textContent='失败: '+e.message; }
+  if(btn) btn.disabled=false;
+}
+document.getElementById('raccoon-scan').onclick=scanRaccoon;
 
 /* ── 设置 / 日志 ── */
+/* ── 平台开关与进程 ── */
+const LAUNCH_EDIT=new Set();
+function launchCommandText(command){
+  if(typeof command==='string') return command;
+  if(Array.isArray(command)) return command.map(x=>/\s/.test(x)?`"${x}"`:x).join(' ');
+  return '';
+}
+async function loadPlatforms(){
+  const host=document.getElementById('platform-list');
+  if(!host) return;
+  try{
+    const d=await api('/api/platforms');
+    applyEngineLinks(d.platforms);
+    host.innerHTML=(d.platforms||[]).map(p=>{
+      const proc=p.process||{};
+      const healthy=proc.healthy!==false;
+      if(LAUNCH_EDIT.has(p.name)){
+        const launch=p.launch||{};
+        return `<div data-leditor="${esc(p.name)}" style="padding:8px 0;border-bottom:1px solid var(--line)">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <b style="min-width:150px">${esc(PLATFORM_LABEL[p.name]||p.name)} 启动命令</b>
+            <input data-lcmd value="${esc(launchCommandText(launch.command))}" placeholder="如 cmd /c start-qoder-proxy.bat" style="flex:1;min-width:280px;min-height:30px;border:1px solid var(--line2);border-radius:8px;padding:0 8px;background:var(--panel)">
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px">
+            <input data-lcwd value="${esc(launch.cwd||'')}" placeholder="工作目录，如 E:\\fascinating\\qoder2api-hub" style="flex:1;min-width:280px;min-height:30px;border:1px solid var(--line2);border-radius:8px;padding:0 8px;background:var(--panel)">
+            <button class="btn mini" data-lsave="${esc(p.name)}">保存</button>
+            <button class="btn sec mini" data-lcancel="${esc(p.name)}">取消</button>
+          </div>
+          <div class="sub-cell" style="margin-top:4px">命令按 shell 执行（Windows 用 cmd /c），可直接填引擎自带的 start-*.bat；工作目录必须存在。</div>
+        </div>`;
+      }
+      const state=proc.managed
+        ?(proc.running
+          ?(healthy?`<span class="pill green">运行中 · 网关托管${proc.pid?` #${proc.pid}`:''}</span>`
+                   :`<span class="pill orange">进程在 · 健康检查失败</span>`)
+          :'<span class="pill gray">已停止</span>')
+        :(proc.running?'<span class="pill indigo">运行中 · 外部启动</span>':'<span class="pill gray">未运行</span>');
+      const start=(p.launch_configured&&!proc.running)?`<button class="btn sec mini" data-pstart="${esc(p.name)}">启动</button>`:'';
+      const stop=(proc.managed&&proc.running)?`<button class="btn sec mini" data-pstop="${esc(p.name)}">停止</button>`:'';
+      const edit=`<button class="btn sec mini" data-pedit="${esc(p.name)}">${p.launch_configured?'编辑启动':'配置启动'}</button>`;
+      const hint=p.launch_configured?'':'<span class="sub-cell">未配置启动命令</span>';
+      return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;min-width:150px">
+          <input type="checkbox" data-penable="${esc(p.name)}" ${p.enabled?'checked':''}> ${esc(PLATFORM_LABEL[p.name]||p.name)}
+        </label>
+        ${state}${start}${stop}${edit}${hint}
+      </div>`;
+    }).join('')||'<div class="empty">—</div>';
+    host.querySelectorAll('[data-penable]').forEach(cb=>cb.onchange=()=>togglePlatform(cb.dataset.penable,cb.checked));
+    host.querySelectorAll('[data-pstart]').forEach(b=>b.onclick=()=>platformProc(b.dataset.pstart,'start',b));
+    host.querySelectorAll('[data-pstop]').forEach(b=>b.onclick=()=>platformProc(b.dataset.pstop,'stop',b));
+    host.querySelectorAll('[data-pedit]').forEach(b=>b.onclick=()=>{LAUNCH_EDIT.add(b.dataset.pedit);loadPlatforms();});
+    host.querySelectorAll('[data-lcancel]').forEach(b=>b.onclick=()=>{LAUNCH_EDIT.delete(b.dataset.lcancel);loadPlatforms();});
+    host.querySelectorAll('[data-lsave]').forEach(b=>b.onclick=()=>saveLaunch(b.dataset.lsave,b));
+  }catch(e){ host.textContent='平台状态加载失败: '+e.message; return viewFailure('settings',e); }
+}
+async function saveLaunch(name,btn){
+  const box=btn.closest('[data-leditor]');
+  if(!box){ return; }
+  const command=box.querySelector('[data-lcmd]').value.trim();
+  const cwd=box.querySelector('[data-lcwd]').value.trim();
+  if(!command){ toast('启动命令不能为空'); return; }
+  await withBtn(btn, async()=>{
+    try{
+      const r=await api('/api/platforms',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name,launch:{command,cwd:cwd||null}})});
+      if(!r.ok) throw new Error(errMsg(r));
+      LAUNCH_EDIT.delete(name);
+      toast('启动命令已保存');
+      loadPlatforms();
+    }catch(e){ toast('保存失败: '+e.message); }
+  });
+}
+async function togglePlatform(name,enabled){
+  try{
+    const r=await api('/api/platforms',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,enabled})});
+    if(!r.ok) throw new Error(errMsg(r));
+    const proc=r.process;
+    if(enabled){
+      if(proc&&proc.ok===false) toast(`已启用，但引擎未启动：${proc.error}`,5200);
+      else if(proc&&proc.started) toast(`${PLATFORM_LABEL[name]||name} 已启用，引擎已启动`);
+      else if(proc&&proc.already) toast(`${PLATFORM_LABEL[name]||name} 已启用（引擎已在运行）`);
+      else toast(`${PLATFORM_LABEL[name]||name} 已启用`);
+    }else if(proc&&proc.ok===false) toast(`已停用，但进程未停止：${proc.error}`,5200);
+    else if(proc&&proc.already) toast(`${PLATFORM_LABEL[name]||name} 已停用（进程本来就没运行）`);
+    else toast(`${PLATFORM_LABEL[name]||name} 已停用${proc&&proc.stopped?'，引擎进程已停止':''}`);
+    EST_CACHE={ts:0,data:null};
+    ['overview','models','usage','media','settings'].forEach(v=>VIEW_LOADED.delete(v));
+    loadPlatforms();
+  }catch(e){ toast('切换失败: '+e.message); loadPlatforms(); }
+}
+async function platformProc(name,action,btn){
+  await withBtn(btn, async()=>{
+    try{
+      const r=await api('/api/platforms/process',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name,action})});
+      if(!r.ok) throw new Error(errMsg(r));
+      toast(`${PLATFORM_LABEL[name]||name} ${action==='start'?'已启动':'已停止'}`);
+      loadPlatforms();
+    }catch(e){ toast((action==='start'?'启动':'停止')+'失败: '+e.message); loadPlatforms(); }
+  });
+}
 async function loadSettings(){
   const k=KEY();
   document.getElementById('set-key').textContent=document.getElementById('btn-reveal-key').textContent==='隐藏'?k:'••••••••';
@@ -2141,6 +2475,7 @@ async function loadSettings(){
     document.getElementById('cfg-realms-info').textContent=
       `当前临期概况：国内版 ${line(r.cn)} · 国际版 ${line(r.intl)}`;
   }catch(e){ return viewFailure('settings',e); }
+  await loadPlatforms();
   return loadUpdates();
 }
 /* 上游版本与更新：qoder/buddy 由网关直查 GitHub release tag；wb 走引擎 /updates */
@@ -2212,29 +2547,43 @@ async function loadLogs(){
   try{
     const d=await api('/api/logs');
     const body=document.getElementById('logbody');
+    const atBottom=body.scrollHeight-body.scrollTop-body.clientHeight<8;
     body.innerHTML=esc(d.lines||'').split('\n').map(l=>{
-      if(/checkin|签到/.test(l))return `<span class="ok">${l}</span>`;
-      if(/失败|ERROR|Traceback|不可达|error/i.test(l))return `<span class="err">${l}</span>`;
+      if(/ERROR|Traceback|失败|不可达|error/i.test(l))return `<span class="err">${l}</span>`;
+      if(/checkin|签到/.test(l))return `<span class="${/ok=true|成功/.test(l)?'ok':'err'}">${l}</span>`;
       if(/WARN|启动|Key/.test(l))return `<span class="warn">${l}</span>`;
       return l;
     }).join('\n')||'<span style="color:#7c796f">暂无日志</span>';
-    body.scrollTop=body.scrollHeight;
+    if(atBottom) body.scrollTop=body.scrollHeight;
   }catch(e){ return viewFailure('logs',e); }
 }
 
 /* ── 总览渲染 ── */
-let RECENT_ROWS=[];
 async function loadOverview(){
   if(LAST_STATUS) renderOverview(LAST_STATUS);
   if(RECENT_ROWS.length) renderRecent({rows:RECENT_ROWS});
+  const request=++RECENT_REQUEST;
   const results=await Promise.all([
     loadStatus(), loadEstimate(),
-    api('/api/usage?limit=100').then(d=>{RECENT_ROWS=d.rows||[];renderRecent(d);}).catch(e=>viewFailure('overview',e))
+    api('/api/usage?limit=100').then(d=>{
+      if(request!==RECENT_REQUEST) return true;
+      RECENT_ERRORS=d.errors||{};
+      RECENT_ROWS=d.rows||[];
+      renderRecent(d);
+      if(Object.keys(RECENT_ERRORS).length){
+        viewFailure('overview',new Error('最近请求部分平台读取失败: '+Object.keys(RECENT_ERRORS).join(', ')));
+        return false;
+      }
+      return true;
+    }).catch(e=>{if(request===RECENT_REQUEST)return viewFailure('overview',e);return true;})
   ]);
   return results.every(result=>result!==false);
 }
 function renderRecent(d){
     const rows=(d.rows||[]).slice(0,10);
+    const errors=d.errors||RECENT_ERRORS||{};
+    document.getElementById('recent-errors').textContent=Object.keys(errors).length
+      ?'部分平台读取失败: '+Object.entries(errors).map(([p,e])=>(PLATFORM_LABEL[p]||p)+': '+e).join(' · '):'';
     document.getElementById('recent-body').innerHTML=rows.length?rows.map(r=>{
       const bad=isBad(r.outcome);
       const cr=(r.credit==null||isNaN(Number(r.credit)))?null:Number(r.credit);
@@ -2247,7 +2596,7 @@ function renderRecent(d){
         <td><span class="pill ${bad?'red':'green'}">${esc(r.outcome||'ok')}</span></td></tr>`;
     }).join(''):'<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
 }
-document.getElementById('btn-refresh-top').onclick=()=>{refreshView('overview',true);loadEstimate(true);};
+document.getElementById('btn-refresh-top').onclick=()=>refreshView('overview',true);
 
 /* ── 启动 ── */
 function gateHidden(){return document.getElementById('gate').classList.contains('hidden');}
@@ -2266,6 +2615,7 @@ setInterval(()=>{
   if(active==='view-auto'){ if(!RUNNING.size) refreshView('auto',true); return; }
   if(active==='view-usage'){ refreshView('usage',true); return; }
   if(active==='view-logs'){ refreshView('logs',true); return; }
+  if(active==='view-media'){ refreshView('media',true); return; } // 不兜底刷总览
   if(active==='view-models') return; // 目录有 15s 缓存语义，静置即可
   if(active==='view-add'||active==='view-settings') return;
   refreshView(active==='view-accounts'?'accounts':'overview',true);

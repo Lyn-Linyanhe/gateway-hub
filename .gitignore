@@ -11,3 +11,25 @@ __pycache__/
 *.pyc
 .venv/
 python/
+
+# 账号、凭据和本机环境
+accounts/
+auths/
+.env
+.env.*
+!.env.example
+*_auth_url.txt
+
+# 本地研究、代理任务与生成产物（公开说明放在 docs/）
+.agent-teams/
+.v2c/
+.video_agent/
+/OPTIMIZATION-REVIEW-*.md
+/RACCOON-THINKING-RESEARCH-*.md
+/HANDOFF-*.md
+backup-*/
+*.tmp
+*.zip
+*.exe
+*.mp4
+*.webm

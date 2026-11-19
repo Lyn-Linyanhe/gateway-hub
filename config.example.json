@@ -1,20 +1,21 @@
 {
   "listen_port": 8787,
-  "api_key": "agg-please-change-me",
+  "api_key": "",
   "hide_pro_locked": true,
   "wb_dual_prefer": "auto",
+  "disabled_platforms": [],
   "upstreams": [
     {
       "name": "workbuddy",
       "base_url": "http://127.0.0.1:8788",
       "api_key": "wb-your-key",
-      "panel_password": "admin"
+      "panel_password": "replace-with-your-engine-panel-password"
     },
     {
       "name": "qoder",
       "base_url": "http://127.0.0.1:8790",
       "api_key": "",
-      "panel_password": "admin",
+      "panel_password": "replace-with-your-engine-panel-password",
       "repo": "shuishuipingan/qoder2api-hub"
     },
     {
@@ -22,6 +23,35 @@
       "base_url": "http://127.0.0.1:8792",
       "api_key": "sk-cb-your-key",
       "repo": "wicm84266964/Buddy2api"
+    },
+    {
+      "name": "raccoon",
+      "base_url": "http://127.0.0.1:7867",
+      "api_key": "xhx-your-key",
+      "repo": "rsfree/xhx2api",
+      "launch": {
+        "command": ["xhx2api.exe", "-config", "config.json"],
+        "cwd": "..\\xiaohuanxiong2api"
+      }
+    },
+    {
+      "name": "trae",
+      "base_url": "http://127.0.0.1:8791",
+      "api_key": "trae-local-your-key",
+      "panel_password": "replace-with-your-engine-panel-password",
+      "repo": "shuishuipingan/trae2api-hub",
+      "launch": {
+        "command": ["python", "trae_proxy.py"],
+        "cwd": "..\\trae2api-hub",
+        "env": {
+          "QODER_DISABLE": "1",
+          "TRAE_PROXY_DEFAULT_REALM": "cn",
+          "HTTP_PROXY": "",
+          "HTTPS_PROXY": "",
+          "ALL_PROXY": "",
+          "NO_PROXY": "*"
+        }
+      }
     }
   ],
   "hidden_models": [],
