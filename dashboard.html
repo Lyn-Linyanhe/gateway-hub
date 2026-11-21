@@ -938,6 +938,15 @@ function toast(msg, ms=2800){
   t.classList.remove('hidden'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.add('hidden'),ms);
 }
 function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+/* 媒体产物 URL 只允许 http(s) 与图片 data URI：esc() 不拦 javascript: 协议，
+   上游返回的 url 未经校验就进 <a>/<video> 会变成点击型注入。
+   不依赖 URL 构造器：内嵌环境的合成 DOM 里它可能不存在。 */
+function safeMediaUrl(url){
+  const raw=String(url||'').trim();
+  if(/^data:image\//i.test(raw)) return raw;
+  if(/^(?:https?:\/\/)/i.test(raw)) return raw.replace(/[\\\"'<>]/g,'');
+  return '';
+}
 function fmt(n){ return Math.round(n).toLocaleString(); }
 /* token 专用格式化：≥100 万 → M（百万）、≥1000 → k（千）、小数值原样。
    只用于 token 计数；积分/金额等仍用 fmt() 保留精确数字。 */
@@ -1056,7 +1065,7 @@ function renderHistory(){
       ${h.jobId?`<button class="btn sec mini" data-job-refresh="${esc(h.jobId)}">刷新状态</button>`:''}
       ${h.steps?.length?`<details style="flex-basis:100%"><summary class="sub-cell" style="cursor:pointer">步骤详情</summary>${h.steps.map(s=>`<div class="toolbar" style="margin:4px 0"><span>${esc(s.step_id)}</span><span class="pill ${s.status==='failed'?'red':s.status==='unknown'?'orange':s.status==='skipped'?'gray':'green'}">${esc(s.status)}</span><span class="sub-cell">${esc(s.summary)}</span>${s.retryable?`<button class="btn sec mini" data-job-retry="${esc(h.jobId)}" data-step-retry="${esc(s.step_id)}">重试此步骤</button>`:''}</div>`).join('')}</details>`:''}
     </div>`).join(''):'<div class="empty">暂无操作记录</div>';
-  el.querySelectorAll('[data-job-refresh]').forEach(b=>b.onclick=()=>pollAutomationJob(b.dataset.jobRefresh,true));
+  el.querySelectorAll('[data-job-refresh]').forEach(b=>b.onclick=()=>pollAutomationJob(b.dataset.jobRefresh,true).catch(()=>{}));
   el.querySelectorAll('[data-job-retry]').forEach(b=>b.onclick=()=>retryAutomationStep(b.dataset.jobRetry,b.dataset.stepRetry,b));
 }
 /* 从引擎返回里提取一句话人类摘要（各引擎返回形状不一，按常见字段名探底） */
@@ -1163,10 +1172,11 @@ async function api(p, opt={}) {
       if(!read&&data?.ok===true) policy.views.forEach(view=>VIEW_LOADED.delete(view));
       return data;
     }catch(e){
-      if(timedOut||e&&e.name==='AbortError'){
+      if(timedOut){
         const seconds=Math.round((probeAuth?8000:timeoutMs)/1000);
         const err=new Error(`请求超时（${seconds} 秒），请稍后重试`);err.code='READ_TIMEOUT';throw err;
       }
+      if(e&&e.name==='AbortError') throw e;  // 调用方自带 signal 触发：保留原始 abort 语义
       throw e;
     }finally{ if(timeoutId!==null) clearTimeout(timeoutId); }
   })();
@@ -1199,8 +1209,12 @@ async function tryGate(){
   }catch(e){
     error.style.display='block';
     error.textContent=e.message;
-    if(e.status===401) input.setAttribute('aria-invalid','true');
-    if(KEY()===v) localStorage.removeItem('gh_key');
+    if(e.status===401){
+      input.setAttribute('aria-invalid','true');
+      // 只有服务端明确拒绝时才清除本地 Key；网络超时/网关未启动不删，
+      // 否则恢复联网后用户还得重新手输已验证过的凭证。
+      if(KEY()===v) localStorage.removeItem('gh_key');
+    }
     input.focus();
   }finally{
     button.disabled=false;
@@ -1788,7 +1802,7 @@ async function mediaGenerate(){
       const r=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
       if(seq!==MEDIA_TASK_SEQ) return;
       const item=(r.data||[])[0]||{};
-      const url=item.url||(item.b64_json?'data:image/png;base64,'+item.b64_json:'');
+      const url=safeMediaUrl(item.url)||(item.b64_json?'data:image/png;base64,'+item.b64_json:'');
       const mode=ref?'图生图':'文生图';
       mediaResult(url
         ?`<img src="${esc(url)}" alt="生成结果"><div class="sub" style="margin-top:8px">${mode} · 模型 ${esc(r.model||m.id)}${r.credit!=null?' · 扣 '+esc(String(r.credit))+' 积分':''}${r.hint?' · '+esc(r.hint):''}</div>`
@@ -1804,10 +1818,12 @@ async function mediaGenerate(){
       MEDIA_TASK_ID=r.id||null;
       renderVideoTask(r,m.id);
       if(r.status!=='completed'&&r.status!=='failed'&&r.id){
+        let misses=0;
         MEDIA_POLL=setInterval(async()=>{
           try{
             const t=await api('/v1/videos/'+encodeURIComponent(r.id),{allowError:true});
             if(seq!==MEDIA_TASK_SEQ) return;
+            misses=0;
             if(t.status==='failed' && t.error){
               stopMediaPoll();
               renderVideoTask(t,m.id);
@@ -1815,7 +1831,14 @@ async function mediaGenerate(){
             }
             renderVideoTask(t,m.id);
             if(t.status==='completed'||t.status==='failed')stopMediaPoll();
-          }catch(e){if(seq===MEDIA_TASK_SEQ){stopMediaPoll();viewFailure('media',e);}}
+          }catch(e){
+            // 一次网络抖动或读超时不代表任务失败：上游仍在生成并计费。
+            // 连续 3 次失败才放弃轮询，并保留任务 ID 供手动查询，不诱导重复提交。
+            if(seq!==MEDIA_TASK_SEQ) return;
+            if(++misses<3) return;
+            stopMediaPoll();
+            mediaResult(`<div class="sub">查询任务状态连续失败：${esc(e.message)}。<br>任务 <span class="mono">${esc(r.id)}</span> 可能仍在上游执行并计费。请稍后刷新页面重试查询，不要重复提交生成请求。</div>`);
+          }
         },5000);
       }
     }
@@ -1830,7 +1853,9 @@ function renderVideoTask(t,model){
   if(t.credit!=null) html+=` · 扣 ${esc(String(t.credit))} 积分`;
   html+='</div>';
   const taskError=(t.error&&t.error.message)||(typeof t.error==='string'?t.error:'');
-  if(t.status==='completed'&&t.url) html+=`<video src="${esc(t.url)}" controls preload="metadata"></video><div class="sub"><a href="${esc(t.url)}" target="_blank" rel="noopener">下载 MP4</a>${t.hint?' · '+esc(t.hint):''}</div>`;
+  const url=safeMediaUrl(t.url);
+  if(t.status==='completed'&&url) html+=`<video src="${esc(url)}" controls preload="metadata"></video><div class="sub"><a href="${esc(url)}" target="_blank" rel="noopener">下载 MP4</a>${t.hint?' · '+esc(t.hint):''}</div>`;
+  else if(t.status==='completed'&&!url) html+=`<div class="empty">任务已完成，但返回的下载链接无效，请刷新任务状态重试。</div>`;
   else if(t.status==='failed') html+=`<div class="empty">失败: ${esc(taskError||'上游未给出原因')}</div>`;
   else html+=`<div class="sub">每 5 秒自动轮询，完成后显示视频。</div>`;
   mediaResult(html);
@@ -2599,8 +2624,14 @@ async function loadAutomationPlan(){
   AUTOMATION_PLAN=d;
   return d;
 }
-let AUTOMATION_PLAN=null, AUTOMATION_JOB=null, AUTOMATION_POLL=null, AUTOMATION_IDEMPOTENCY=null;
+let AUTOMATION_PLAN=null, AUTOMATION_JOB=null, AUTOMATION_POLL=null, AUTOMATION_IDEMPOTENCY=null,
+    AUTOMATION_POLL_STARTED=0, AUTOMATION_LAST_TOAST='';
+const AUTOMATION_POLL_LIMIT=5*60*1000;
 const AUTOMATION_JOB_KEY='gh_automation_job_id_v1', AUTOMATION_RETRY_KEY='gh_automation_pending_v1';
+function automationJobKeyClear(){
+  try{localStorage.removeItem(AUTOMATION_JOB_KEY);}catch(e){}
+  AUTOMATION_JOB=null;
+}
 try{AUTOMATION_JOB={id:localStorage.getItem(AUTOMATION_JOB_KEY)||''};if(!AUTOMATION_JOB.id) AUTOMATION_JOB=null;}catch(e){AUTOMATION_JOB=null;}
 try{AUTOMATION_IDEMPOTENCY=JSON.parse(localStorage.getItem(AUTOMATION_RETRY_KEY)||'null');}catch(e){AUTOMATION_IDEMPOTENCY=null;}
 function automationIdempotency(value){
@@ -2630,10 +2661,23 @@ function renderAutomationJob(job){
   document.getElementById('automation-refresh').classList.remove('hidden');
   pushJobHistory(job);
   if(['queued','running'].includes(job.status)){
-    if(!AUTOMATION_POLL) AUTOMATION_POLL=setTimeout(()=>pollAutomationJob(job.id),1200);
+    if(!AUTOMATION_POLL_STARTED) AUTOMATION_POLL_STARTED=Date.now();
+    if(Date.now()-AUTOMATION_POLL_STARTED>AUTOMATION_POLL_LIMIT){
+      // 服务端 job 长期停在 queued/running：停止自动轮询，保留手动刷新入口。
+      if(el.textContent===description) el.textContent=description+' · 已停止自动轮询（5 分钟），请手动刷新任务状态';
+    }else if(!AUTOMATION_POLL){
+      AUTOMATION_POLL=setTimeout(()=>pollAutomationJob(job.id),1200);
+    }
   }else{
+    AUTOMATION_POLL_STARTED=0;
     if(AUTOMATION_POLL){clearTimeout(AUTOMATION_POLL);AUTOMATION_POLL=null;}
-    if(job.status==='partial'||job.status==='failed') toast(`一键任务${label}，未知结果请刷新状态，只有明确可重试失败才能重试`,5200);
+    if(job.status==='partial'||job.status==='failed'){
+      const key=job.id+':'+job.status;
+      if(AUTOMATION_LAST_TOAST!==key){
+        AUTOMATION_LAST_TOAST=key;
+        toast(`一键任务${label}，未知结果请刷新状态，只有明确可重试失败才能重试`,5200);
+      }
+    }
   }
 }
 async function pollAutomationJob(jobId,refreshOnly=false){
@@ -2644,6 +2688,11 @@ async function pollAutomationJob(jobId,refreshOnly=false){
     if(refreshOnly) toast('已刷新自动化任务状态');
     return d.job;
   }catch(e){
+    if(e.status===404 && AUTOMATION_JOB?.id===jobId){
+      // 任务记录已不在保留窗口：清掉本地死键，避免每次进自动化页都 404。
+      automationJobKeyClear();
+      document.getElementById('automation-refresh').classList.add('hidden');
+    }
     const el=document.getElementById('automation-job-status');
     if(el) el.textContent=e.status===404?'任务记录已不在网关保留窗口内，执行结果可能不完整。请检查账号与调度器状态。':`任务状态刷新失败：${e.message}`;
     if(!refreshOnly) return null;
@@ -2666,8 +2715,12 @@ async function refreshAutomationStatus(){
     renderAutomationJob(d.job);
   }catch(e){
     if(e.status===404){
-      status.textContent='没有找到已接受的任务。再次启动前请检查上游状态；确认无副作用后可清除待确认键。';
-      document.getElementById('automation-clear-pending').classList.remove('hidden');
+      // 幂等键对应的任务已不存在：清掉待确认键与死 job id，避免永久锁住启动按钮。
+      automationIdempotency(null);
+      if(AUTOMATION_JOB) automationJobKeyClear();
+      document.getElementById('automation-refresh').classList.add('hidden');
+      document.getElementById('automation-clear-pending').classList.add('hidden');
+      status.textContent='没有找到已接受的任务（提交结果未知）。请先检查调度器与账号状态，确认无副作用后再重新提交。';
     }else{
       status.textContent='任务状态暂时无法确认，请稍后刷新。';
     }
@@ -2677,6 +2730,7 @@ document.getElementById('automation-refresh').onclick=refreshAutomationStatus;
 document.getElementById('automation-clear-pending').onclick=()=>{
   if(!AUTOMATION_IDEMPOTENCY) return;
   automationIdempotency(null);
+  if(AUTOMATION_JOB) automationJobKeyClear();
   document.getElementById('automation-clear-pending').classList.add('hidden');
   document.getElementById('automation-job-status').textContent='待确认键已清除。先检查调度器/账号状态，再决定是否重新提交。';
 };
@@ -2695,6 +2749,9 @@ async function startAutomationJob(button,selectedIds,checkinOnly=false){
   try{
     const status=document.getElementById('automation-job-status');
     if(AUTOMATION_IDEMPOTENCY){await refreshAutomationStatus();return;}
+    // 刷新页面后恢复的 job 只有 id 没有 status：在 autoView 的状态恢复返回前
+    // 不放行新提交，否则同一批任务会被提交两次（服务端幂等只保同键）。
+    if(AUTOMATION_JOB?.id && AUTOMATION_JOB?.status===undefined){await refreshAutomationStatus();return;}
     if(['queued','running'].includes(AUTOMATION_JOB?.status)){await refreshAutomationStatus();return;}
     const plan=await loadAutomationPlan();
     const allSteps=plan.steps.filter(s=>!checkinOnly||s.kind==='checkin'||s.kind==='skip');

@@ -878,8 +878,7 @@ def _automation_run_step(job_id, index):
         if not job:
             return
         step.update(status=status, summary=summary, finished_at=_automation_now(),
-                    retryable=(status == "failed" and _automation_safe_retry(step)
-                               and step.get("kind") != "checkin"))
+                    retryable=status == "failed" and _automation_safe_retry(step))
         job["updated_at"] = step["finished_at"]
         counts = {s: sum(1 for x in job["steps"] if x.get("status") == s)
                   for s in ("succeeded", "skipped", "failed", "partial", "unknown", "submitted")}
@@ -899,8 +898,28 @@ def _automation_run_step(job_id, index):
             job["finished_at"] = _automation_now()
             job["current_step"] = ""
     if next_index < len(job["steps"]) and not retry_only:
-        threading.Thread(target=_automation_run_step, args=(job_id, next_index),
-                         daemon=True).start()
+        try:
+            threading.Thread(target=_automation_run_step, args=(job_id, next_index),
+                             daemon=True).start()
+        except Exception:
+            # 线程资源耗尽时不能让 job 永远停在 running：落终态并标记当前步失败，
+            # 让前端能通过重试接口接手，而不是只能重启网关。
+            with _automation_lock:
+                job = _automation_jobs.get(job_id)
+                if job:
+                    step = job["steps"][next_index]
+                    step["status"] = "failed"
+                    step["summary"] = "网关无法继续执行后续步骤（线程资源耗尽）"
+                    step["finished_at"] = _automation_now()
+                    step["retryable"] = False
+                    job["counts"] = {s: sum(1 for x in job["steps"] if x.get("status") == s)
+                                     for s in ("succeeded", "skipped", "failed", "partial",
+                                               "unknown", "submitted")}
+                    job["completed"] = sum(job["counts"].values())
+                    job["status"] = ("partial" if job["counts"]["succeeded"]
+                                     else "failed")
+                    job["finished_at"] = _automation_now()
+                    job["current_step"] = ""
 
 
 def _automation_start(job):
@@ -2712,17 +2731,24 @@ def platform_status(up):
             # 但引擎 /accounts 返回的是缓存快照，只有 POST /accounts/credits 才会
             # 去上游刷新。所以这里节流地主动刷新一次（默认 10 分钟），再记录
             # 计数器快照；否则 consumed_amount 永远是旧值，区间增量恒为 0。
-            if time.time() - _trae_refresh_at.get("ts", 0.0) >= TRAE_REFRESH_INTERVAL:
+            if (time.time() - _trae_refresh_at.get("ts", 0.0) >= TRAE_REFRESH_INTERVAL
+                    and _trae_refresh_lock.acquire(blocking=False)):
+                # 非阻塞单飞：/api/status 会被前端轮询，慢刷新（90s 超时）期间
+                # 其余轮询线程直接跳过，不再按轮询频率放大成几十个并发 POST。
                 try:
                     engine_request(up, "POST", "/accounts/credits", body={}, timeout=90)
-                    _trae_refresh_at["ts"] = time.time()
                     data = engine_request(up, "GET", "/accounts?realm=all")
                     items = data.get("accounts") if isinstance(data, dict) else data
                     items = items or []
                     out["accounts"] = [norm(a) for a in items if isinstance(a, dict)]
+                    # POST+GET 都成功才算完成刷新；GET 失败时保留旧 ts，
+                    # 下个轮询周期可以立刻重试而不是白等一个完整窗口。
+                    _trae_refresh_at["ts"] = time.time()
                 except Exception as exc:
                     # 刷新失败不影响账号展示：用缓存值继续，并把原因留在卡片上。
                     out["credits_error"] = f"{type(exc).__name__}: {exc}"[:200]
+                finally:
+                    _trae_refresh_lock.release()
             for raw, row in zip(items, out["accounts"]):
                 if not isinstance(raw, dict):
                     continue
@@ -3217,6 +3243,7 @@ TRAE_SPEND_HISTORY = os.path.join(HERE, "trae_spend_history.jsonl")
 #: 调 /accounts/credits 才会去上游拉最新的 consumed_amount；5 分钟一次既能
 #: 让估值在一个观测周期内收敛，又不会把上游打成刷新风暴。
 _trae_refresh_at = {"ts": 0.0}
+_trae_refresh_lock = threading.Lock()
 TRAE_REFRESH_INTERVAL = 300.0
 
 
@@ -5043,6 +5070,9 @@ class Handler(BaseHTTPRequestHandler):
         if path not in allowed:
             return self._deny(403, f"路径 `{path}` 不在 {name} 的自动化白名单内")
         method = str(body.get("method") or "POST").upper()
+        if method not in ("GET", "POST"):
+            # 白名单按路径放行的是只读/动作类面板接口，不是任意方法网关
+            return self._deny(405, f"引擎代理不支持 `{method}`（仅 GET/POST）")
         payload = body.get("body") if isinstance(body.get("body"), dict) else {}
         # 每日活跃/成长任务这类要在引擎里跑真实会话的操作，耗时可能几分钟
         timeout = 300 if ("daily-chat" in path or "checkin_all" in path
@@ -5295,10 +5325,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(502, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     def _api_usage(self):
+        from urllib.parse import parse_qs
         try:
-            limit = max(1, min(500, int(self.path.split("limit=")[-1].split("&")[0]) if "limit=" in self.path else 60))
-        except ValueError:
+            # 规范解析 query，避免裸子串匹配吞掉 output_limit= 这类以 limit 结尾的参数名
+            params = parse_qs(urlsplit(self.path).query)
+            limit = int((params.get("limit") or ["60"])[0])
+        except (ValueError, TypeError):
             limit = 60
+        limit = max(1, min(500, limit))
         requested_limit = limit
         rows, errors, usd_cny = [], {}, None
         coverage = {}
@@ -5395,8 +5429,14 @@ class Handler(BaseHTTPRequestHandler):
                 errors[name] = f"{type(exc).__name__}: {exc}"
                 realm_coverage["all"] = {"ok": False, "rows": 0,
                                           "error": f"{type(exc).__name__}: {exc}"}
-            if name != "workbuddy" or "workbuddy" not in errors:
-                coverage[name] = realm_coverage
+            # wb 双区部分失败时也保留 coverage：前端需要展示每个源的真实行数，
+            # 只留 errors 里一条拼串会让该平台在覆盖面板上凭空消失。
+            coverage[name] = realm_coverage
+        truncated = False
+        for sources in coverage.values():
+            for src in sources.values():
+                if isinstance(src, dict) and src.get("ok") and (src.get("rows") or 0) >= limit:
+                    truncated = True
         rows.sort(key=lambda r: r["at"], reverse=True)
         # Upstreams expose only recent windows, and Trae omits failed requests entirely.
         # Keep the result explicit so the dashboard never labels this as a complete daily count.
@@ -5404,7 +5444,7 @@ class Handler(BaseHTTPRequestHandler):
                               "usd_cny": usd_cny,
                               "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
                               "requested_limit": requested_limit, "returned": len(rows),
-                              "truncated": len(rows) >= requested_limit,
+                              "truncated": truncated,
                               "failure_coverage": {"complete": False,
                                   "note": "上游日志窗口有限；Trae 上游仅记录成功请求"},
                               "coverage": coverage})
@@ -5415,7 +5455,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_login_start(self, name):
         up = next((u for u in CONFIG["upstreams"] if u["name"] == name), None)
-        if not up or name == "qwenwork":
+        if not up:
+            return self._deny(400, f"未知平台 `{name}`（OAuth 支持: workbuddy, qoder, trae）")
+        if name == "qwenwork":
             return self._deny(400, "千问办公没有 OAuth 流程：在官方客户端登录后点「重新检测并导入」")
         if not platform_enabled(name):
             return self._deny(409, f"平台 `{name}` 已在控制台停用（设置页可重新启用）")
@@ -5448,8 +5490,10 @@ class Handler(BaseHTTPRequestHandler):
         up_name = (params.get("platform") or [""])[0].strip()
         state = (params.get("state") or [""])[0].strip()
         up = next((u for u in CONFIG["upstreams"] if u["name"] == up_name), None)
-        if not up or not state or up_name == "qwenwork":
+        if not up or not state:
             return self._deny(400, "需要 platform 与 state 参数")
+        if up_name == "qwenwork":
+            return self._deny(400, "千问办公没有 OAuth 轮询：在官方客户端登录后点「重新检测并导入」")
         if not platform_enabled(up_name):
             return self._deny(409, f"平台 `{up_name}` 已在控制台停用（设置页可重新启用）")
         try:
@@ -5469,9 +5513,12 @@ class Handler(BaseHTTPRequestHandler):
             disc = engine_request(up, "GET", "/admin/accounts/discover?channel=qwenwork", auth="none")
             token = disc.get("preview_token") or ""
             if not token or not disc.get("importable_count"):
+                # preview_token 可直接调 /admin/accounts/import，绝不能进 HTTP 响应；
+                # 只回非敏感的计数字段（对齐 raccoon scan「token 不带到浏览器」的约定）。
                 return self._send_json(200, {"ok": False,
                     "error": "没有发现可导入的新凭证（确认 QwenWork 客户端已登录企业工作区）",
-                    "discover": disc})
+                    "discover": {"importable_count": disc.get("importable_count") or 0,
+                                 "total_count": disc.get("total_count")}})
             result = engine_request(up, "POST", "/admin/accounts/import",
                                     {"channel": "qwenwork", "preview_token": token}, auth="none")
             log(f"qwenwork reimport -> {json.dumps(result, ensure_ascii=False)[:150]}")
@@ -5780,12 +5827,24 @@ class Handler(BaseHTTPRequestHandler):
                 platform_names += [f"{m.get('platform') or 'workbuddy'}/{m['public']}"
                                    for m in public_media_catalog()
                                    if (m.get("platform") or "workbuddy") == up["name"]]
+        def _known_model(mid):
+            # 隐藏操作只接受目录里真实存在的模型，防止拼错的 id 写成永远
+            # 清不掉的孤儿键、虚增 hidden_count；显示路径不校验，
+            # 保留清理历史孤儿键的能力。
+            return (any(f"{x['platform']}/{x['public']}" == mid for x in public_catalog())
+                    or any(f"{m.get('platform') or 'workbuddy'}/{m['public']}" == mid
+                           for m in public_media_catalog()))
+
         with _config_lock:
             hidden = _hidden_set()
             if "ids" in body:
                 ids = body.get("ids")
                 if not isinstance(ids, list) or not all(isinstance(i, str) and "/" in i for i in ids):
                     return self._deny(400, "ids 必须是 `平台/模型` 全名数组")
+                if body.get("visible") is False:
+                    unknown = [mid for mid in ids if not _known_model(mid)]
+                    if unknown:
+                        return self._deny(400, f"模型 `{unknown[0]}` 不在当前目录里，无法隐藏")
                 for mid in ids:
                     if body.get("visible") is False:
                         hidden.add(mid)
@@ -5795,6 +5854,8 @@ class Handler(BaseHTTPRequestHandler):
                 mid = str(body["id"] or "").strip()
                 if not mid or "/" not in mid:
                     return self._deny(400, "id 必须是 `平台/模型` 形式")
+                if body.get("visible") is False and not _known_model(mid):
+                    return self._deny(400, f"模型 `{mid}` 不在当前目录里，无法隐藏")
                 if body.get("visible") is False:
                     hidden.add(mid)
                 else:

@@ -536,6 +536,10 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(payload['rows']), 1)
         self.assertEqual(payload['rows'][0]['account'], 'User')
         self.assertIn('intl', payload['errors']['workbuddy'])
+        # intl 失败时 coverage 仍要带每个源的真实行数，不能整平台消失
+        self.assertIn('cn', payload['coverage']['workbuddy'])
+        self.assertIn('intl', payload['coverage']['workbuddy'])
+        self.assertFalse(payload['truncated'])
 
     def test_trae_spend_rate_uses_consumed_counter_delta(self):
         """Trae 的 Σ实扣来自累计计数器增量，不是余额差。
@@ -2148,6 +2152,95 @@ class GatewayTests(unittest.TestCase):
                     self.assertEqual(counts[platform], 0)
                     self.assertEqual(closed, [1] if stream else [])
 
+    def test_console_api_hardening(self):
+        from unittest.mock import Mock
+        # usage limit：output_limit= 不再影响 limit；非法/越界回退默认并夹紧
+        handler = object.__new__(self.ns["Handler"])
+        handler._send_json = Mock()
+        self.ns["active_upstreams"] = lambda: []
+        for path, expected in (("/api/usage?output_limit=30", 60),
+                               ("/api/usage?limit=abc", 60),
+                               ("/api/usage?limit=9999", 500),
+                               ("/api/usage", 60)):
+            handler.path = path
+            handler._api_usage()
+            self.assertEqual(handler._send_json.call_args.args[1]["requested_limit"],
+                             expected, path)
+
+        # engine 代理：白名单路径上的非 GET/POST 方法必须 405
+        handler._deny = Mock()
+        self.ns["CONFIG"] = {"upstreams": [{"name": "workbuddy", "base_url": "http://127.0.0.1:8788"}]}
+        self.ns["platform_enabled"] = lambda name: True
+        handler._post_body = {"platform": "workbuddy", "path": "accounts/refresh",
+                              "method": "DELETE"}
+        handler._api_engine()
+        self.assertEqual(handler._deny.call_args.args[0], 405)
+
+        # reimport：discover 失败分支不得把 preview_token 带回浏览器
+        self.ns["CONFIG"] = {"upstreams": [{"name": "qwenwork", "base_url": "http://127.0.0.1:8792"}]}
+        self.ns["engine_request"] = Mock(return_value={"preview_token": "synthetic-token",
+                                                       "importable_count": 0})
+        handler._post_body = {}
+        handler._api_qwenwork_reimport()
+        code, body = handler._send_json.call_args.args
+        self.assertFalse(body["ok"])
+        self.assertNotIn("preview_token", json.dumps(body))
+        self.assertEqual(body["discover"]["importable_count"], 0)
+
+    def test_visibility_rejects_unknown_model_on_hide(self):
+        from unittest.mock import Mock
+        path = ROOT / "router.py"
+        scope = isolated(path, {"Handler", "_hidden_set"},
+                         {"CONFIG": {"upstreams": [{"name": "workbuddy",
+                                                    "base_url": "http://127.0.0.1:8788"}],
+                                     "hidden_models": []},
+                          "_config_lock": threading.RLock(),
+                          "public_catalog": lambda: [{"platform": "workbuddy", "public": "m1"}],
+                          "public_media_catalog": lambda: [],
+                          "save_config": Mock(),
+                          "log": lambda *_: None})
+        handler = object.__new__(scope["Handler"])
+        handler._send_json = Mock()
+        handler._deny = Mock()
+        for body, expect_hide_ok in (({"id": "workbuddy/nope", "visible": False}, False),
+                                     ({"id": "workbuddy/m1", "visible": False}, True),
+                                     ({"id": "workbuddy/nope", "visible": True}, True)):
+            handler._post_body = body
+            handler._api_visibility()
+            if expect_hide_ok:
+                handler._deny.assert_not_called()
+            else:
+                self.assertEqual(handler._deny.call_args.args[0], 400)
+            handler._deny.reset_mock()
+        self.assertEqual(scope["CONFIG"]["hidden_models"], ["workbuddy/m1"])
+
+    def test_usage_truncated_follows_per_source_limit(self):
+        from unittest.mock import Mock
+        handler = object.__new__(self.ns["Handler"])
+        handler.path = '/api/usage?limit=10'
+        handler._send_json = Mock()
+        row = {'at': 1000, 'model': 'm', 'account': 'u', 'total_tokens': 5,
+               'prompt_tokens': 3, 'completion_tokens': 2, 'status_code': 200}
+
+        def fake(up, method, path_, body=None, auth=None, timeout=None):
+            if path_.startswith('/accounts'):
+                return {'accounts': []}
+            return {'rows': [row] * 10}
+
+        self.ns.update(active_upstreams=lambda: [{'name': 'qoder', 'base_url': 'http://127.0.0.1:8790'}],
+                       engine_request=fake, _num=lambda n: float(n or 0), time=time)
+        handler._api_usage()
+        body = handler._send_json.call_args.args[1]
+        self.assertTrue(body["truncated"],
+                        "a source returning exactly limit rows counts as truncated")
+        # 合计超限但没有任何单源触顶时不算截断
+        handler.path = '/api/usage?limit=100'
+        handler._send_json.reset_mock()
+        handler._api_usage()
+        body = handler._send_json.call_args.args[1]
+        self.assertEqual(body["returned"], 10)
+        self.assertFalse(body["truncated"])
+
     def test_automation_job_concurrent_reuse_and_retry_boundary(self):
         from concurrent.futures import ThreadPoolExecutor
         from types import SimpleNamespace
@@ -2238,6 +2331,14 @@ class GatewayTests(unittest.TestCase):
             scope["_automation_run_step"](job_id, 1)
             self.assertEqual(job["steps"][1]["status"], "failed")
             self.assertFalse(job["steps"][1]["retryable"])
+        with self.subTest("a deterministic checkin failure stays retryable"):
+            # checkin 幂等（已签会返回已完成）：确定性 failed 可以安全重试；
+            # 传输异常路径才是 unknown 且不可重试。
+            scope["_automation_call_step"] = lambda step: {"ok": False, "error": "引擎拒绝签到"}
+            job["steps"][0].update(status="queued")
+            scope["_automation_run_step"](job_id, 0)
+            self.assertEqual(job["steps"][0]["status"], "failed")
+            self.assertTrue(job["steps"][0]["retryable"])
 
     def test_dashboard_offline(self):
         import subprocess
@@ -2498,6 +2599,30 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
 	 assert.match(el('automation-job-status').textContent,/已完成/);
 	 assert.equal(store.get('gh_automation_job_id_v1'),'job-offline');
 	 assert.equal(JSON.parse(store.get('gh_task_history_v1'))[0].jobId,'job-offline');
+	 // Cross-reload guard: a restored job has only an id, so start must refresh
+	 // its status first instead of submitting a second job.
+	 fetchImpl=async p=>p==='/api/automation/jobs/job-offline'
+	   ?reply({ok:true,job:{id:'job-offline',status:'succeeded',completed:2,counts:{succeeded:1,skipped:1,failed:0,partial:0,unknown:0,submitted:0},steps:[]}}):reply({ok:true});
+	 run("AUTOMATION_JOB={id:'job-offline'};AUTOMATION_IDEMPOTENCY=null");
+	 await run('startAutomationJob(null,undefined,false)');
+	 assert.equal(automationPosts.length,1,'restore-then-refresh must not double submit');
+	 assert.equal(run('AUTOMATION_JOB?.status'),'succeeded');
+	 // 404 on the stored job clears the dead key instead of looping forever.
+	 fetchImpl=async p=>p==='/api/automation/jobs/job-offline'?reply({ok:false,error:{message:'gone'}},404):reply({ok:true});
+	 await run('pollAutomationJob("job-offline",true).catch(()=>{})');
+	 assert.equal(run('AUTOMATION_JOB'),null);
+	 assert.equal(store.get('gh_automation_job_id_v1'),undefined);
+	 // A failed/partial toast must not repeat on every 30s auto refresh.
+	 run("globalThis.__toasts=[];toast=m=>__toasts.push(m)");
+	 const partialJob={id:'job-p',status:'partial',completed:2,counts:{succeeded:1,skipped:0,failed:1,partial:0,unknown:0,submitted:0},steps:[]};
+	 fetchImpl=async p=>reply({ok:true,job:partialJob});
+	 await run('pollAutomationJob("job-p")');
+	 await run('pollAutomationJob("job-p")');
+	 assert.equal(run("__toasts.filter(t=>t.includes('一键任务')).length"),1);
+	 // Media URLs are protocol-checked before they reach href/src.
+	 assert.equal(run('safeMediaUrl("javascript:alert(1)")'),'');
+	 assert.equal(run('safeMediaUrl("http://x/y.mp4")'),'http://x/y.mp4');
+	 assert.equal(run('safeMediaUrl("data:image/png;base64,AAAA")'),'data:image/png;base64,AAAA');
 	 // Media page renders both kinds and switches the form between image/video.
 
 	 run("document.getElementById('media-visfilter').value='visible';MEDIA={items:[{id:'workbuddy/hunyuan-image-v3.0-art',model:'hunyuan-image-v3.0-art',name:'Hunyuan',kind:'image',tags:['text-to-image'],realms:['cn'],credit_per_image:6,image_measured:false,hidden:false},{id:'workbuddy/kling-video-v3',model:'kling-video-v3',name:'Kling',kind:'video',tags:['text-to-video'],realms:['cn','intl'],credits_per_second:{'720P':10},hidden:false}],errors:{},hidden:[]};renderMedia()");
