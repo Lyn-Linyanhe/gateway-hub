@@ -695,6 +695,228 @@ _proc_lock = threading.Lock()
 _managed_procs = {}
 _platform_op_locks = {}
 
+# 自动化 job 只保存网关进程生命周期内的脱敏状态；业务原始返回不落盘。
+_automation_lock = threading.RLock()
+_automation_jobs = {}
+_automation_idempotency = {}
+_AUTOMATION_JOB_LIMIT = 40
+_AUTOMATION_STEP_SPECS = (
+    ("workbuddy.checkin", "WorkBuddy · 签到 + 国际打卡", "checkin", "workbuddy", ""),
+    ("workbuddy.tasks.run", "WorkBuddy · 运行成长任务", "task", "workbuddy", "run"),
+    ("workbuddy.tasks.claim", "WorkBuddy · 领取任务奖励", "task", "workbuddy", "claim"),
+    ("workbuddy.tasks.travel", "WorkBuddy · 猫猫旅行", "task", "workbuddy", "travel"),
+    ("workbuddy.tasks.streak", "WorkBuddy · 连登奖励", "task", "workbuddy", "streak-bonus"),
+    ("workbuddy.tasks.night", "WorkBuddy · 夜猫子", "task", "workbuddy", "night"),
+    ("qoder.checkin", "Qoder · 签到", "checkin", "qoder", ""),
+    ("qoder.tasks.run", "Qoder · 领取全部福利", "task", "qoder", "run"),
+    ("qoder.tasks.travel", "Qoder · 猫猫旅行", "task", "qoder", "travel"),
+    ("trae.checkin", "Trae · 签到", "checkin", "trae", ""),
+    ("trae.tasks.travel", "Trae · 领取 Pro 福利包", "task", "trae", "travel"),
+    ("raccoon.checkin", "小浣熊 · 签到", "checkin", "raccoon", ""),
+    ("workbuddy.scheduler", "WorkBuddy · 提交补充巡检", "engine", "workbuddy", "scheduler/trigger"),
+)
+
+
+def _automation_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def _automation_plan():
+    configured = {up.get("name") for up in CONFIG.get("upstreams", [])}
+    steps = []
+    for step_id, label, kind, platform, action in _AUTOMATION_STEP_SPECS:
+        supported = platform in configured and platform_enabled(platform)
+        reason = "" if supported else (
+            "平台未配置" if platform not in configured else "平台已停用")
+        dynamic = kind in ("checkin", "task")
+        steps.append({"step_id": step_id, "label": label, "kind": kind,
+                      "platform": platform, "action": action,
+                      "supported": supported, "skip_reason": reason,
+                      "dynamic": dynamic,
+                      "note": "执行前会按账号/上游状态再次判断" if dynamic else
+                              "提交后由引擎调度器异步完成"})
+    # 千问办公没有签到动作，但必须在预览中显式出现，避免用户误以为漏跑。
+    steps.insert(9, {"step_id": "qwenwork.auto-credit", "label": "千问办公 · 上游自动发放",
+                      "kind": "skip", "platform": "qwenwork", "action": "",
+                      "supported": False, "skip_reason": "每日积分由上游自动发放",
+                      "dynamic": False, "note": "不会调用签到接口"})
+    version = hashlib.sha256(json.dumps(
+        [(s["step_id"], s["supported"], s["skip_reason"]) for s in steps],
+        ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    return {"version": version, "generated_at": _automation_now(), "steps": steps}
+
+
+def _automation_safe_retry(step):
+    # 任务领取/旅行可能已经在上游执行，未知结果不能盲重放。
+    return step.get("kind") == "checkin" or step.get("action") in (
+        "accounts/refresh", "accounts/credits", "accounts/credits/fetch")
+
+
+def _automation_summary(result):
+    if not isinstance(result, dict):
+        return "上游返回格式未知"
+    if result.get("unknown"):
+        return "上游执行结果未知，请检查账号或调度器状态"
+    if result.get("partial"):
+        return "部分账号未完成，请查看引擎状态"
+    if result.get("ok") is False:
+        return "引擎返回失败，请查看引擎状态"
+    if result.get("skipped") or (isinstance(result.get("result"), dict)
+                                  and result["result"].get("skipped")):
+        return "无需执行"
+    if result.get("ok") is True:
+        return "已执行；积分到账以引擎/上游记录为准"
+    return "已提交，等待上游确认"
+
+
+def _automation_checkin(name):
+    if not platform_enabled(name):
+        return {"ok": False, "error": "平台已停用"}
+    up = _upstream_by_name(name)
+    if not up:
+        return {"ok": False, "error": "平台未配置"}
+    if name == "qwenwork":
+        return {"ok": True, "skipped": True, "msg": "每日积分由上游自动发放"}
+    path, auth_kind = CHECKIN_PATHS.get(name, (None, None))
+    if not path:
+        return {"ok": False, "error": "没有签到接口"}
+    try:
+        result = engine_request(up, "POST", path, {}, auth=auth_kind,
+                                timeout=600 if name == "raccoon" else 15)
+    except Exception:
+        # A timed-out check-in might have completed upstream; don't enable retries.
+        return {"unknown": True, "error": "签到结果未知，请刷新账号状态确认"}
+    if name == "raccoon":
+        result = _raccoon_checkin_result(result)
+    if name == "workbuddy":
+        try:
+            accs = engine_request(up, "GET", "/accounts?realm=all", auth=auth_kind, timeout=30)
+            alist = accs.get("accounts") if isinstance(accs, dict) else accs
+            today = time.strftime("%Y-%m-%d")
+            pending = [a for a in (alist or []) if isinstance(a, dict)
+                       and a.get("realm") == "intl" and a.get("enabled")
+                       and a.get("canDailyChat") and not str(a.get("lastDailyChat") or "").startswith(today)]
+            intl = (engine_request(up, "POST", "/accounts/daily-chat",
+                                   {"uids": [a.get("uid") for a in pending]},
+                                   auth=auth_kind, timeout=600)
+                    if pending else {"ok": True, "skipped": True, "msg": "没有待打卡的国际版账号"})
+            if pending and isinstance(intl, dict) and intl.get("ok") is False:
+                intl = {**intl, "unknown": True}
+            result = {"cn_checkin": result, "intl_daily_chat": intl}
+        except Exception as exc:
+            # Upstream may have accepted the POST before transport failed; don't replay it.
+            intl = {"unknown": True, "error": "国际打卡结果未知，需刷新状态确认"}
+            result = {"cn_checkin": result, "intl_daily_chat": intl}
+    return {**_action_status(result), "result": result}
+
+
+def _automation_call_step(step):
+    name, kind, action = step["platform"], step["kind"], step.get("action", "")
+    if kind == "checkin":
+        return _automation_checkin(name)
+    up = _upstream_by_name(name)
+    if not up or not platform_enabled(name):
+        return {"ok": False, "error": "平台不可用"}
+    if kind == "task":
+        spec = {"run": "/tasks/run", "claim": "/tasks/claim", "travel": "/tasks/travel",
+                "night": "/tasks/night", "streak-bonus": "/tasks/streak-bonus"}.get(action)
+        if not spec:
+            return {"ok": False, "error": "任务动作不支持"}
+        if action == "claim" and name == "workbuddy":
+            result = Handler._wb_claim_all(None, up, {})
+            return {**_action_status(result), "result": result}
+        result = engine_request(up, "POST", spec, {}, timeout=300)
+        return {**_action_status(result), "result": result}
+    if kind == "engine":
+        result = engine_request(up, "POST", "/" + action, {},
+                                auth="panel", timeout=300)
+        return {**_action_status(result), "submitted": action.endswith("/trigger"),
+                "result": result}
+    return {"ok": True, "skipped": True, "msg": step.get("skip_reason") or "已跳过"}
+
+
+def _automation_update(job_id, **changes):
+    with _automation_lock:
+        job = _automation_jobs.get(job_id)
+        if job:
+            job.update(changes)
+            job["updated_at"] = _automation_now()
+            return dict(job)
+    return None
+
+
+def _automation_run_step(job_id, index):
+    with _automation_lock:
+        job = _automation_jobs.get(job_id)
+        if not job or index >= len(job["steps"]):
+            return
+        step = job["steps"][index]
+        step["status"] = "running"
+        step["started_at"] = _automation_now()
+        job["status"] = "running"
+        job["started_at"] = job.get("started_at") or step["started_at"]
+        job["current_step"] = step["step_id"]
+        job["current_index"] = index
+        job["updated_at"] = _automation_now()
+    try:
+        if not step.get("supported", True):
+            result = {"ok": True, "skipped": True, "msg": step.get("skip_reason")}
+        else:
+            result = _automation_call_step(step)
+        status = ("unknown" if result.get("unknown") else
+                  "partial" if result.get("partial") else
+                  "skipped" if result.get("skipped") else
+                  "submitted" if result.get("ok") is True and result.get("submitted") else
+                  "succeeded" if result.get("ok") is True else "failed")
+        summary = ("已提交，等待引擎调度器结果" if status == "submitted"
+                   else _automation_summary(result))
+    except Exception:
+        # 传输失败时无法确认上游是否已经执行。
+        status, summary = "unknown", "上游执行结果未知，请检查账号或调度器状态"
+    with _automation_lock:
+        job = _automation_jobs.get(job_id)
+        if not job:
+            return
+        step.update(status=status, summary=summary, finished_at=_automation_now(),
+                    retryable=(status == "failed" and _automation_safe_retry(step)
+                               and step.get("kind") != "checkin"))
+        job["updated_at"] = step["finished_at"]
+        counts = {s: sum(1 for x in job["steps"] if x.get("status") == s)
+                  for s in ("succeeded", "skipped", "failed", "partial", "unknown", "submitted")}
+        job["counts"] = counts
+        job["completed"] = sum(counts.values())
+        next_index = index + 1
+        retry_only = bool(job.get("retry_only"))
+        if retry_only:
+            job["retry_only"] = False
+        if next_index < len(job["steps"]) and not retry_only:
+            job["current_index"] = next_index
+        else:
+            bad = counts["failed"] + counts["partial"]
+            job["status"] = ("failed" if counts["failed"] and not counts["succeeded"]
+                              else "partial" if bad or counts["unknown"] or counts["submitted"]
+                              else "succeeded")
+            job["finished_at"] = _automation_now()
+            job["current_step"] = ""
+    if next_index < len(job["steps"]) and not retry_only:
+        threading.Thread(target=_automation_run_step, args=(job_id, next_index),
+                         daemon=True).start()
+
+
+def _automation_start(job):
+    with _automation_lock:
+        _automation_jobs[job["id"]] = job
+    threading.Thread(target=_automation_run_step, args=(job["id"], 0), daemon=True).start()
+
+
+def _automation_public(job):
+    with _automation_lock:
+        out = json.loads(json.dumps(job, ensure_ascii=False))
+    out.pop("idempotency_key", None)
+    for step in out.get("steps", []):
+        step.pop("result", None)
+    return out
+
 
 def _platform_op_lock(name):
     with _proc_lock:
@@ -784,12 +1006,22 @@ def _platform_process(up):
         if proc is not None and proc.poll() is not None:
             _managed_procs.pop(name, None)
             proc = None
-    healthy = _upstream_health(up) if platform_enabled(name) else False
+    # 路由启用与进程可达是两种状态。停用平台后仍探测健康端点，避免把
+    # 未能安全停止的外部进程误报成已停止。
+    healthy = _upstream_health(up)
+    enabled = platform_enabled(name)
+    observed_at = _automation_now()
     if proc is not None:
+        state = "running_healthy" if healthy else "running_unhealthy"
         return {"managed": True, "running": True, "healthy": healthy,
+                "state": state, "route_enabled": enabled,
+                "observed_at": observed_at,
                 "pid": proc.pid,
                 "launch_configured": _launch_spec(up) is not None}
-    return {"managed": False, "running": healthy, "healthy": healthy, "pid": None,
+    state = "running_healthy" if healthy else "unknown"
+    return {"managed": False, "running": healthy, "healthy": healthy,
+            "state": state, "route_enabled": enabled,
+            "observed_at": observed_at, "pid": None,
             "launch_configured": _launch_spec(up) is not None}
 
 
@@ -2396,8 +2628,16 @@ def _raccoon_points_audit(up):
 def platform_status(up):
     """单个引擎的健康 + 账号池聚合。"""
     name = up["name"]
+    expiry_sources = {"workbuddy": "credits.earliest_expiring",
+                      "qoder": "credits.expires_at",
+                      "raccoon": "points audit",
+                      "trae": "entitlement packs",
+                      "qwenwork": "qwenwork_reset_at configuration"}
     out = {"name": name, "base_url": up["base_url"], "health": False, "accounts": [],
-           "inflight": _inflight.get(name, 0), "error": ""}
+           "inflight": _inflight.get(name, 0), "error": "",
+           "observed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+           "data_state": "unknown", "balance_state": "unknown",
+           "expiry_state": "unknown", "expiry_source": expiry_sources.get(name, "")}
     try:
         # hub 系引擎是 /health；xhx2api 用 /healthz（同样是 JSON status=ok）。
         health_path = "/healthz" if name == "raccoon" else "/health"
@@ -2413,6 +2653,8 @@ def platform_status(up):
             out["health"] = True  # 200 且无标准字段，视为可达
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
+        out["data_state"] = "offline"
+        out["expiry_state"] = "error"
         return out
     try:
         if name == "qwenwork":
@@ -2446,6 +2688,12 @@ def platform_status(up):
             # 15ms），而 /api/status 每轮询都走这里，所以单独缓存 5 分钟；失败
             # 只让临期行缺省，不拖垮账号与余额聚合。
             by_uid = _raccoon_points_audit(up)
+            with _raccoon_points_lock:
+                points_cache = dict(_raccoon_points_cache)
+            if points_cache.get("fail_ts", 0) > points_cache.get("ts", 0):
+                out["expiry_state"] = "error"
+            else:
+                out["expiry_state"] = "known"
             for a in items:
                 if isinstance(a, dict) and by_uid:
                     a["_audit"] = by_uid.get(str(a.get("uid") or ""))
@@ -2635,8 +2883,23 @@ def platform_status(up):
                 except ValueError:
                     pass
         out["expiring"] = expiring
+        enabled_accounts = [a for a in out["accounts"] if a.get("enabled")]
+        known_balances = sum(1 for a in enabled_accounts
+                             if _known_num(a.get("remain")) is not None)
+        out["balance_state"] = ("unknown" if not enabled_accounts or not known_balances
+                                 else "complete" if known_balances == len(enabled_accounts)
+                                 else "partial")
+        out["data_state"] = "partial" if out.get("credits_error") else "ok"
+        if name != "raccoon":
+            if name == "qwenwork" and not str(CONFIG.get("qwenwork_reset_at") or "").strip():
+                out["expiry_state"] = "unsupported"
+            else:
+                out["expiry_state"] = "known" if expiring else "unknown"
     except Exception as exc:
         out["error"] = f"账号聚合失败: {type(exc).__name__}: {exc}"
+        out["data_state"] = "partial" if out["health"] else "offline"
+        if out["expiry_state"] == "unknown":
+            out["expiry_state"] = "error"
     return out
 
 
@@ -3616,6 +3879,11 @@ def _action_status(result):
         for key in result_keys:
             if isinstance(value.get(key), (dict, list)):
                 visit(value[key], key in ("results", "claimed"))
+        if value.get("unknown") is True:
+            unknown += 1
+            errors.append(str(value.get("error") or value.get("msg")
+                              or value.get("message") or "上游执行结果未知"))
+            return
         failed = value.get("ok") is False or bool(value.get("error"))
         if failed:
             failures += 1
@@ -3870,6 +4138,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_gwconfig()
         if path == "/api/platforms":
             return self._api_platforms()
+        if path == "/api/automation/plan":
+            return self._api_automation_plan()
+        if path == "/api/automation/jobs":
+            key = self.headers.get("Idempotency-Key", "").strip()
+            if not key:
+                return self._deny(400, "需要 Idempotency-Key 请求头")
+            with _automation_lock:
+                job_id = _automation_idempotency.get(key)
+            if not job_id:
+                return self._deny(404, "未找到对应的自动化任务")
+            return self._api_automation_job_get(job_id)
+        if path.startswith("/api/automation/jobs/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 4:
+                return self._api_automation_job_get(parts[3])
+            return self._deny(404, "自动化任务路径无效")
         if path == "/api/updates":
             force = "force=1" in query
             return self._send_json(200, {"ok": True, "rows": _collect_updates(force=force)})
@@ -3913,6 +4197,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/checkin/"):
             return self._api_checkin(path.rsplit("/", 1)[-1])
+        if path == "/api/automation/jobs":
+            return self._api_automation_job_post()
+        if path.startswith("/api/automation/jobs/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 6 and parts[4] == "steps":
+                return self._api_automation_job_post(parts[3], parts[5])
+            return self._deny(404, "自动化任务路径无效")
         if path.startswith("/api/tasks/"):
             # /api/tasks/{action}/{platform}
             parts = path.strip("/").split("/")
@@ -4193,7 +4484,7 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/media/models：控制台用（带 hidden 标记与刷新）。"""
         if not platform_enabled("workbuddy") and not platform_enabled("raccoon"):
             return self._send_json(200, {"ok": True, "items": [], "total": 0,
-                                         "hidden_count": 0, "errors": {},
+                                         "hidden_count": 0, "hidden": sorted(_hidden_set()), "errors": {},
                                          "disabled": True})
         rows, errors = self._media_catalog_combined(force="force=1" in self.path)
         items = []
@@ -4219,7 +4510,7 @@ class Handler(BaseHTTPRequestHandler):
             })
         self._send_json(200, {"ok": True, "items": items, "total": len(items),
                               "hidden_count": sum(1 for i in items if i["hidden"]),
-                              "errors": errors})
+                              "hidden": sorted(_hidden_set()), "errors": errors})
 
     def _abs_media_url(self, url):
         """引擎回的是相对产物路径（/v1/videos/...?t=签名）；转成网关直链。
@@ -4398,6 +4689,7 @@ class Handler(BaseHTTPRequestHandler):
         # 不做跨平台积分合计：三家对积分/额度的口径完全不同，加总没有意义。
         self._send_json(200, {
             "ok": True,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
             "platforms": platforms,
             "expiring": expiring_all,
             "kpi": {
@@ -4482,7 +4774,95 @@ class Handler(BaseHTTPRequestHandler):
         log(f"checkin[{name}] ok={status['ok']} partial={status['partial']}")
         self._send_json(200, payload)
 
-    # ---- 任务中心（成长任务 / 猫猫旅行 / 福利领取，代理到各引擎） ----
+    def _api_automation_plan(self):
+        plan = _automation_plan()
+        return self._send_json(200, {"ok": True, **plan})
+
+    def _api_automation_job_get(self, job_id):
+        with _automation_lock:
+            job = _automation_jobs.get(job_id)
+        if not job:
+            return self._deny(404, "自动化任务不存在")
+        return self._send_json(200, {"ok": True, "job": _automation_public(job)})
+
+    def _api_automation_job_post(self, job_id=None, step_id=None):
+        body = self._post_body or {}
+        if job_id and step_id:
+            with _automation_lock:
+                job = _automation_jobs.get(job_id)
+                step = next((s for s in (job or {}).get("steps", [])
+                             if s.get("step_id") == step_id), None)
+                if not job or not step:
+                    return self._deny(404, "自动化任务或步骤不存在")
+                if job.get("status") in ("queued", "running"):
+                    return self._deny(409, "自动化任务仍在执行，不能单独重试")
+                if step.get("status") != "failed" or not step.get("retryable"):
+                    return self._deny(409, "该步骤不是明确可安全重试的失败")
+                step.update(status="queued", summary="等待重试", retryable=False)
+                job.update(status="running", current_step=step_id, retry_only=True,
+                           finished_at=None, updated_at=_automation_now())
+                index = next(i for i, item in enumerate(job["steps"])
+                             if item.get("step_id") == step_id)
+            threading.Thread(target=_automation_run_step, args=(job_id, index),
+                             daemon=True).start()
+            return self._send_json(202, {"ok": True, "job": _automation_public(job)})
+
+        if job_id:
+            return self._deny(404, "自动化任务路径无效")
+        key = str(body.get("idempotency_key") or "").strip()
+        if not key or len(key) > 160:
+            return self._deny(400, "需要 1-160 个字符的 idempotency_key")
+        plan = _automation_plan()
+        requested_version = str(body.get("plan_version") or "")
+        if requested_version != plan["version"]:
+            return self._send_json(409, {"ok": False, "error": "执行计划已变化，请重新预览",
+                                         "plan": plan})
+        with _automation_lock:
+            old_id = _automation_idempotency.get(key)
+            if old_id and old_id in _automation_jobs:
+                return self._send_json(200, {"ok": True, "reused": True,
+                                             "job": _automation_public(_automation_jobs[old_id])})
+        wanted = body.get("steps")
+        if not isinstance(wanted, list) or not wanted:
+            return self._deny(400, "需要至少一个明确的执行步骤")
+        if any(not isinstance(step_id, str) for step_id in wanted):
+            return self._deny(400, "执行步骤必须是字符串")
+        if len(set(wanted)) != len(wanted):
+            return self._deny(400, "执行步骤不能重复")
+        by_id = {s["step_id"]: s for s in plan["steps"]}
+        if any(not isinstance(step_id, str) or step_id not in by_id for step_id in wanted):
+            return self._deny(400, "执行步骤不在当前计划中")
+        steps = [dict(by_id[step_id]) for step_id in wanted]
+        job = {"id": secrets.token_urlsafe(12), "status": "queued",
+               "plan_version": plan["version"], "idempotency_key": key,
+               "created_at": _automation_now(), "updated_at": _automation_now(),
+               "started_at": None, "finished_at": None, "current_step": "",
+               "current_index": 0, "completed": 0,
+               "counts": {s: 0 for s in ("succeeded", "skipped", "failed", "partial",
+                                         "unknown", "submitted")},
+               "steps": steps}
+        with _automation_lock:
+            old_id = _automation_idempotency.get(key)
+            if old_id and old_id in _automation_jobs:
+                return self._send_json(200, {"ok": True, "reused": True,
+                                             "job": _automation_public(_automation_jobs[old_id])})
+            _automation_jobs[job["id"]] = job
+            _automation_idempotency[key] = job["id"]
+            while len(_automation_jobs) > _AUTOMATION_JOB_LIMIT:
+                old = next((job_id for job_id, item in _automation_jobs.items()
+                            if item.get("status") not in ("queued", "running")
+                            and job_id != job["id"]), None)
+                if old is None:
+                    break
+                _automation_jobs.pop(old, None)
+                for old_key, old_job_id in list(_automation_idempotency.items()):
+                    if old_job_id == old:
+                        _automation_idempotency.pop(old_key, None)
+        threading.Thread(target=_automation_run_step, args=(job["id"], 0),
+                         daemon=True).start()
+        return self._send_json(202, {"ok": True, "job": _automation_public(job)})
+
+    # ---- 自动化任务计划与生命周期 ----
 
     TASK_ACTIONS = {
         # action -> {平台: (引擎路径, 说明)}
@@ -4754,7 +5134,8 @@ class Handler(BaseHTTPRequestHandler):
                     "process": proc,
                 })
             return self._send_json(200, {"ok": True, "platforms": items,
-                                         "disabled": sorted(_disabled_platforms())})
+                                         "disabled": sorted(_disabled_platforms()),
+                                         "observed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())})
         body = self._post_body
         name = str(body.get("name") or "").strip()
         up = _upstream_by_name(name)
@@ -4815,8 +5196,14 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"platform[{name}] 停用后停止进程: "
                     f"{json.dumps(process, ensure_ascii=False)}")
             log(f"platform[{name}] {'启用' if enabled else '停用'}; disabled={disabled}")
+            process_ok = process is None or process.get("ok", True)
+            warning = ""
+            if process and not process_ok:
+                warning = str(process.get("error") or "进程状态未确认")
             return self._send_json(200, {"ok": True, "platform": name,
-                                         "enabled": enabled, "disabled": disabled,
+                                         "enabled": enabled, "route_enabled": enabled,
+                                         "config_applied": True, "process_ok": process_ok,
+                                         "warning": warning, "disabled": disabled,
                                          "process": process})
         return self._deny(400, "需要 enabled 或 action=start|stop")
 
@@ -4911,20 +5298,26 @@ class Handler(BaseHTTPRequestHandler):
             limit = max(1, min(500, int(self.path.split("limit=")[-1].split("&")[0]) if "limit=" in self.path else 60))
         except ValueError:
             limit = 60
+        requested_limit = limit
         rows, errors, usd_cny = [], {}, None
+        coverage = {}
         for up in active_upstreams():
             name = up["name"]
+            before_count = len(rows)
+            realm_coverage = {}
             try:
                 uid_names = {}
                 if name == "qwenwork":
                     data = engine_request(up, "GET", f"/admin/logs?limit={limit}", auth="none")
                     items = data if isinstance(data, list) else data.get("items") or data.get("logs") or []
+                    realm_coverage["all"] = {"ok": True, "rows": len(items)}
                 elif name == "raccoon":
                     # xhx2api 没有 /usage/recent：逐条请求在 /panel/api/requests，
                     # 事件里没有 credit / cached，保持未知而不是补 0。
                     data = engine_request(up, "GET", f"/panel/api/requests?limit={limit}",
                                           auth="bearer", timeout=30)
                     events = (data.get("events") if isinstance(data, dict) else data) or []
+                    realm_coverage["all"] = {"ok": True, "rows": len(events)}
                     items = []
                     for e in events:
                         if not isinstance(e, dict):
@@ -4962,10 +5355,14 @@ class Handler(BaseHTTPRequestHandler):
                                 d2 = engine_request(
                                     up, "GET", f"/usage/recent?realm={realm}&limit={limit}")
                                 r2 = d2.get("rows") if isinstance(d2, dict) else d2
-                                items.extend(r2 or [])
+                                r2 = r2 or []
+                                realm_coverage[realm] = {"ok": True, "rows": len(r2)}
+                                items.extend(r2)
                                 if isinstance(d2, dict) and d2.get("usd_cny"):
                                     usd_cny = d2.get("usd_cny")
                             except Exception as exc:
+                                realm_coverage[realm] = {"ok": False, "rows": 0,
+                                                         "error": f"{type(exc).__name__}: {exc}"}
                                 realm_errors.append(f"{realm}: {type(exc).__name__}: {exc}")
                         if realm_errors:
                             errors[name] = "; ".join(realm_errors)
@@ -4973,12 +5370,14 @@ class Handler(BaseHTTPRequestHandler):
                         for r in normed:
                             r["account"] = uid_names.get(r["account"]) or r["account"]
                         rows.extend(normed)
+                        coverage[name] = realm_coverage
                         continue
 
                     else:
                         data = engine_request(up, "GET", f"/usage/recent?limit={limit}")
                         items = data.get("rows") if isinstance(data, dict) else data
                         items = items or []
+                        realm_coverage["all"] = {"ok": True, "rows": len(items)}
                         if isinstance(data, dict) and data.get("usd_cny"):
                             usd_cny = data.get("usd_cny")
                         if name == "trae":
@@ -4993,8 +5392,21 @@ class Handler(BaseHTTPRequestHandler):
                 rows.extend(normed)
             except Exception as exc:
                 errors[name] = f"{type(exc).__name__}: {exc}"
+                realm_coverage["all"] = {"ok": False, "rows": 0,
+                                          "error": f"{type(exc).__name__}: {exc}"}
+            if name != "workbuddy" or "workbuddy" not in errors:
+                coverage[name] = realm_coverage
         rows.sort(key=lambda r: r["at"], reverse=True)
-        self._send_json(200, {"ok": True, "rows": rows, "errors": errors, "usd_cny": usd_cny})
+        # Upstreams expose only recent windows, and Trae omits failed requests entirely.
+        # Keep the result explicit so the dashboard never labels this as a complete daily count.
+        self._send_json(200, {"ok": True, "rows": rows, "errors": errors,
+                              "usd_cny": usd_cny,
+                              "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+                              "requested_limit": requested_limit, "returned": len(rows),
+                              "truncated": len(rows) >= requested_limit,
+                              "failure_coverage": {"complete": False,
+                                  "note": "上游日志窗口有限；Trae 上游仅记录成功请求"},
+                              "coverage": coverage})
 
     # ---- OAuth 添加账号 ----
 

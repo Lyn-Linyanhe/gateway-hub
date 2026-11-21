@@ -2057,6 +2057,97 @@ class GatewayTests(unittest.TestCase):
         obj._relay_json.assert_called_once()
         self.assertEqual(obj._relay_json.call_args.args[0], 200)
 
+    def test_automation_job_concurrent_reuse_and_retry_boundary(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        path = ROOT / "router.py"
+        creation = threading.Barrier(2)
+        worker = Mock()
+
+        def make_id(size):
+            creation.wait(timeout=5)
+            return secrets.token_urlsafe(size)
+
+        scope = isolated(path, {"Handler", "_automation_plan", "_automation_now",
+                                "_automation_public", "_automation_run_step", "_automation_summary",
+                                "_automation_safe_retry", "_request_target", "_media_download_allowed"}, {
+            "CONFIG": {"upstreams": [{"name": "workbuddy"}, {"name": "trae"}]},
+            "platform_enabled": lambda name: name != "trae", "hashlib": hashlib,
+            "_AUTOMATION_STEP_SPECS": constant(path, "_AUTOMATION_STEP_SPECS"),
+            "_AUTOMATION_JOB_LIMIT": 40, "_automation_jobs": {},
+            "_automation_idempotency": {}, "_automation_lock": threading.RLock(),
+            "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
+            "_media_download_secret": b"offline-test-only",
+            "_media_link_secret": b"offline-test-only",
+            "secrets": SimpleNamespace(token_urlsafe=make_id),
+            "threading": SimpleNamespace(Thread=worker),
+        })
+
+        def handler(body=None):
+            obj = object.__new__(scope["Handler"])
+            obj._post_body = body
+            obj._send_json = lambda code, data: (code, data)
+            obj._deny = lambda code, message: (code, message)
+            return obj
+
+        code, plan = handler()._api_automation_plan()
+        self.assertEqual(code, 200)
+        planned = {step["step_id"]: step for step in plan["steps"]}
+        self.assertFalse(planned["trae.checkin"]["supported"])
+        self.assertEqual(planned["qwenwork.auto-credit"]["kind"], "skip")
+        selected = ["workbuddy.checkin", "workbuddy.scheduler", "qwenwork.auto-credit"]
+        body = {"idempotency_key": "offline", "plan_version": plan["version"], "steps": selected}
+        self.assertEqual(handler(dict(body, plan_version="stale"))._api_automation_job_post()[0], 409)
+        self.assertEqual(handler(dict(body, steps=[]))._api_automation_job_post()[0], 400)
+        self.assertEqual(handler(dict(body, steps=[selected[0], selected[0]]))._api_automation_job_post()[0], 400)
+        self.assertEqual(handler(dict(body, steps=[{}]))._api_automation_job_post()[0], 400)
+        self.assertEqual(handler(dict(body, steps=[True]))._api_automation_job_post()[0], 400)
+        self.assertEqual(handler(dict(body, steps=["unlisted"]))._api_automation_job_post()[0], 400)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            calls = [pool.submit(handler(body)._api_automation_job_post) for _ in range(2)]
+            replies = [call.result(timeout=7) for call in calls]
+        self.assertEqual(sorted(code for code, _ in replies), [200, 202])
+        job_id = replies[0][1]["job"]["id"]
+        self.assertEqual(replies[1][1]["job"]["id"], job_id)
+        self.assertEqual(list(scope["_automation_jobs"]), [job_id])
+        worker.return_value.start.assert_called_once()
+        code, reused = handler(body)._api_automation_job_post()
+        self.assertEqual((code, reused["reused"], reused["job"]["id"]), (200, True, job_id))
+        missing_reader = object.__new__(scope["Handler"])
+        missing_reader.path = "/api/automation/jobs"
+        missing_reader.headers = {"Idempotency-Key": ""}
+        missing_reader._deny = lambda code, message: (code, message)
+        self.assertEqual(missing_reader.do_GET()[0], 400)
+        class HeaderMap(dict):
+            def get(self, name, default=None):
+                return super().get(name.lower(), default)
+        reader = object.__new__(scope["Handler"])
+        reader.path = "/api/automation/jobs"
+        reader.headers = HeaderMap({"idempotency-key": "offline"})
+        reader._send_json = lambda code, data: (code, data)
+        reader._deny = lambda code, message: (code, message)
+        response = reader.do_GET()
+        self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["job"]["id"], job_id)
+        job = scope["_automation_jobs"][job_id]
+        job["steps"][0]["result"] = {"private": "synthetic-only"}
+        code, public = handler()._api_automation_job_get(job_id)
+        self.assertEqual(code, 200)
+        self.assertNotIn("idempotency_key", public["job"])
+        self.assertNotIn("result", public["job"]["steps"][0])
+        self.assertEqual(handler()._api_automation_job_post(job_id, selected[0])[0], 409)
+        job.update(status="failed")
+        job["steps"][0].update(status="failed", retryable=True)
+        self.assertEqual(handler()._api_automation_job_post(job_id, selected[0])[0], 202)
+        self.assertEqual(job["steps"][0]["status"], "queued")
+        with self.subTest("a failed scheduler submission is not accepted"):
+            scope["_automation_call_step"] = lambda step: {"ok": False, "submitted": True}
+            scope["_automation_run_step"](job_id, 1)
+            self.assertEqual(job["steps"][1]["status"], "failed")
+            self.assertFalse(job["steps"][1]["retryable"])
+
     def test_dashboard_offline(self):
         import subprocess
         # Run the actual inline script with a synthetic DOM, transport and clock.
@@ -2069,10 +2160,12 @@ function element(id=''){
   const classes=new Set(id==='usage-statview'?['hidden']:[]);
   return {id,value:id==='usage-pagesize'?'10':'',textContent:'',innerHTML:'',style:{},dataset:{},options:[{text:'全部'}],
     classList:{contains:k=>classes.has(k),add:k=>classes.add(k),remove:k=>classes.delete(k),toggle(k,on){if(on)classes.add(k);else classes.delete(k);}},
-    addEventListener(){},setAttribute(){},prepend(){},querySelector(){return null;},querySelectorAll(){return []}};
+    addEventListener(){},setAttribute(k,v){this.attrs=this.attrs||{};this.attrs[k]=v;this[k]=v;},removeAttribute(k){if(this.attrs)delete this.attrs[k];delete this[k];},focus(){},showModal(){this.open=true;},close(){this.open=false;},open:false,attrs:{},
+    prepend(){},querySelector(){return null;},querySelectorAll(){return []}};
 }
 function el(id){if(!elements.has(id))elements.set(id,element(id));return elements.get(id);}
 const navs=['overview','models'].map(v=>{const e=element();e.dataset.view=v;return e;});
+const usageTabs=['records','stats'].map((v,i)=>{const e=element();e.dataset.utab=v;e.attrs={'aria-selected':String(i===0)};e.getAttribute=k=>e.attrs[k];return e;});
 const views=['overview','models'].map(v=>el('view-'+v));
 const copyButtons=[...html.matchAll(/data-media-copy="([^"]+)"/g)].map(m=>{
  const button=element();button.dataset.mediaCopy=m[1];
@@ -2086,7 +2179,7 @@ navs[0].classList.add('active');views[0].classList.add('active');
 const store=new Map(), scheduledTimers=[];
 let fetchImpl=async()=>({ok:true,status:200,json:async()=>({})});
 const context=vm.createContext({console,Map,Set,Date,Promise,JSON,Number,String,Math,Array,Object,Error,AbortController,
- document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:s==='[data-media-copy]'?copyButtons:[],querySelector:()=>null,
+ document:{getElementById:el,createElement:()=>element(),querySelectorAll:s=>s==='.nav'?navs:s==='.view'?views:s==='.usage-tab'?usageTabs:s==='[data-media-copy]'?copyButtons:[],querySelector:()=>null,
    documentElement:{attrs:{},setAttribute(k,v){this.attrs[k]=v;}}},
  localStorage:{getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)},
  fetch:(...a)=>fetchImpl(...a),setInterval:()=>1,clearInterval(){},setTimeout:(fn,ms)=>{scheduledTimers.push({fn,ms});return scheduledTimers.length;},clearTimeout(){},
@@ -2145,11 +2238,49 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.match(el('platform-list').innerHTML,/Qoder/);
  assert.match(el('platform-list').innerHTML,/未运行/);
  assert.match(el('platform-list').innerHTML,/网关托管/);
- await run("togglePlatform('qoder',true)");
- assert.equal(platformPosts.length,1);
- assert.equal(platformPosts[0].name,'qoder');
- assert.equal(platformPosts[0].enabled,true);
- // CSV quoting covers CR/LF, commas and quotes exactly as CSV requires.
+	 await run("togglePlatform('qoder',true)");
+	 assert.equal(platformPosts.length,1);
+	 assert.equal(platformPosts[0].name,'qoder');
+	 assert.equal(platformPosts[0].enabled,true);
+	 const fakeToggle=run("globalThis.__fakeToggle={checked:false,disabled:false,isConnected:true}");
+	 run('confirmAction=async()=>false');
+	 await run("togglePlatform('qoder',false,__fakeToggle)");
+	 assert.equal(platformPosts.length,1,'cancel must not post platform disable');
+	 assert.equal(run('__fakeToggle.checked'),true,'cancel restores the route toggle');
+	 run('confirmAction=async()=>true');
+	 fetchImpl=async (p,opt)=>{
+	   if(p==='/api/platforms'&&opt&&opt.method==='POST'){
+	     platformPosts.push(JSON.parse(opt.body));
+	     return reply({ok:true,process_ok:false,warning:'safe stop unavailable',process:{ok:false,error:'busy'}});
+	   }
+	   if(p==='/api/platforms') return reply({ok:true,platforms:[
+	     {name:'qoder',enabled:false,launch_configured:false,warning:'safe stop unavailable',process:{managed:false,running:false,state:'unknown'}}]});
+	   return reply({});
+	 };
+	 await run("togglePlatform('qoder',false,__fakeToggle)");
+	 assert.equal(platformPosts.length,2);
+	 assert.equal(platformPosts[1].enabled,false);
+	 assert.match(el('platform-list').innerHTML,/safe stop unavailable/,'failed stop is retained inline');
+	 // Media catalog shares the authoritative hidden set with chat models.
+	 run("confirmAction=async()=>true;MEDIA={items:[{id:'workbuddy/image-one',model:'image-one',name:'Image One',platform:'workbuddy',kind:'image',tags:['text-to-image'],realms:['cn'],hidden:false}],hidden:[],errors:{}};MEDIA_UNDO=[];MEDIA_SELECTED.clear();renderMedia()");
+	 assert.match(el('media-models').innerHTML,/workbuddy\/image-one/);
+	 fetchImpl=async(p,opt)=>p==='/api/models/visibility'
+	   ?reply({ok:true,hidden:['workbuddy/image-one']}):reply({});
+	 await run("setMediaVisible('workbuddy/image-one',false,null)");
+	 assert.deepEqual(Array.from(run('MEDIA.hidden')),['workbuddy/image-one']);
+	 assert.deepEqual(Array.from(run('MEDIA_UNDO')),['workbuddy/image-one']);
+	 assert.match(el('media-action-result').textContent,/撤销/);
+	 run("document.getElementById('media-visfilter').value='hidden';renderMedia()");
+	 assert.match(el('media-models').innerHTML,/已隐藏/);
+	 assert.equal(el('btn-media-hidden').classList.contains('hidden'),false);
+	 fetchImpl=async(p,opt)=>p==='/api/models/visibility'
+	   ?reply({ok:true,hidden:[]}):reply({});
+	 await run("document.getElementById('btn-media-undo').onclick()");
+	 assert.deepEqual(Array.from(run('MEDIA.hidden')),[]);
+	 assert.deepEqual(Array.from(run('MEDIA_UNDO')),[]);
+	 assert.match(el('media-action-result').textContent,/已恢复显示/);
+	 // CSV quoting covers CR/LF, commas and quotes exactly as CSV requires.
+
  const cr=run('csvCell(String.fromCharCode(65,13,66))');assert.equal(cr.length,5);assert.equal(cr.charCodeAt(0),34);assert.equal(cr.charCodeAt(2),13);assert.equal(cr.charCodeAt(4),34);
  const lf=run('csvCell(String.fromCharCode(65,10,66))');assert.equal(lf.length,5);assert.equal(lf.charCodeAt(2),10);
  assert.equal(run('csvCell("A,B")'),'"A,B"');
@@ -2242,10 +2373,44 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.equal(run("balanceSummary([{enabled:true,remain:0}]).value"),0);
  run("renderUsageStats([{credit:0}])");assert.match(el('usage-stats').innerHTML,/0\.00/);
  run("pushHistory('partial',{ok:false,partial:true},'detail','');pushHistory('skip','skipped','detail','')");
- assert.match(el('task-history').innerHTML,/部分失败/);assert.match(el('task-history').innerHTML,/已跳过/);
- assert.equal(run('TASK_HISTORY[0].state'),'skipped');assert.equal(run('TASK_HISTORY[1].state'),'partial');
- // Media page renders both kinds and switches the form between image/video.
- run("MEDIA={items:[{id:'workbuddy/hunyuan-image-v3.0-art',model:'hunyuan-image-v3.0-art',name:'Hunyuan',kind:'image',tags:['text-to-image'],realms:['cn'],credit_per_image:6,image_measured:false,hidden:false},{id:'workbuddy/kling-video-v3',model:'kling-video-v3',name:'Kling',kind:'video',tags:['text-to-video'],realms:['cn','intl'],credits_per_second:{'720P':10},hidden:false}],errors:{}};renderMedia()");
+	 assert.match(el('task-history').innerHTML,/部分失败/);assert.match(el('task-history').innerHTML,/已跳过/);
+	 assert.equal(run("localStorage.getItem('gh_task_history_v1')!==null"),true);
+	 assert.ok(JSON.parse(run("localStorage.getItem('gh_task_history_v1')")).length<=20);
+	 assert.equal(run('TASK_HISTORY.some(h=>Object.hasOwn(h,"detail"))'),false);
+	 run("USAGE={rows:[{at:1,platform:'trae',model:'m',prompt:1,completion:1,total:2,cached:null}],generated_at:'2026-11-20T10:00:00+0000',requested_limit:500,returned:500,truncated:true,coverage:{trae:{all:{ok:true,rows:500}}},failure_coverage:{complete:false,note:'Trae 上游仅记录成功请求'},errors:{}};renderUsage()");
+	 assert.match(el('usage-coverage').textContent,/最多 500 条/);
+	 assert.match(el('usage-coverage').textContent,/已截断/);
+	 assert.match(el('usage-coverage').textContent,/成功请求/);
+	 assert.equal(el('usage-records').attrs['aria-hidden'],'false');
+	 assert.equal(el('usage-statview').attrs['aria-hidden'],'true');
+	 run("selectUsageTab(usageTabs[1])");
+	 assert.equal(el('usage-records').attrs['aria-hidden'],'true');
+	 assert.equal(el('usage-statview').attrs['aria-hidden'],'false');
+	 const plan={version:'offline-v1',steps:[{step_id:'workbuddy.checkin',label:'WorkBuddy · 签到',kind:'checkin',platform:'workbuddy',supported:true,dynamic:true},{step_id:'qwenwork.auto-credit',label:'千问办公 · 上游自动发放',kind:'skip',platform:'qwenwork',supported:false,skip_reason:'每日积分由上游自动发放'}]};
+	 let automationPosts=[];
+	 fetchImpl=async(p,opt)=>{
+	   if(p==='/api/automation/plan') return reply({ok:true,...plan});
+	   if(p==='/api/automation/jobs'&&opt?.method==='POST'){
+	     const body=JSON.parse(opt.body);automationPosts.push(body);
+	     return reply({ok:true,job:{id:'job-offline',status:'succeeded',completed:2,counts:{succeeded:1,skipped:1,failed:0,partial:0,unknown:0,submitted:0},steps:[{step_id:'workbuddy.checkin',label:'WorkBuddy · 签到',status:'succeeded',summary:'已执行'},{step_id:'qwenwork.auto-credit',label:'千问办公 · 上游自动发放',status:'skipped',summary:'每日积分由上游自动发放'}]}});
+	   }
+	   return reply({ok:true});
+	 };
+	 run('confirmAction=async()=>true;loadAuto=async()=>true;loadStatus=async()=>true;loadTasksStatus=async()=>true');
+	 await run('loadAutomationPlan()');
+	 assert.equal(run('AUTOMATION_PLAN.version'),'offline-v1');
+	 await run('startAutomationJob(null,undefined,false)');
+	 assert.equal(automationPosts.length,1);
+	 assert.equal(automationPosts[0].plan_version,'offline-v1');
+	 assert.ok(automationPosts[0].idempotency_key);
+	 assert.deepEqual(automationPosts[0].steps,['workbuddy.checkin','qwenwork.auto-credit']);
+	 assert.match(el('automation-job-status').textContent,/已完成/);
+	 assert.equal(store.get('gh_automation_job_id_v1'),'job-offline');
+	 assert.equal(JSON.parse(store.get('gh_task_history_v1'))[0].jobId,'job-offline');
+	 // Media page renders both kinds and switches the form between image/video.
+
+	 run("document.getElementById('media-visfilter').value='visible';MEDIA={items:[{id:'workbuddy/hunyuan-image-v3.0-art',model:'hunyuan-image-v3.0-art',name:'Hunyuan',kind:'image',tags:['text-to-image'],realms:['cn'],credit_per_image:6,image_measured:false,hidden:false},{id:'workbuddy/kling-video-v3',model:'kling-video-v3',name:'Kling',kind:'video',tags:['text-to-video'],realms:['cn','intl'],credits_per_second:{'720P':10},hidden:false}],errors:{},hidden:[]};renderMedia()");
+
  assert.match(el('media-models').innerHTML,/hunyuan-image-v3\.0-art/);
  assert.match(el('media-models').innerHTML,/积分\/张/);
  assert.match(el('media-models').innerHTML,/积分\/秒/);
@@ -2273,7 +2438,8 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.equal(run("DAILY_STEPS.some(s=>s.platform==='trae'&&s.kind==='checkin')"),true);
  assert.equal(html.includes('data-engine-link="trae"'),true);
  assert.equal(html.includes('id="trae-start"'),true);
- assert.equal(html.split('<option value="trae">Trae</option>').length-1,2);
+  assert.equal(html.split('<option value="trae">Trae</option>').length-1,3);
+
  // Navigation paints immediately even when requests never settle.
  fetchImpl=()=>new Promise(()=>{});navs[1].onclick();
  assert.equal(views[1].classList.contains('active'),true);
@@ -2295,10 +2461,10 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.match(el('gw-update-info').innerHTML,/v1\.10\.0/);
  assert.match(el('gw-update-info').innerHTML,/v1\.11\.0/);
  assert.equal(el('btn-gw-update-deploy').disabled,false);
- run("globalThis.confirm=()=>false");
- await el('btn-gw-update-deploy').onclick();
- assert.equal(gwPosts.length,0);
- run("globalThis.confirm=()=>true");
+	 run("confirmAction=async()=>false");
+	 await el('btn-gw-update-deploy').onclick();
+	 assert.equal(gwPosts.length,0);
+	 run("confirmAction=async()=>true");
  fetchImpl=gwFetch({status:'preflight',version:'1.11.0'});
  await el('btn-gw-update-deploy').onclick();
  await new Promise(resolve=>setImmediate(resolve));
