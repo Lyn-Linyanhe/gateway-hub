@@ -122,9 +122,11 @@ input,select{font:inherit;color:var(--fg)}
 .realmmeta{font-size:12px;color:var(--dim)}
 
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:16px}
+.kpis.kpis-compact{grid-template-columns:minmax(0,360px)}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px 20px}
 .kpi .label{font-size:12px;color:var(--dim);margin-bottom:6px}
 .kpi .num{font-size:26px;font-weight:800;letter-spacing:-.5px}
+.kpi .num .of{font-size:13px;font-weight:500;color:var(--dim2);letter-spacing:0}
 .kpi .num.green{color:var(--green)}.kpi .num.orange{color:var(--orange)}.kpi .num.indigo{color:var(--accent)}
 .kpi .note{font-size:11px;color:var(--dim2);margin-top:4px}
 /* 用量「按模型汇总」的 token 占比条 */
@@ -209,10 +211,7 @@ a,.nav.active,.pill.indigo{color:var(--accent-text)}
 .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 .mobile-nav{display:none}
 .card h2,.section-title{font-size:16px;margin-bottom:8px}
-.attention-list{list-style:none;display:grid;gap:8px}
-.attention-list li{display:flex;flex-wrap:wrap;gap:6px 14px}
-.attention-list a{text-decoration:underline;min-width:120px}
-.attention-list span,.section-help,.expiry-notes,.status-line{color:var(--dim);overflow-wrap:anywhere}
+.section-help,.expiry-notes,.status-line{color:var(--dim);overflow-wrap:anywhere}
 .section-help{font-size:12px;margin:8px 0 12px}
 .section-help summary,.usage-filters summary{cursor:pointer}
 .section-help p{margin-top:6px}
@@ -305,21 +304,9 @@ a,.nav.active,.pill.indigo{color:var(--accent-text)}
   <div id="view-overview" class="view active">
     <div class="pagerow"><div><h1 class="pagetitle" tabindex="-1">总览</h1><div class="pagesub">查看平台状态、临期积分和最近请求。</div></div>
       <div class="grow"></div><button class="btn sec mini" id="btn-refresh-top">刷新数据</button></div>
-    <div class="kpis">
-      <div class="kpi"><div class="label">已启用平台在线</div><div class="num" id="overview-online-count">—</div><div class="note">在线 / 已启用</div></div>
-      <div class="kpi"><div class="label">已读取账号</div><div class="num" id="overview-account-count">—</div><div class="note">已启用平台 · 含停用账号</div></div>
-      <div class="kpi"><div class="label">样本中的失败</div><div class="num" id="overview-failure-count">—</div><div class="note" id="overview-failure-summary" role="status">等待最近请求样本</div></div>
-      <div class="kpi"><div class="label">已知临期积分包</div><div class="num" id="overview-expiry-count">—</div><div class="note">未来 14 天 · 未知到期不计</div></div>
+    <div class="kpis kpis-compact">
+      <div class="kpi"><div class="label">平台与账号</div><div class="num"><span id="overview-online-count">—</span><span class="of" style="margin-left:6px">平台在线</span></div><div class="note" id="overview-account-count">等待状态数据</div></div>
     </div>
-    <section class="card" aria-labelledby="overview-attention-title">
-      <h2 id="overview-attention-title">需要关注</h2>
-      <ul class="attention-list">
-        <li><a href="#overview-platforms">平台与账号</a><span id="overview-platform-summary">等待状态数据</span></li>
-        <li><a href="#overview-expiring">未来 14 天到期</a><span id="overview-expiry-summary">等待积分数据</span></li>
-        <li><a href="#overview-recent">最近请求</a><span id="overview-request-summary">等待请求记录</span></li>
-      </ul>
-    <div class="status-line" id="overview-generated-at" role="status"></div>
-  </section>
     <section id="overview-platforms" aria-labelledby="overview-platforms-title">
       <h2 id="overview-platforms-title" class="section-title" tabindex="-1">平台状态</h2>
       <div class="grid3" id="realm-cards"></div>
@@ -344,7 +331,7 @@ a,.nav.active,.pill.indigo{color:var(--accent-text)}
       <div class="sub" id="overview-estimate-note" style="margin-top:8px"></div>
     </section>
     <section class="card" id="overview-recent" aria-labelledby="overview-recent-title">
-      <h2 id="overview-recent-title" tabindex="-1">最近请求 <span class="sub">全平台合并 · 最新 10 条</span></h2>
+      <h2 id="overview-recent-title" tabindex="-1">最近请求 <span class="sub">全平台合并 · 最新 10 条 · 上游失败记录覆盖不完整</span></h2>
       <div id="recent-errors" class="sub" style="margin-top:6px"></div>
       <div class="tblwrap" tabindex="0" role="region" aria-label="最近请求表" style="margin-top:10px">
         <table><caption class="sr-only">最近 10 条请求记录</caption><thead><tr><th scope="col">时间</th><th scope="col">平台</th><th scope="col">模型</th><th scope="col">账号</th><th scope="col" class="num">总 TOKEN</th><th scope="col" class="num">积分</th><th scope="col" class="num">耗时</th><th scope="col">结果</th></tr></thead>
@@ -2004,17 +1991,6 @@ function balanceSummary(accounts){
 function renderOverview(d){
   const platforms=d.platforms||[], expiring=d.expiring||[];
   renderExpiring(expiring,platforms);
-  const attention=platforms.filter(p=>!p.health||p.error||p.credits_error||(p.accounts||[]).some(a=>a.identity_mismatch));
-  document.getElementById('overview-platform-summary').textContent=attention.length
-    ? attention.map(p=>`${PLATFORM_LABEL[p.name]||p.name} · ${!p.health?'离线':(p.error||p.credits_error?'读取不完整':'账号身份异常')}`).join('、')
-    : (platforms.length?'未发现异常':'未启用平台');
-  const upcoming=expiring.filter(row=>knownNumber(row.days_left)!==null&&row.days_left>0&&row.days_left<=14);
-  document.getElementById('overview-expiry-summary').textContent=upcoming.length
-    ? `${upcoming.length} 个积分包` : '暂无已知在 14 天内到期的积分包';
-  const stamp=document.getElementById('overview-generated-at');
-  const at=d.generated_at||platforms.map(p=>p.observed_at).filter(Boolean).sort().slice(-1)[0];
-  const incomplete=platforms.some(p=>!p.health||p.error||p.credits_error||p.data_state==='partial'||p.balance_state==='partial'||p.expiry_state==='error');
-  stamp.textContent=(at?`状态数据更新时间：${at}`:'状态更新时间未知')+(incomplete?' · 数据不完整':'');
   const cards=platforms.map(p=>{
     // 只算启用账号：停用账号不参与调度，且千问的两个账号可能读同一钱包
     const balance=balanceSummary(p.accounts), rem=balance.value;
@@ -2035,8 +2011,7 @@ function renderOverview(d){
   }).join('');
   document.getElementById('realm-cards').innerHTML=cards;
   document.getElementById('overview-online-count').textContent=`${d.kpi.platforms_ok} / ${d.kpi.platforms_total}`;
-  document.getElementById('overview-account-count').textContent=d.kpi.accounts;
-  document.getElementById('overview-expiry-count').textContent=upcoming.length;
+  document.getElementById('overview-account-count').textContent=`${d.kpi.accounts} 个账号 · 已启用平台（含停用账号）`;
 }
 let ACC_PLATFORMS=null;                 // 账号页最近一次数据：切换区域筛选时复用，不重新请求
 const REALM_LABEL={cn:'国内版',intl:'国际版'};
@@ -3614,8 +3589,6 @@ async function loadOverview(force=false){
       return true;
     }).catch(e=>{
       if(request!==RECENT_REQUEST) return true;
-      document.getElementById('overview-request-summary').textContent=RECENT_DATA?'本次读取失败 · 保留上次请求样本':'请求样本读取失败';
-      document.getElementById('overview-failure-summary').textContent=RECENT_DATA?'本次读取失败 · 数字来自上次样本':'本次读取失败 · 失败数未知';
       return viewFailure('overview',e);
     })
   ]);
@@ -3624,13 +3597,6 @@ async function loadOverview(force=false){
 function renderRecent(d){
     const rows=(d.rows||[]).slice(0,10);
     const errors=d.errors||{};
-    const failed=rows.filter(row=>isBad(row.outcome)).length;
-    const sample=rows.length?`最近样本 ${rows.length} 条中记录 ${failed} 条失败`:'没有可显示的请求样本';
-    document.getElementById('overview-failure-count').textContent=rows.length?failed:'—';
-    document.getElementById('overview-failure-summary').textContent=
-      `${sample} · 失败记录覆盖不完整${d.generated_at?' · '+d.generated_at:''}`;
-    document.getElementById('overview-request-summary').textContent=sample
-      +(Object.keys(errors).length?' · 部分平台读取失败':'');
     document.getElementById('recent-errors').textContent=Object.keys(errors).length
       ?'部分平台读取失败: '+Object.entries(errors).map(([p,e])=>(PLATFORM_LABEL[p]||p)+': '+e).join(' · '):'';
     document.getElementById('recent-body').innerHTML=rows.length?rows.map(r=>{
