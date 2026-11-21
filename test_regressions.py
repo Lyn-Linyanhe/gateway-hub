@@ -2057,6 +2057,97 @@ class GatewayTests(unittest.TestCase):
         obj._relay_json.assert_called_once()
         self.assertEqual(obj._relay_json.call_args.args[0], 200)
 
+    def test_wb_stops_after_success_or_nonretryable_response(self):
+        import contextlib
+        from unittest.mock import Mock
+
+        for path in ('/v1/chat/completions', '/v1/responses', '/v1/messages'):
+            for status in (200, 204, 400, 401, 403, 404, 422):
+                with self.subTest(path=path, status=status):
+                    headers = {'Content-Type': 'application/json'}
+                    first, second = b'{"source":"cn"}', b'{"source":"intl"}'
+                    forward = Mock(side_effect=[(status, headers, first), (200, headers, second)])
+                    fail, success, sticky = Mock(), Mock(), Mock()
+                    self.ns.update(
+                        resolve_model=lambda _: ({'name': 'workbuddy'}, 'm', 'workbuddy/m', None),
+                        _wb_plan=lambda *_: {'order': ['cn', 'intl'], 'key': 'k'},
+                        forward=forward, _platform_inflight=lambda _: contextlib.nullcontext(),
+                        _wb_health_fail=fail, _wb_health_success=success,
+                        _wb_sticky_set=sticky, _wb_sticky_clear=Mock(),
+                        _wb_retryable=lambda status, body: status == 429,
+                        _wb_retry_after=lambda _: 30, _wb_log_route=Mock())
+                    handler = self.post(path, b'{"model":"workbuddy/m","messages":[]}')
+                    handler._relay_json = Mock()
+                    handler.do_POST()
+                    forward.assert_called_once()
+                    self.assertEqual(forward.call_args.args[4]['X-Realm'], 'cn')
+                    handler._relay_json.assert_called_once_with(status, headers, first, 'workbuddy/m')
+                    fail.assert_not_called()
+                    if status < 400:
+                        success.assert_called_once_with('cn')
+                        sticky.assert_called_once_with('k', 'cn')
+                    else:
+                        success.assert_not_called()
+                        sticky.assert_not_called()
+
+    def test_inflight_covers_response_writes_and_stream_cleanup(self):
+        import contextlib
+        from unittest.mock import Mock
+
+        counts = {}
+        scope = isolated(ROOT / 'router.py', {'_platform_inflight'}, {
+            'contextlib': contextlib, 'threading': threading,
+            '_inflight_lock': threading.Lock(), '_inflight': counts})
+        for platform in ('workbuddy', 'qoder'):
+            for stream, outcome in ((False, 'complete'), (False, 'disconnect'),
+                                    (True, 'complete'), (True, 'disconnect'),
+                                    (True, 'upstream-error')):
+                with self.subTest(platform=platform, stream=stream, outcome=outcome):
+                    closed = []
+
+                    def chunks():
+                        try:
+                            self.assertEqual(counts[platform], 1)
+                            yield b'data: {"model":"m"}\n\n'
+                            self.assertEqual(counts[platform], 1)
+                            if outcome == 'upstream-error':
+                                raise TimeoutError('synthetic stream timeout')
+                            yield b'data: [DONE]\n\n'
+                        finally:
+                            closed.append(counts[platform])
+
+                    def forward(*args):
+                        self.assertEqual(counts[platform], 1)
+                        return 200, {'Content-Type': 'text/event-stream' if stream else 'application/json'}, (
+                            chunks() if stream else b'{"model":"m"}')
+
+                    def write(data):
+                        self.assertEqual(counts[platform], 1)
+                        if outcome == 'disconnect':
+                            raise BrokenPipeError('synthetic client disconnect')
+                        return len(data)
+
+                    self.ns.update(
+                        resolve_model=lambda _: ({'name': platform}, 'm', platform + '/m', None),
+                        _platform_inflight=scope['_platform_inflight'], forward=Mock(side_effect=forward),
+                        _wb_plan=lambda *_: {'order': ['cn', 'intl'], 'key': 'k'},
+                        _wb_health_success=Mock(), _wb_sticky_set=Mock(),
+                        _wb_retryable=lambda *_: False, _wb_log_route=Mock())
+                    handler = self.post('/v1/chat/completions', json.dumps({
+                        'model': platform + '/m', 'messages': [], 'stream': stream}).encode())
+                    handler.send_response = Mock()
+                    handler.send_header = Mock()
+                    handler.end_headers = Mock()
+                    handler.wfile = Mock(write=Mock(side_effect=write))
+                    if not stream and outcome == 'disconnect':
+                        with self.assertRaises(BrokenPipeError):
+                            handler.do_POST()
+                    else:
+                        handler.do_POST()
+                    self.ns['forward'].assert_called_once()
+                    self.assertEqual(counts[platform], 0)
+                    self.assertEqual(closed, [1] if stream else [])
+
     def test_automation_job_concurrent_reuse_and_retry_boundary(self):
         from concurrent.futures import ThreadPoolExecutor
         from types import SimpleNamespace

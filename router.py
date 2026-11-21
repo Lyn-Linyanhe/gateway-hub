@@ -4330,22 +4330,23 @@ class Handler(BaseHTTPRequestHandler):
                         # 400/401/404/内容拒绝：请求本身的问题，不惩罚区域、不换区。
                         _wb_log_route(rid, model, wb_plan, attempt_no, realm,
                                       status=status, outcome="client-error")
+                break
 
-        # HTTP 200 + 上游 request id 允许把唯一账单标题和请求日志配对，
-        # 流式请求也通过响应头获取 id；无 id 时宁可保持待测。
-        if raccoon_bill_link and up["name"] == "raccoon" and status < 300:
-            response_id = _raccoon_response_id(status, resp_headers, result)
-            if response_id:
-                _record_raccoon_billing_link(
-                    response_id, raccoon_bill_link["marker"],
-                    raccoon_bill_link["model"], raccoon_bill_link["at"])
-        # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
-        if stream and not isinstance(result, (bytes, bytearray)):
-            return self._relay_stream(status, resp_headers, result, client_facing, up,
-                                      t0=t0, t_head=time.time(), label=model,
-                                      t_parse=t_parse, t_payload=t_payload,
-                                      t_route=t_route)
-        return self._relay_json(status, resp_headers, result, client_facing)
+            # HTTP 200 + 上游 request id 允许把唯一账单标题和请求日志配对，
+            # 流式请求也通过响应头获取 id；无 id 时宁可保持待测。
+            if raccoon_bill_link and up["name"] == "raccoon" and status < 300:
+                response_id = _raccoon_response_id(status, resp_headers, result)
+                if response_id:
+                    _record_raccoon_billing_link(
+                        response_id, raccoon_bill_link["marker"],
+                        raccoon_bill_link["model"], raccoon_bill_link["at"])
+            # forward 会把「客户端要流式但上游回了非流式」退化为缓冲字节
+            if stream and not isinstance(result, (bytes, bytearray)):
+                return self._relay_stream(status, resp_headers, result, client_facing, up,
+                                          t0=t0, t_head=time.time(), label=model,
+                                          t_parse=t_parse, t_payload=t_payload,
+                                          t_route=t_route)
+            return self._relay_json(status, resp_headers, result, client_facing)
 
     # ---- 转发实现 ----
 
