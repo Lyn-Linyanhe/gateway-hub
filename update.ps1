@@ -37,8 +37,9 @@ function Get-LatestRelease {
 }
 
 function Copy-CodeFiles([string]$Source) {
-    $files = @('router.py', 'dashboard.html', 'audit_platform.py', 'test_regressions.py',
-               'README.md', 'run-router.bat', 'start-buddy2api.bat', '.gitignore')
+    $files = @('router.py', 'gateway_update.py', 'dashboard.html', 'audit_platform.py',
+               'test_regressions.py', 'README.md', 'run-router.bat',
+               'start-buddy2api.bat', '.gitignore')
     $backup = Join-Path $Here ('backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
     New-Item -ItemType Directory -Path $backup | Out-Null
     foreach ($name in $files) {

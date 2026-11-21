@@ -1,6 +1,10 @@
 """Offline tests for the self-update release decision boundary."""
+import json
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -96,6 +100,92 @@ class GatewayUpdateTests(unittest.TestCase):
         self.assertEqual(subprocess.check_output(
             ["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(), old_head)
         self.assertTrue(gateway_update.repository_status(root)["clean"])
+
+
+    def test_candidate_test_commands_match_ci(self):
+        direct = gateway_update._candidate_test_command(Path("test_regressions.py"))
+        discover = gateway_update._candidate_test_command(Path("test_gateway_update.py"))
+        self.assertEqual(direct[:3], [sys.executable, "-I", "-B"])
+        self.assertEqual(direct[-1], "test_regressions.py")
+        # -I 直跑带本地 import 的脚本必然 ModuleNotFoundError；必须走 discover。
+        self.assertIn("-m", discover)
+        self.assertIn("unittest", discover)
+        self.assertEqual(discover[-1], "test_gateway_update.py")
+
+    def test_run_candidate_tests_passes_in_minimal_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            (stage / "test_gateway_update.py").write_text(
+                "import unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        self.assertTrue(True)\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n", encoding="utf-8")
+            gateway_update._run_candidate_tests(stage)
+
+    def test_run_candidate_tests_reports_failure_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            (stage / "test_gateway_update.py").write_text(
+                "import unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_bad(self):\n"
+                "        self.fail('synthetic candidate failure')\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n", encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                gateway_update._run_candidate_tests(stage)
+            self.assertIn("test_gateway_update.py did not pass", str(ctx.exception))
+            self.assertIn("synthetic candidate failure", str(ctx.exception))
+
+    def test_pid_alive_distinguishes_living_and_dead_processes(self):
+        if sys.platform != "win32":
+            self.skipTest("os.kill(pid, 0) is reliable liveness on POSIX")
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        try:
+            time.sleep(0.4)
+            self.assertTrue(gateway_update._pid_alive(proc.pid))
+        finally:
+            proc.kill()
+            proc.wait()
+        deadline = time.time() + 3
+        while gateway_update._pid_alive(proc.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(gateway_update._pid_alive(proc.pid),
+                         "os.kill(pid, 0) reports dead Windows processes as alive")
+
+    def test_stop_listeners_kills_port_owner(self):
+        if sys.platform != "win32":
+            self.skipTest("Windows-only listener kill path")
+        script = ("import socket,time\n"
+                  "s=socket.socket()\ns.bind(('127.0.0.1',18801))\ns.listen(1)\n"
+                  "print('LISTENING', flush=True)\ntime.sleep(30)\n")
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0)
+        proc = subprocess.Popen(
+            [sys.executable.replace("python.exe", "pythonw.exe"), "-c", script],
+            creationflags=flags)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.1)
+            # 临时把健康端口指向实验端口，复用同一条强杀路径。
+            root = Path(tempfile.mkdtemp(prefix="gw-stop-listener-"))
+            try:
+                (root / "config.json").write_text(
+                    json.dumps({"listen_port": 18801}), encoding="utf-8")
+                gateway_update._stop_listeners(root)
+                self.assertFalse(
+                    gateway_update._pid_alive(proc.pid),
+                    "listener on the health port must be killed for rollback")
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
 
 if __name__ == "__main__":

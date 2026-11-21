@@ -1,4 +1,5 @@
 """Safely check and deploy the official Gateway Hub stable GitHub Release."""
+import ctypes
 import json
 import os
 import re
@@ -199,6 +200,31 @@ def _extract_git_archive(root, commit, destination):
                 shutil.copyfileobj(source, output)
 
 
+def _candidate_test_command(script):
+    """候选目录里跑离线回归的命令。
+
+    -I 隔离模式下脚本目录不在 sys.path：带本地 import 的测试脚本必须走
+    unittest discover（与 CI/README 相同口径），否则 import gateway_update
+    必然 ModuleNotFoundError，一键自更新在预检阶段 100% 失败。
+    """
+    name = Path(script).name
+    if name == "test_gateway_update.py":
+        return [sys.executable, "-I", "-B", "-m", "unittest", "discover",
+                "-p", name]
+    return [sys.executable, "-I", "-B", name]
+
+
+def _run_candidate_tests(stage):
+    for script in ("test_regressions.py", "test_gateway_update.py"):
+        path = Path(stage) / script
+        if path.is_file():
+            test = subprocess.run(_candidate_test_command(path), cwd=str(stage),
+                                  capture_output=True, text=True, timeout=600)
+            if test.returncode:
+                tail = "\n".join((test.stderr or test.stdout or "").splitlines()[-6:])
+                raise ValueError(f"candidate {script} did not pass" + (f": {tail}" if tail else ""))
+
+
 def _check_candidate(stage, version):
     stage = Path(stage)
     router = stage / "router.py"
@@ -215,13 +241,7 @@ def _check_candidate(stage, version):
     if example.get("api_key") or any(row.get("panel_password") == "admin"
                                       for row in example.get("upstreams", [])):
         raise ValueError("candidate example config contains an unsafe default credential")
-    for script in ("test_regressions.py", "test_gateway_update.py"):
-        path = stage / script
-        if path.is_file():
-            test = subprocess.run([sys.executable, "-I", "-B", str(path)], cwd=str(stage),
-                                  capture_output=True, text=True, timeout=180)
-            if test.returncode:
-                raise ValueError(f"candidate {script} did not pass")
+    _run_candidate_tests(stage)
 
 
 def prepare_release(root, latest):
@@ -242,9 +262,29 @@ def prepare_release(root, latest):
     return {"tag": tag, "version": version, "commit": commit, "previous_commit": old_head}
 
 
+_STILL_ACTIVE = 0x00000103
+
+
 def _pid_alive(pid):
+    pid = int(pid)
+    if os.name == "nt":
+        # os.kill(pid, 0) 在 Windows 走 GenerateConsoleCtrlEvent(CTRL_C_EVENT)，
+        # 只反映"能否发控制台事件"，不反映进程是否存在——实测对已退出进程
+        # 仍返回成功。探活必须走 OpenProcess + GetExitCodeProcess。
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
         return True
     except OSError:
         return False
@@ -394,6 +434,32 @@ def _wait_gateway_health(root, timeout=30):
     return False
 
 
+def _stop_listeners(root):
+    """强杀占用健康端口的监听进程（回滚时清掉占着端口的新版网关）。"""
+    port = _health_port(root)
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-NetTCPConnection -State Listen -LocalPort "
+                 f"{port} | Select-Object -ExpandProperty OwningProcess -Unique"],
+                capture_output=True, text=True, timeout=20)
+        except Exception:
+            return
+        for line in (out.stdout or "").split():
+            if line.strip().isdigit():
+                try:
+                    subprocess.run(["taskkill", "/F", "/PID", line.strip()],
+                                   capture_output=True, timeout=20)
+                except Exception:
+                    pass
+        return
+    try:
+        subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=20)
+    except Exception:
+        pass
+
+
 def apply_release_after_exit(root, commit, version, parent_pid, expected_head=None):
     """Child updater: wait for gateway exit, fast-forward one verified Release, relaunch."""
     root = Path(root).resolve()
@@ -419,8 +485,17 @@ def apply_release_after_exit(root, commit, version, parent_pid, expected_head=No
         _git(root, "reset", "--keep", previous)
         _launch_gateway(root)
         raise ValueError("deployed router version did not match the selected Release; rollback attempted")
-    _launch_gateway(root)
+    proc = _launch_gateway(root)
     if not _wait_gateway_health(root, timeout=45):
+        # 新版仍占着健康端口时，旧版绑不上；先清掉监听者再回滚，
+        # 否则磁盘是旧版、内存是坏的新版，报错里的"已恢复"是假的。
+        _stop_listeners(root)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        time.sleep(1.0)  # 留给端口释放
         _git(root, "reset", "--keep", previous)
         _launch_gateway(root)
         raise RuntimeError("updated gateway failed health check; previous version was restored")
