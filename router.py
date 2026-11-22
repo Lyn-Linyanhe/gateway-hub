@@ -2218,6 +2218,14 @@ def normalize_wb(a):
         "daily_chatted_today": bool(last_dc.startswith(today)),
         "realm": a.get("realm"),
         "streak": ck.get("streak_days"),
+        # 引擎已经记录的错误标记（面板「当前禁用」的同源数据）：
+        # lastError=最近一次失败；modelCaps=6004 配额耗尽（含上游给的恢复墙钟，
+        # 跨重启成立）；disabledModels=面板手动禁用的模型。之前全被丢掉，
+        # 账号页看不到任何异常标记。
+        "last_error": (str(a.get("lastError") or "").strip()[:200] or None),
+        "cooldown_until": _known_num(a.get("cooldownUntil")),
+        "model_caps": a.get("modelCaps") if isinstance(a.get("modelCaps"), dict) else {},
+        "disabled_models": [str(m) for m in (a.get("disabledModels") or [])],
     }
 
 

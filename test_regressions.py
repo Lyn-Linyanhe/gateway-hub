@@ -379,6 +379,32 @@ class GatewayTests(unittest.TestCase):
             self.assertIsNone(normalize({})['remain'])
             self.assertEqual(normalize({'credits':{'remain':0}})['remain'],0)
 
+    def test_wb_normalize_passes_engine_error_marks(self):
+        """引擎账号行的错误标记必须透传：面板「当前禁用」的数据源同款。
+
+        引擎 /accounts 已输出 lastError/modelCaps(6004)/disabledModels/cooldownUntil，
+        但 normalize_wb 此前全部丢弃——十二月账号的 ds 配额耗尽在网关账号页
+        看不到任何标记。
+        """
+        normalize = self.ns['normalize_wb']
+        row = normalize({
+            'nickname': '十二月',
+            'lastError': 'stream limit (model throttled)',
+            'cooldownUntil': 1000.5,
+            'modelCaps': {'deepseek-v4.1-flash': {'at': 111.0, 'reset': 222.0}},
+            'disabledModels': ['hy4preview'],
+        })
+        self.assertEqual(row['last_error'], 'stream limit (model throttled)')
+        self.assertEqual(row['cooldown_until'], 1000.5)
+        self.assertEqual(row['model_caps'],
+                         {'deepseek-v4.1-flash': {'at': 111.0, 'reset': 222.0}})
+        self.assertEqual(row['disabled_models'], ['hy4preview'])
+        # 没有错误标记的账号字段保持空态，不制造假异常
+        clean = normalize({'nickname': '青'})
+        self.assertIsNone(clean['last_error'])
+        self.assertEqual(clean['model_caps'], {})
+        self.assertEqual(clean['disabled_models'], [])
+
     def test_known_pool_routes_only_to_present_accounts(self):
         self.ns.update(_wb_realm_meta=lambda:{'m':{'realms':['cn','intl'],'pro':[]}},
             _wb_pool_state=lambda:{'known':True,'realms':{'intl':{'paid':False}}})
@@ -2644,8 +2670,14 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  assert.match(el('expiring-list').innerHTML,/7 天/);        // 6.4 → ceil 7，不是 374
  assert.match(el('expiring-list').innerHTML,/375 天/);      // 374.7 → ceil 375，只出现在速度列
  assert.match(el('expiring-list').innerHTML,/12 天/);
- run("renderExpiring([])");
- assert.match(el('expiring-list').innerHTML,/暂无已知过期信息/);
+	 run("renderExpiring([])");
+	 assert.match(el('expiring-list').innerHTML,/暂无已知过期信息/);
+	 // Engine error marks surface on the account rows: 6004 cap with the
+	 // upstream reset wall clock, plus panel-disabled models.
+	 run("renderPlatforms([{name:'workbuddy',health:true,observed_at:'2026-11-22T17:00:00+0800',accounts:[{name:'十二月',uid:'dd31a37f',realm:'cn',enabled:true,remain:938,size:1000,last_error:'stream limit (model throttled)',model_caps:{'deepseek-v4.1-flash':{at:111,reset:222}},disabled_models:[]}]}])");
+	 assert.match(el('platforms').innerHTML,/配额耗尽/);
+	 assert.match(el('platforms').innerHTML,/deepseek-v4\.1-flash/);
+	 assert.match(el('platforms').innerHTML,/stream limit/);
  // Trae platform wiring: label, sidebar link, add-account card, filters, automation.
  assert.equal(run("PLATFORM_LABEL.trae"),'Trae');
  assert.equal(run("PF_COLOR.trae"),'#0dbd8b');

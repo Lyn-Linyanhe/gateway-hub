@@ -2115,7 +2115,18 @@ function renderPlatforms(platforms){
         :`<span class="bar"><i class="${pct<25?'low':''}" style="width:${pct}%"></i></span>${esc(a.pct||pct.toFixed(1)+'%')}`);
       const idw=a.identity_mismatch;
       const warn=idw?'<span class="pill orange">身份异常</span>':'';
-      const issue=(idw&&(idw.message||'客户端身份与凭证不一致'))||a.last_error||(a.account_status==='expired'?'凭证已过期，请重新登录':'');
+      // 引擎侧的错误标记（normalize_wb 透传）：6004 配额耗尽带上游恢复墙钟，
+      // disabledModels 是面板手动禁用的模型；与 last_error 一起拼进行内 issue。
+      const capNote=Object.entries(a.model_caps||{}).map(([m,v])=>{
+        const reset=v&&v.reset?new Date(Number(v.reset)*1000).toLocaleString():'';
+        return `${m} 配额耗尽${reset?` · ${reset} 恢复`:''}`;
+      }).join('；');
+      const disabledNote=(a.disabled_models||[]).length
+        ?`${(a.disabled_models||[]).join('、')} 已被面板禁用`:'';
+      const issue=[(idw&&(idw.message||'客户端身份与凭证不一致'))
+        ||a.last_error
+        ||(a.account_status==='expired'?'凭证已过期，请重新登录':''),
+        capNote, disabledNote].filter(Boolean).join('；');
       return `<tr><td class="name-cell">${esc(a.name)} ${warn}<div class="sub-cell">${esc(a.sub||'')}</div>${issue?`<div class="account-issue">${esc(issue)}</div>`:''}</td>
         <td>${realmPill(a)}</td>
         <td class="num">${creditCell}</td>
