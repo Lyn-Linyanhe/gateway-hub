@@ -628,6 +628,33 @@ def _wb_log_route(rid, model, plan, attempt, realm, status=None,
     log(" ".join(parts))
 
 
+def _raccoon_session_key(req):
+    """从小浣熊请求派生稳定的会话键（注入 X-Session-Id 头）。
+
+    xhx2api 的会话粘性优先吃显式 X-Session-Id；ZCode 不发这个头，退到引擎的
+    消息前缀指纹又因 system 每轮都变（时间戳/工作目录）而命中率只有 ~44%，
+    于是同一会话在两个账号间轮番——风控视角等于「同一段上下文在多个登录态
+    下出现」，也是二次风控的诱因之一。
+
+    会话键取「第一条 user 消息」的哈希：一次对话里 system 可能每轮都变，
+    但首问不变；新会话首问不同，自然换键。没有 user 消息的请求不派生。
+    """
+    msgs = req.get("messages")
+    if not isinstance(msgs, list):
+        return ""
+    for msg in msgs:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict))
+        text = str(content or "").strip()
+        if text:
+            return "gw-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return ""
+
+
 def _upstream_headers(up, extra=None):
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     key = (up.get("api_key") or "").strip()
@@ -4286,10 +4313,12 @@ class Handler(BaseHTTPRequestHandler):
         # 并在成功响应带回 X-Request-Id 后记录关联。Responses 路径的上游转换不保留
         # title，故不在该入口猜测账单归属。
         raccoon_bill_link = None
-        if (up["name"] == "raccoon" and path == "/v1/chat/completions"
-                and "title" not in req):
-            raccoon_bill_link = _raccoon_bill_link_for_request(upstream_model, t_parse)
-            req["title"] = raccoon_bill_link["marker"]
+        raccoon_session_key = ""
+        if up["name"] == "raccoon":
+            raccoon_session_key = _raccoon_session_key(req)
+            if path == "/v1/chat/completions" and "title" not in req:
+                raccoon_bill_link = _raccoon_bill_link_for_request(upstream_model, t_parse)
+                req["title"] = raccoon_bill_link["marker"]
 
         # 客户端视角的名字回显给客户端；上游拿真实模型名。
         req["model"] = upstream_model
@@ -4299,6 +4328,10 @@ class Handler(BaseHTTPRequestHandler):
         log(f"{path} model={model} -> {up['name']}/{upstream_model} stream={stream}")
 
         client_h = dict(self.headers.items())
+        if raccoon_session_key:
+            # 覆盖客户端可能自带的同名头：会话键由网关统一派生，保证同会话
+            # 同键。forward 只透传 x-* 白名单头，会原样到达引擎的粘性路由。
+            client_h["X-Session-Id"] = raccoon_session_key
         wb_plan = None
         rid = ""
         if up["name"] == "workbuddy":

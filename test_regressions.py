@@ -50,6 +50,7 @@ class GatewayTests(unittest.TestCase):
             "_launch_spec", "_raccoon_billing_rows", "_read_raccoon_billing_links",
             "_attach_raccoon_bills", "_record_raccoon_billing_link",
             "_raccoon_bill_link_for_request", "_raccoon_response_id",
+            "_raccoon_session_key",
             "_estimate_at", "_action_status", "_request_target",
             "_media_supports_tag", "_trae_consumption_rate", "_trae_spend_rate",
             "_trae_consumed_amount",
@@ -1452,6 +1453,45 @@ class GatewayTests(unittest.TestCase):
                     record.assert_not_called()
                 (handler._relay_stream if stream else handler._relay_json).assert_called_once()
                 (handler._relay_json if stream else handler._relay_stream).assert_not_called()
+
+    def test_raccoon_session_key_injected_as_x_session_id(self):
+        """同一会话必须粘住一个账号：网关派生稳定的 X-Session-Id。
+
+        ZCode 不发会话头，引擎的前缀指纹被 system 里的时间戳打穿（命中率 ~44%），
+        同一会话在两个账号间轮番。网关用「第一条 user 消息」派生键——system 每轮
+        都变但首问不变；覆盖客户端自带头，保证键由网关统一。
+        """
+        import contextlib
+        from unittest.mock import Mock
+
+        def run_case(first_user, system_text, client_header=None):
+            request = {'model': 'raccoon/m',
+                       'messages': [{'role': 'system', 'content': system_text},
+                                    {'role': 'user', 'content': first_user}]}
+            forward = Mock(return_value=(200, {}, b'{}'))
+            self.ns.update(resolve_model=lambda _: ({'name': 'raccoon'}, 'm', 'raccoon/m', None),
+                           forward=forward, _record_raccoon_billing_link=Mock(),
+                           _platform_inflight=lambda _: contextlib.nullcontext())
+            handler = self.post('/v1/chat/completions', json.dumps(request).encode())
+            if client_header:
+                handler.headers['X-Session-Id'] = client_header
+            handler._relay_json = Mock()
+            handler.do_POST()
+            headers = forward.call_args.args[4]
+            return headers.get('X-Session-Id') or ''
+
+        # 同一会话：system 每轮都变（时间戳/目录），首问不变 → 键稳定
+        sid_a = run_case('帮我写个爬虫', '当前时间 2026-11-22 10:00，cwd=/a')
+        sid_b = run_case('帮我写个爬虫', '当前时间 2026-11-22 10:05，cwd=/a')
+        self.assertTrue(sid_a.startswith('gw-'))
+        self.assertEqual(sid_a, sid_b, 'same conversation must keep one session key')
+        # 不同首问 → 新会话新键
+        sid_c = run_case('查一下天气', '当前时间 2026-11-22 10:00，cwd=/a')
+        self.assertNotEqual(sid_c, sid_a)
+        # 客户端自带的 X-Session-Id 被网关派生键覆盖
+        overridden = run_case('帮我写个爬虫', 'sys', client_header='client-key')
+        self.assertNotEqual(overridden, 'client-key')
+        self.assertTrue(overridden.startswith('gw-'))
 
     def test_invalid_bodies_never_dispatch(self):
         paths = ['/api/checkin/workbuddy', '/api/qwenwork/reimport',
