@@ -56,7 +56,8 @@ class GatewayTests(unittest.TestCase):
             "_media_supports_tag", "_trae_consumption_rate", "_trae_spend_rate",
             "_trae_consumed_amount",
             "_media_link_signature", "_media_download_allowed",
-            "_media_multipart_reject", "_oversized_function_names"},
+            "_media_multipart_reject", "_oversized_function_names",
+            "_parse_token_remaining"},
             {"QWEN_WALLET_HISTORY": "", "RACCOON_WALLET_HISTORY": "",
              "TRAE_WALLET_HISTORY": "", "TRAE_SPEND_HISTORY": "",
              "RACCOON_BILLING_LINKS": "",
@@ -2668,6 +2669,15 @@ class GatewayTests(unittest.TestCase):
         out = scope['_codearts_keepalive_once']()
         self.assertFalse(out['ok'])
         self.assertIn('OSError', out['error'])
+
+        # token 剩余时间解析：引擎给 "1h32m0s" 这种形状
+        parse = self.ns['_parse_token_remaining']
+        self.assertEqual(parse('1h32m0s'), 92.0)
+        self.assertEqual(parse('45m0s'), 45.0)
+        self.assertEqual(parse('30s'), 0.5)
+        self.assertEqual(parse('2h'), 120.0)
+        for bad in ('', None, 'abc', '--'):
+            self.assertIsNone(parse(bad), bad)
 
     def test_codearts_rejects_oversized_function_names(self):
         """codearts 的 function name ≤64 字符限制要在网关侧拦下。

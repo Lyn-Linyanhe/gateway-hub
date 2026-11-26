@@ -1125,16 +1125,64 @@ def _codearts_keepalive_once():
     return {"ok": True, "result": result}
 
 
+#: token 剩余低于这个分钟数才去续期。2 小时有效期的 token 每 90 分钟续一次足够，
+#: 没必要每轮询都打一次上游。
+CODECARTS_KEEPALIVE_THRESHOLD_MINUTES = 45
+
+
+def _parse_token_remaining(text):
+    """把引擎的 "1h32m0s" 解析成分钟；解析不了返回 None。"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    total = 0
+    matched = False
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", text):
+        matched = True
+        total += float(value) * {"h": 60.0, "m": 1.0, "s": 1.0 / 60.0}[unit]
+    if not matched:
+        return None
+    return total
+
+
+def _codearts_token_remaining(up):
+    """读引擎 overview 里的 token 剩余分钟数；读不到返回 None。"""
+    try:
+        data = engine_request(up, "GET", "/admin/api/overview", auth="bearer", timeout=15)
+    except Exception:
+        return None
+    accounts = (data.get("accounts") if isinstance(data, dict) else None) or []
+    values = []
+    for account in accounts:
+        if not isinstance(account, dict) or account.get("disabled"):
+            continue
+        minutes = _parse_token_remaining(account.get("token_remaining"))
+        if minutes is not None:
+            values.append(minutes)
+    return min(values) if values else None
+
+
 def _codearts_keepalive_loop(interval):
-    """后台续期线程：先等 FIRST_DELAY，然后每个 interval 跑一次。"""
+    """后台续期线程：只在 token 快到期时才续，不是每个周期都打上游。
+
+    实测 token 只有约 2 小时有效期，而引擎自己的 watchdog 在 auth 文件缺
+    expires_at 时不会提前刷新（2026-11-26：14:12 启动剩 1h47m，直到 19:50
+    第一次刷新，中间近 4 小时是过期状态）。这里按剩余时间判断，剩 45 分钟
+    以内才续；读不到剩余时间时保守续一次（宁可多打一次也不让 token 断）。
+    """
     time.sleep(CODECARTS_KEEPALIVE_FIRST_DELAY)
     while True:
         try:
-            out = _codearts_keepalive_once()
-            if not out.get("ok"):
-                log("codearts 保活失败：%s" % (out.get("error") or "未知原因"))
-            elif not out.get("skipped"):
-                log("codearts 保活成功（token 已续期）")
+            up = _upstream_by_name("codearts")
+            if up and platform_enabled("codearts"):
+                remaining = _codearts_token_remaining(up)
+                if remaining is None or remaining <= CODECARTS_KEEPALIVE_THRESHOLD_MINUTES:
+                    out = _codearts_keepalive_once()
+                    if not out.get("ok"):
+                        log("codearts 保活失败：%s" % (out.get("error") or "未知原因"))
+                    elif not out.get("skipped"):
+                        log("codearts 保活成功（token 剩余 %s 分钟）"
+                            % (round(remaining, 1) if remaining is not None else "未知"))
         except Exception as exc:
             log("codearts keepalive loop error: %s: %s" % (type(exc).__name__, exc))
         time.sleep(interval)
