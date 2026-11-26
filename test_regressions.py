@@ -2485,6 +2485,39 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(body["returned"], 10)
         self.assertFalse(body["truncated"])
 
+    def test_codearts_usage_rows_from_admin_recent(self):
+        from unittest.mock import Mock
+        scope = isolated(ROOT / 'router.py', {'_codearts_usage_rows', '_iso_epoch'},
+                         {'datetime': datetime})
+        self.ns.update(scope)
+        handler = object.__new__(self.ns["Handler"])
+        handler.path = '/api/usage?limit=10'
+        handler._send_json = Mock()
+
+        def fake(up, method, path_, body=None, auth=None, timeout=None):
+            self.assertEqual(path_, '/admin/api/recent?limit=10')   # 不是 /usage/recent
+            self.assertEqual(auth, 'bearer')
+            return {'items': [
+                {'time': '2026-11-26T14:26:04+08:00', 'model': 'glm-5.3', 'account': 'u1',
+                 'status': 200, 'duration_ms': 8346, 'stream': True},
+                {'time': '2026-11-26T14:25:53+08:00', 'model': 'glm-5.3', 'account': 'u1',
+                 'status': 503, 'code': 'no_healthy_account', 'kind': 'unknown'},
+            ]}
+
+        self.ns.update(active_upstreams=lambda: [
+                           {'name': 'codearts', 'base_url': 'http://127.0.0.1:7866'}],
+                       engine_request=fake,
+                       _num=lambda n: float(n or 0),
+                       _known_num=lambda n: (float(n) if isinstance(n, (int, float))
+                                             and not isinstance(n, bool) else None))
+        handler._api_usage()
+        body = handler._send_json.call_args.args[1]
+        self.assertEqual(body['returned'], 2)
+        self.assertEqual(body['coverage']['codearts']['all'], {'ok': True, 'rows': 2})
+        outcomes = sorted(r['outcome'] for r in body['rows'])
+        self.assertEqual(outcomes, ['no_healthy_account', 'ok'])   # 用错误分类而非裸状态码
+        self.assertTrue(all(r['total'] == 0 for r in body['rows']))  # token 未知不造假
+
     def test_automation_job_concurrent_reuse_and_retry_boundary(self):
         from concurrent.futures import ThreadPoolExecutor
         from types import SimpleNamespace

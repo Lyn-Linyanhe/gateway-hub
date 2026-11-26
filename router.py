@@ -3248,6 +3248,36 @@ def _iso_epoch(value):
         return 0.0
 
 
+def _codearts_usage_rows(events):
+    """codearts2api /admin/api/recent 条目 → 用量页行。
+
+    该端点是内存里的最近 100 条（重启即清空），且不返回 token 计数：
+    prompt/completion 按未知记为 0，与 raccoon 用量行的既有口径一致，
+    前端不会拿它参与单价估算。outcome 优先用引擎的错误分类（code/kind），
+    比裸状态码更能解释「为什么失败」。
+    """
+    rows = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        status = event.get("status")
+        outcome = ("ok" if status == 200
+                   else (event.get("code") or event.get("kind") or "http %s" % status))
+        rows.append({
+            "at": _iso_epoch(event.get("time")),
+            "model": event.get("model") or "",
+            "account": event.get("account") or "",
+            "stream": event.get("stream"),
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "elapsed_ms": event.get("duration_ms"),
+            "ttft_ms": None,
+            "outcome": outcome,
+        })
+    return rows
+
+
 RACCOON_BILLING_LINKS = os.path.join(HERE, "raccoon_billing_links.jsonl")
 _raccoon_billing_link_lock = threading.Lock()
 
@@ -5644,6 +5674,14 @@ class Handler(BaseHTTPRequestHandler):
                             "outcome": ("ok" if status == 200
                                         else (e.get("error_kind") or f"http {status}")),
                         })
+                elif name == "codearts":
+                    # codearts2api 没有 /usage/recent；/admin/api/recent 是内存里
+                    # 最近 100 条（重启清空），字段比 hub 系少：没有 token 计数。
+                    data = engine_request(up, "GET", f"/admin/api/recent?limit={limit}",
+                                          auth="bearer", timeout=30)
+                    events = (data.get("items") if isinstance(data, dict) else data) or []
+                    realm_coverage["all"] = {"ok": True, "rows": len(events)}
+                    items = _codearts_usage_rows(events)
                 else:
                     try:  # uid -> 昵称映射，让日志显示人名而不是一串 uuid；
                         # realm=all 才是全池（默认视图漏国际账号）
