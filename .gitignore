@@ -35,3 +35,6 @@ backup-*/
 *.exe
 *.mp4
 *.webm
+
+# 浏览器同步的 CodeArts 积分快照（运行时数据，含账号 uid）
+codearts_credits.json

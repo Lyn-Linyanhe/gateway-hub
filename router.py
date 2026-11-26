@@ -2523,12 +2523,57 @@ def normalize_trae(a):
     }
 
 
+#: 浏览器同步的 CodeArts 积分快照（由 cftk 会话取数后落盘）。
+#:
+#: 为什么不能直接调上游：`/portal/snap-manager/v1/statistics/plugin` 只认真实
+#: 浏览器会话——同样的 cookie 与 header，curl/python/Go 客户端一律拿到
+#: **HTTP 200 空响应体**（华为云 WAF 的 TLS/JS 指纹静默拦截，不是 403）。
+#: 所以余额只能由浏览器取一次、写进这个文件，网关读它展示。
+CODEARTS_CREDITS_FILE = os.path.join(HERE, "codearts_credits.json")
+#: 快照超过这个时长就标注「数据陈旧」，避免把旧余额当实时值。
+CODEARTS_CREDITS_STALE = 24 * 3600
+
+
+def _codearts_credits_snapshot():
+    """读浏览器同步的积分快照；没有或损坏返回 None。"""
+    try:
+        with open(CODEARTS_CREDITS_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    total = data.get("total") if isinstance(data.get("total"), dict) else {}
+    remain = _known_num(total.get("remain"))
+    if remain is None:
+        return None
+    synced_at = None
+    try:
+        synced_at = datetime.fromisoformat(
+            str(data.get("synced_at") or "").replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        synced_at = None
+    return {
+        "remain": remain,
+        "size": _known_num(total.get("amount")),
+        "used": _known_num(total.get("used")),
+        "expiring": _known_num(total.get("expiring")) or 0,
+        "end_date": str(data.get("end_date") or ""),
+        "synced_at": synced_at,
+        "stale": bool(synced_at and time.time() - synced_at > CODEARTS_CREDITS_STALE),
+        "basic": data.get("basic") if isinstance(data.get("basic"), dict) else {},
+        "bonus": data.get("bonus") if isinstance(data.get("bonus"), dict) else {},
+    }
+
+
 def normalize_codearts(a):
     """codearts2api /admin/api/overview 的账号行 → 看板形状。
 
-    引擎不查积分余额：`credits` 恒为 0 且注释写明「未查询真实余额」，所以
-    remain 必须是 None——填 0 会被看板当成「已用完」，填别的就是假数据。
-    能展示的是登录态：token 剩余有效期、冷却、禁用、最近错误、并发占用。
+    引擎不查积分余额（`credits` 恒为 0，只记录领取动作成功与否），所以
+    `remain` 不能取引擎字段。真实余额来自浏览器同步的快照文件
+    （见 CODEARTS_CREDITS_FILE 的说明：上游只认真实浏览器，WAF 指纹拦截
+    其他客户端）。没有快照时 remain 保持 None——填 0 会被当成「已用完」。
+    能展示的登录态：token 剩余有效期、冷却、禁用、最近错误、并发占用。
 
     `checkin` 是 {ok, message, checked_at}；checked_at 为 RFC3339，取日期部分
     与东八区今天比较。
@@ -2537,14 +2582,21 @@ def normalize_codearts(a):
     ck = a.get("checkin") if isinstance(a.get("checkin"), dict) else {}
     checked_at = str(ck.get("checked_at") or "")[:10]
     cool_until = _iso_epoch(a.get("cool_until")) if a.get("cooling") else None
+    snap = _codearts_credits_snapshot()
+    remain = snap["remain"] if snap else None
+    size = (snap["size"] if snap and snap.get("size") else None)
+    sub = "码道 · token " + str(a.get("token_remaining") or "?")
+    if snap:
+        sub += " · 余额同步于 " + time.strftime(
+            "%m-%d %H:%M", time.localtime(snap["synced_at"])) if snap.get("synced_at") else ""
     return {
         "uid": uid,
         "name": a.get("nickname") or a.get("user_name") or (uid[:8] if uid else "?"),
-        "sub": "码道 · token " + str(a.get("token_remaining") or "?"),
+        "sub": sub,
         "enabled": not a.get("disabled"),
-        "remain": None,
-        "size": None,
-        "pct": "",
+        "remain": remain,
+        "size": size,
+        "pct": ("%.1f%%" % (remain / size * 100)) if (remain is not None and size) else "",
         "checked_in": bool(ck.get("ok")) and checked_at == _shanghai_today(),
         "can_checkin": True,
         "can_daily_chat": None,
@@ -2555,6 +2607,11 @@ def normalize_codearts(a):
         "cooldown_until": cool_until or None,
         "cooldown_kind": a.get("cool_kind") or None,
         "last_error": (str(a.get("reason") or a.get("last_error") or "").strip()[:200] or None),
+        # 积分快照的元信息：让前端能标注「数据陈旧」与到期日
+        "credits_synced_at": snap["synced_at"] if snap else None,
+        "credits_stale": snap["stale"] if snap else None,
+        "credits_expiring": snap["expiring"] if snap else None,
+        "credits_end_date": snap["end_date"] if snap else None,
     }
 
 
@@ -3497,6 +3554,13 @@ def _estimate_rows(up):
             d = engine_request(up, "GET", f"/usage/recent?realm={realm}&limit={limit}")
             rows.extend((d.get("rows") if isinstance(d, dict) else d) or [])
         return rows
+    if name == "codearts":
+        # codearts2api 的用量端点是 /admin/api/recent（不是 /usage/recent）。
+        # 该端点只给 body_bytes，没有 token 计数，所以这些行只能进「最近请求」
+        # 展示，不能参与单价估算——total_tokens 保持 0 而不是猜。
+        d = engine_request(up, "GET", f"/admin/api/recent?limit={limit}", auth="bearer")
+        events = (d.get("items") if isinstance(d, dict) else d) or []
+        return _codearts_usage_rows(events)
     d = engine_request(up, "GET", f"/usage/recent?limit={limit}")
     return (d.get("rows") if isinstance(d, dict) else d) or []
 
@@ -3812,17 +3876,16 @@ PLATFORM_BALANCE_UNIT = {
     "qwenwork": "千问办公企业配额",
     "raccoon": "小浣熊积分点",
     "trae": "Trae 积分（信用）",
+    "codearts": "码道积分",
 }
 
 #: 不参与「额度可用量预估」的平台。
 #:
-#: codearts 的引擎既不提供积分余额（`credits` 恒为 0，只记录「领取动作成功」
-#: 而非「领到多少」），也没有任何用量端点（/usage/recent、/admin/api/usage
-#: 全是 404）。列进预估只会得到一行 HTTPError + 一串「待测」，是纯噪音。
-#: 上游华为云 CodeArts 的积分余额在网页 portal 的私有接口里，需要 portal
-#: session 而非 API token；2026-11-26 的二进制逆向与抓包都没能稳定挖出路径。
-#: 它的签到状态与 token 有效期仍在账号页正常展示。
-ESTIMATE_EXCLUDED = {"codearts"}
+#: 留空：codearts 现在有余额了（浏览器同步快照，见 CODEARTS_CREDITS_FILE），
+#: 虽然它的 /admin/api/recent 不返回 token 计数、算不出单价，但预估循环本来
+#: 就能把「有余额、无单价」的模型显示成「待测」，不需要整块排除——那样连余额
+#: 都看不到。只有「既无余额又无用量」的平台才值得排除。
+ESTIMATE_EXCLUDED = set()
 
 
 def estimate_snapshot(force=False):

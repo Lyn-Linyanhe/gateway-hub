@@ -3,6 +3,7 @@ import ast
 import hashlib
 import io
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -1145,10 +1146,16 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(out['expiring'], [])       # 只是缺临期行
 
     def test_codearts_normalize_keeps_balance_unknown(self):
-        """引擎不查余额：credits=0 是占位，归一后必须留 None 而不是 0。"""
+        """没有浏览器同步快照时，remain 必须留 None 而不是 0。
+
+        引擎的 credits=0 是占位；真实余额只能来自浏览器同步的快照文件
+        （上游 WAF 拦截非浏览器客户端）。快照缺失 ≠ 余额为零。
+        """
         scope = isolated(ROOT / 'router.py',
                          {'normalize_codearts', '_shanghai_today', '_iso_epoch'},
-                         {'datetime': datetime})
+                         {'datetime': datetime, 'time': time, 'os': __import__('os'),
+                          'json': json,
+                          '_codearts_credits_snapshot': lambda: None})
         norm, today = scope['normalize_codearts'], scope['_shanghai_today']()
         row = norm({"uid": "8063", "name": "acct", "nickname": "用户abc",
                     "disabled": False, "cooling": False, "cool_until": "",
@@ -1170,6 +1177,68 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(cooled['cooldown_kind'], 'soft')
         # 禁用账号即使有 checkin 记录也不参与调度
         self.assertFalse(norm({"uid": "u3", "disabled": True})['enabled'])
+
+    def test_codearts_normalize_uses_browser_credits_snapshot(self):
+        """有快照时用真实余额（16455.19），并带上同步时间与到期日。"""
+        now = time.time()
+        snap = {"remain": 16455.19, "size": 16600.0, "used": 144.81,
+                "expiring": 0.0, "end_date": "2026-12-27",
+                "synced_at": now - 60, "stale": False, "basic": {}, "bonus": {}}
+        scope = isolated(ROOT / 'router.py',
+                         {'normalize_codearts', '_shanghai_today', '_iso_epoch'},
+                         {'datetime': datetime, 'time': time, 'os': __import__('os'),
+                          'json': json,
+                          '_codearts_credits_snapshot': lambda: snap})
+        row = scope['normalize_codearts']({"uid": "8063", "nickname": "acct",
+                                           "credits": 0, "token_remaining": "23h0m0s"})
+        self.assertEqual(row['remain'], 16455.19)   # 不是引擎的占位 0
+        self.assertEqual(row['size'], 16600.0)
+        self.assertAlmostEqual(float(row['pct'].rstrip('%')), 99.1, places=1)
+        self.assertEqual(row['credits_end_date'], '2026-12-27')
+        self.assertFalse(row['credits_stale'])
+        self.assertEqual(row['credits_expiring'], 0.0)
+
+    def test_codearts_credits_snapshot_marks_stale_and_rejects_garbage(self):
+        """快照超过 24h 标 stale；文件缺失/损坏/无 remain 一律返回 None。"""
+        import tempfile
+        now = time.time()
+        cases = [
+            ({"total": {"remain": 100, "amount": 200}, "synced_at": "2026-01-01T00:00:00Z"},
+             True, 100),          # 旧快照 → stale
+            ({"total": {"remain": 100, "amount": 200},
+              "synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))},
+             False, 100),         # 新快照
+            ({"total": {}}, None, None),          # 没有 remain
+            ({"synced_at": "x"}, None, None),     # 没有 total
+        ]
+        scope = isolated(ROOT / 'router.py', {'_codearts_credits_snapshot'},
+                         {'datetime': datetime, 'time': time, 'os': __import__('os'),
+                          'json': json,
+                          '_known_num': lambda v: (float(v) if isinstance(v, (int, float))
+                                                   and not isinstance(v, bool) else None),
+                          'CODEARTS_CREDITS_FILE': '<tmp>',
+                          'CODEARTS_CREDITS_STALE': 24 * 3600})
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False,
+                                         encoding='utf-8') as handle:
+            path = handle.name
+        try:
+            scope['CODEARTS_CREDITS_FILE'] = path
+            for payload, want_stale, want_remain in cases:
+                with open(path, 'w', encoding='utf-8') as handle:
+                    json.dump(payload, handle)
+                got = scope['_codearts_credits_snapshot']()
+                if want_remain is None:
+                    self.assertIsNone(got, payload)
+                    continue
+                self.assertIsNotNone(got, payload)
+                self.assertEqual(got['remain'], want_remain, payload)
+                self.assertEqual(got['stale'], want_stale, payload)
+            # 文件不存在
+            os.unlink(path)
+            self.assertIsNone(scope['_codearts_credits_snapshot']())
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
     def test_codearts_status_uses_healthz_and_admin_overview(self):
         import urllib.request
@@ -1195,7 +1264,10 @@ class GatewayTests(unittest.TestCase):
                           '_known_num', '_num', '_epoch_seconds', '_expiry_row',
                           '_iso_epoch', '_trae_pack_name'},
                          {'urllib': __import__('urllib.request'),
-                          'datetime': datetime,
+                          'datetime': datetime, 'time': time, 'os': __import__('os'),
+                          'json': json,
+                          # 本用例只验证端点选择与归一，不涉及余额快照
+                          '_codearts_credits_snapshot': lambda: None,
                           'CONFIG': {'upstreams': [{'name': 'codearts',
                                                     'base_url': 'http://127.0.0.1:7866'}]},
                           '_inflight': {}, 'NORMALIZERS': {},
