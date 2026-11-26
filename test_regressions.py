@@ -17,10 +17,39 @@ from http.server import BaseHTTPRequestHandler
 
 ROOT = Path(__file__).resolve().parent
 
+#: dashboard.html 快照：三个看板用例让 node 现场读文件，若读取瞬间文件正在被
+#: 更新/替换会读到截断内容，表现为随机的 returncode=1。统一用导入时的快照，
+#: 并从 stdin 注入脚本（HTML 太大，不能走命令行参数）。
+_DASHBOARD_HTML = (ROOT / "dashboard.html").read_text(encoding="utf-8")
+
+#: 源码快照：一次测试运行只读一次盘。
+#:
+#: 之前在 isolated() 里每个用例都重新 read_text+parse router.py，整套跑一遍
+#: 会跨很长时间窗、读几十次。如果此时工作树正在被编辑（改代码/自更新替换文件），
+#: 不同用例会看到不同版本的源码，表现为「偶发失败、每次失败用例不同、单跑必过」。
+#: 快照后同一轮所有用例看到同一份源码，也避免被自更新的逐文件 os.replace 干扰。
+_SOURCE_AST = {}
+
+
+def _ast_for(path):
+    key = str(Path(path).resolve())
+    tree = _SOURCE_AST.get(key)
+    if tree is None:
+        tree = _SOURCE_AST[key] = ast.parse(Path(path).read_text(encoding="utf-8"))
+    return tree
+
 
 def isolated(path, names, extra=None):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
+    tree = _ast_for(path)
+    wanted = set(names)
+    nodes = [n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
+    # 以前这里静默忽略缺失符号，导致「测试要的符号在源码里没找到」变成随机
+    # 用例里的 NameError/断言失败。现在直接指名道姓报错。
+    missing = wanted - {n.name for n in nodes}
+    if missing:
+        raise AssertionError(
+            "%s missing symbols: %s" % (Path(path).name, sorted(missing)))
     scope = dict(json=json, re=re, secrets=secrets, time=time, BaseHTTPRequestHandler=BaseHTTPRequestHandler,
                  HTTPException=HTTPException, CONFIG={}, log=lambda *_: None)
     scope.update(extra or {})
@@ -29,7 +58,7 @@ def isolated(path, names, extra=None):
 
 
 def constant(path, name):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = _ast_for(path)
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
                 isinstance(target, ast.Name) and target.id == name for target in node.targets):
@@ -42,11 +71,11 @@ class GatewayTests(unittest.TestCase):
         self.ns = isolated(ROOT / "router.py", {
             "_rewrite_sse_model", "_rewrite_sse_chunks", "forward", "_action_status", "Handler",
             "_num", "_known_num", "_checkin_tally", "_wb_route_realm", "_wb_usable_realms",
-            "_wb_known_no_account", "estimate_snapshot", "_credit_rate", "_wallet_rate",
+            "estimate_snapshot", "_credit_rate", "_wallet_rate",
             "_read_wallet_history", "_estimate_public_model", "_qwen_sample",
             "_row_multiplier", "normalize_wb", "normalize_qoder", "_wb_account_realms",
             "_wb_pool_fetch", "_wb_dual_prefer", "normalize_raccoon", "_shanghai_today",
-            "_raccoon_checkin_result", "_iso_epoch", "normalize_trae",
+            "_raccoon_checkin_result", "_iso_epoch", "_codearts_usage_rows", "normalize_trae",
             "_disabled_platforms", "platform_enabled", "active_upstreams", "_upstream_by_name",
             "_launch_spec", "_raccoon_billing_rows", "_read_raccoon_billing_links",
             "_attach_raccoon_bills", "_record_raccoon_billing_link",
@@ -1330,16 +1359,100 @@ class GatewayTests(unittest.TestCase):
 
     def test_automation_daily_due_respects_time_and_last_run(self):
         scope = isolated(ROOT / 'router.py', {'_automation_daily_due'},
-                         {'datetime': datetime, 'timedelta': timedelta, 'timezone': timezone})
+                         {'datetime': datetime, 'timedelta': timedelta, 'timezone': timezone,
+                          'AUTOMATION_DAILY_MAX_ATTEMPTS': 6,
+                          'AUTOMATION_DAILY_RETRY_MINUTES': 20})
         due = scope['_automation_daily_due']
         cfg = {'enabled': True, 'hour': 9, 'minute': 0}
         tz = timezone(timedelta(hours=8))
-        self.assertFalse(due(dict(cfg, enabled=False), '',
+        empty = {'last_success': '', 'attempts': {}, 'last_attempt_at': ''}
+        self.assertFalse(due(dict(cfg, enabled=False), empty,
                              datetime(2026, 11, 26, 10, 0, tzinfo=tz)))
-        self.assertFalse(due(cfg, '', datetime(2026, 11, 26, 8, 59, tzinfo=tz)))
-        self.assertTrue(due(cfg, '', datetime(2026, 11, 26, 9, 0, tzinfo=tz)))
-        self.assertTrue(due(cfg, '2026-11-25', datetime(2026, 11, 26, 9, 0, tzinfo=tz)))
+        self.assertFalse(due(cfg, empty, datetime(2026, 11, 26, 8, 59, tzinfo=tz)))
+        self.assertTrue(due(cfg, empty, datetime(2026, 11, 26, 9, 0, tzinfo=tz)))
+        self.assertTrue(due(cfg, {'last_success': '2026-11-25', 'attempts': {},
+                                  'last_attempt_at': ''},
+                             datetime(2026, 11, 26, 9, 0, tzinfo=tz)))
+        self.assertFalse(due(cfg, {'last_success': '2026-11-26', 'attempts': {},
+                                   'last_attempt_at': ''},
+                             datetime(2026, 11, 26, 18, 0, tzinfo=tz)))
+        # 兼容旧格式：传字符串等价于「上次成功」
         self.assertFalse(due(cfg, '2026-11-26', datetime(2026, 11, 26, 18, 0, tzinfo=tz)))
+
+    def test_automation_daily_retries_after_failure_but_caps_attempts(self):
+        """失败当天可重试，但有间隔与次数上限；成功才记 last_success。"""
+        scope = isolated(ROOT / 'router.py', {'_automation_daily_due'},
+                         {'datetime': datetime, 'timedelta': timedelta, 'timezone': timezone,
+                          'AUTOMATION_DAILY_MAX_ATTEMPTS': 6,
+                          'AUTOMATION_DAILY_RETRY_MINUTES': 20})
+        due = scope['_automation_daily_due']
+        cfg = {'enabled': True, 'hour': 9, 'minute': 0}
+        tz = timezone(timedelta(hours=8))
+        now = datetime(2026, 11, 26, 11, 30, tzinfo=tz)
+        # 刚失败过（5 分钟前）→ 不重试，等间隔
+        self.assertFalse(due(cfg, {'last_success': '2026-11-25',
+                                   'attempts': {'2026-11-26': 1},
+                                   'last_attempt_at': '2026-11-26T11:25:00+08:00'}, now))
+        # 超过间隔 → 重试
+        self.assertTrue(due(cfg, {'last_success': '2026-11-25',
+                                  'attempts': {'2026-11-26': 1},
+                                  'last_attempt_at': '2026-11-26T11:00:00+08:00'}, now))
+        # 达到次数上限 → 当天不再试
+        self.assertFalse(due(cfg, {'last_success': '2026-11-25',
+                                   'attempts': {'2026-11-26': 6},
+                                   'last_attempt_at': '2026-11-26T10:00:00+08:00'}, now))
+
+    def test_automation_daily_marks_success_only_when_no_failures(self):
+        """每日任务收尾：整轮无失败才记「今天完成」；有失败则不记，等当天重试。
+
+        旧实现是在任务**创建时**就写 last_run，导致网关晚启动（引擎还没拉起）
+        时签到全失败也永不重试——实测小浣熊 checked_in 停滞 4~7 天。
+        """
+        path = ROOT / "router.py"
+        marked = []
+
+        def make_scope():
+            return isolated(path, {"_automation_run_step", "_automation_now"},
+                            {"_automation_jobs": {}, "_automation_idempotency": {},
+                             "_automation_lock": threading.RLock(),
+                             "_automation_summary": lambda result: "synthetic",
+                             "_automation_safe_retry": lambda step: False,
+                             "_automation_call_step": lambda step: {"ok": True},
+                             "_automation_daily_mark_success": lambda day: marked.append(day),
+                             "threading": threading})
+
+        def job():
+            return {"id": "j1", "status": "queued", "daily": True,
+                    "daily_day": "2026-11-26", "counts": {}, "completed": 0,
+                    "steps": [{"step_id": "a.checkin", "status": "queued",
+                               "supported": True}]}
+
+        # 成功 → 记 last_success
+        scope = make_scope()
+        scope["_automation_jobs"]["j1"] = ok_job = job()
+        scope["_automation_run_step"]("j1", 0)
+        self.assertEqual(marked, ["2026-11-26"])
+        self.assertEqual(ok_job["status"], "succeeded")
+
+        # 失败 → 不记，保持可重试
+        marked.clear()
+        scope = make_scope()
+        scope["_automation_jobs"]["j1"] = bad_job = job()
+        scope["_automation_call_step"] = lambda step: {"ok": False, "error": "引擎离线"}
+        scope["_automation_run_step"]("j1", 0)
+        self.assertEqual(marked, [])
+        self.assertEqual(bad_job["status"], "failed")
+
+        # 上游结果未知（传输失败）→ 同样不记（job 落 partial）
+        marked.clear()
+        scope = make_scope()
+        scope["_automation_jobs"]["j1"] = unknown_job = job()
+        def boom(step):
+            raise OSError("loopback reset")
+        scope["_automation_call_step"] = boom
+        scope["_automation_run_step"]("j1", 0)
+        self.assertEqual(marked, [])
+        self.assertEqual(unknown_job["status"], "partial")
 
     def test_automation_daily_steps_only_checkin_and_supported(self):
         plan = {'steps': [
@@ -2572,9 +2685,8 @@ class GatewayTests(unittest.TestCase):
 
     def test_codearts_usage_rows_from_admin_recent(self):
         from unittest.mock import Mock
-        scope = isolated(ROOT / 'router.py', {'_codearts_usage_rows', '_iso_epoch'},
-                         {'datetime': datetime})
-        self.ns.update(scope)
+        # _codearts_usage_rows / _iso_epoch 已在 setUp 的 ns 里：共用同一个
+        # globals dict，后面 update(engine_request=..., _num=...) 才对 helper 生效。
         handler = object.__new__(self.ns["Handler"])
         handler.path = '/api/usage?limit=10'
         handler._send_json = Mock()
@@ -2839,8 +2951,7 @@ class GatewayTests(unittest.TestCase):
         """
         import subprocess
         script = r'''
-const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
-const html=fs.readFileSync(process.argv[2],'utf8');
+const vm=require('node:vm'), assert=require('node:assert/strict');
 
 // 按函数名精确截取（大括号配平）：正则非贪婪会在模板字符串里提前截断。
 function extractFn(name){
@@ -2933,7 +3044,8 @@ assert.equal([...single.matchAll(/seq-cell">(\d+)</g)].map(m=>m[1]).join(','),'1
 
 console.log('dashboard accounts: realm grouping, continuous seq, single-realm fallback passed');
 '''
-        result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
+        script = "const html=" + json.dumps(_DASHBOARD_HTML) + ";" + chr(10) + script
+        result = subprocess.run(['node', '-'], input=script,
                                 text=True, encoding='utf-8', capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -2946,8 +3058,7 @@ console.log('dashboard accounts: realm grouping, continuous seq, single-realm fa
         """
         import subprocess
         script = r'''
-const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
-const html=fs.readFileSync(process.argv[2],'utf8');
+const vm=require('node:vm'), assert=require('node:assert/strict');
 function extractFn(name){
   const start=html.indexOf('function '+name+'(');
   assert.ok(start>=0, name+' not found');
@@ -3008,7 +3119,8 @@ assert.equal((single.match(/class="realm-group"/g)||[]).length,0,'单平台不�
 
 console.log('dashboard expiring: platform grouping, in-group expiry order, single-platform fallback passed');
 '''
-        result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
+        script = "const html=" + json.dumps(_DASHBOARD_HTML) + ";" + chr(10) + script
+        result = subprocess.run(['node', '-'], input=script,
                                 text=True, encoding='utf-8', capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -3016,8 +3128,7 @@ console.log('dashboard expiring: platform grouping, in-group expiry order, singl
         import subprocess
         # Run the actual inline script with a synthetic DOM, transport and clock.
         script = r'''
-const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
-const html=fs.readFileSync(process.argv[2],'utf8');
+const vm=require('node:vm'), assert=require('node:assert/strict');
 const source=[...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]).join('\n');
 const elements=new Map();
 function element(id=''){
@@ -3424,7 +3535,8 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  console.log('dashboard offline: 503/retry, single-flight, invalidation, 401, pagination, cost coverage, unknown, result states, navigation, self-update, theme, load latency passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 '''
-        result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
+        script = "const html=" + json.dumps(_DASHBOARD_HTML) + ";" + chr(10) + script
+        result = subprocess.run(['node', '-'], input=script,
                                 text=True, encoding='utf-8', capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

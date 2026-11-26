@@ -14,10 +14,10 @@ gateway-hub 依赖 5 个上游引擎。这些引擎由第三方维护，但我�
 
 | 引擎 | 版本 | 补丁文件 | 状态 |
 |---|---|---|---|
-| workbuddy2api-hub | 2.2.4 | `workbuddy-wb_proxy.patch`、`workbuddy-wb_accounts.patch` | 已移植到 2.2.4，计数与 2.2.1 一致 |
-| xiaohuanxiong2api | v0.1.34 | `xhx2api.patch`、`xhx2api-account_expiry_test.go.txt` | 已 rebase 到 origin/main |
+| workbuddy2api-hub | 2.2.5 | `workbuddy-wb_proxy.patch`、`workbuddy-wb_accounts.patch` | 已移植到 2.2.5，计数与 2.2.1 一致 |
+| xiaohuanxiong2api | v0.1.36 | `xhx2api.patch`、`xhx2api-account_expiry_test.go.txt` | 已 rebase 到 origin/main |
 | trae2api-hub | 1.7.2 | （见下） | 已 rebase；上游吸收了部分同类修复，我们的更细 |
-| qoder2api-hub | 1.10.3 | `qoder2api-hub.patch` | 已 rebase，零冲突 |
+| qoder2api-hub | 1.10.4 | `qoder2api-hub.patch` | 已 rebase，零冲突 |
 | Buddy2api | 2.2.25 | `Buddy2api.patch` | 已 rebase，零冲突 |
 | codearts2api | v1.0.3 | 无 | 无源码、无补丁 |
 

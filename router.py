@@ -901,6 +901,7 @@ def _automation_run_step(job_id, index):
     except Exception:
         # 传输失败时无法确认上游是否已经执行。
         status, summary = "unknown", "上游执行结果未知，请检查账号或调度器状态"
+    daily_success_day = None
     with _automation_lock:
         job = _automation_jobs.get(job_id)
         if not job:
@@ -925,6 +926,14 @@ def _automation_run_step(job_id, index):
                               else "succeeded")
             job["finished_at"] = _automation_now()
             job["current_step"] = ""
+            # 每日任务：整轮没有失败/部分/未知才算「今天完成」。
+            # 否则保持未完成，让 _automation_daily_loop 按间隔重试。
+            if (job.get("daily") and job.get("daily_day")
+                    and counts["failed"] == 0 and counts["partial"] == 0
+                    and counts["unknown"] == 0):
+                daily_success_day = job["daily_day"]
+    if daily_success_day:
+        _automation_daily_mark_success(daily_success_day)
     if next_index < len(job["steps"]) and not retry_only:
         try:
             threading.Thread(target=_automation_run_step, args=(job_id, next_index),
@@ -993,33 +1002,102 @@ def _automation_daily_cfg():
             "hour": hour, "minute": minute, "steps": steps}
 
 
-def _automation_daily_last_run():
+#: 当天最多尝试次数与两次尝试的最小间隔。
+#:
+#: 每日自动化最容易踩的坑是「网关晚于 9 点启动」：网关刚起来时引擎还没拉起，
+#: 签到步骤全部失败。旧实现不管成败，在任务**创建时**就把当天标记成「已跑」，
+#: 于是当天不会再试——实测小浣熊 checked_in 因此停滞 4~7 天。
+#: 现在只有整轮没有 failed/unknown/partial 才记为「当天成功」；否则每隔
+#: RETRY_MINUTES 重试，最多 MAX_ATTEMPTS 次（签到接口幂等，重试安全）。
+AUTOMATION_DAILY_MAX_ATTEMPTS = 6
+AUTOMATION_DAILY_RETRY_MINUTES = 20
+
+
+def _automation_daily_state():
+    """读状态。兼容旧格式 {"last_run": "YYYY-MM-DD"}（等价于「上次成功」）。"""
+    empty = {"last_success": "", "attempts": {}, "last_attempt_at": ""}
     try:
         with open(AUTOMATION_DAILY_STATE, encoding="utf-8") as handle:
-            return str(json.load(handle).get("last_run") or "")
+            raw = json.load(handle)
     except (OSError, ValueError):
-        return ""
+        return empty
+    if not isinstance(raw, dict):
+        return empty
+    attempts = {}
+    raw_attempts = raw.get("attempts")
+    if isinstance(raw_attempts, dict):
+        for key, value in raw_attempts.items():
+            try:
+                attempts[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return {
+        "last_success": str(raw.get("last_success") or raw.get("last_run") or ""),
+        "attempts": attempts,
+        "last_attempt_at": str(raw.get("last_attempt_at") or ""),
+    }
 
 
-def _automation_daily_mark(day):
+def _automation_daily_save(state):
     tmp = AUTOMATION_DAILY_STATE + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"last_run": day}, handle)
+            json.dump(state, handle)
         os.replace(tmp, AUTOMATION_DAILY_STATE)
     except OSError:
         pass
 
 
-def _automation_daily_due(cfg, last_run, now=None):
-    """到点且今天没跑过 → True。now 固定东八区，与账号签到口径一致。"""
+def _automation_daily_note_attempt(day):
+    """记录「今天试过一次」。失败后当天还可以重试，所以要单独计数。"""
+    state = _automation_daily_state()
+    attempts = dict(state.get("attempts") or {})
+    attempts[day] = int(attempts.get(day) or 0) + 1
+    # 只保留最近 3 天，避免状态文件无限增长。
+    for old in sorted(attempts)[:-3]:
+        attempts.pop(old, None)
+    state["attempts"] = attempts
+    state["last_attempt_at"] = _automation_now()
+    _automation_daily_save(state)
+
+
+def _automation_daily_mark_success(day):
+    """整轮无失败才调用：今天算完成，当天不再重试。"""
+    state = _automation_daily_state()
+    state["last_success"] = day
+    _automation_daily_save(state)
+
+
+def _automation_daily_due(cfg, state, now=None):
+    """到点、今天还没成功、且未超重试上限/间隔 → True。now 固定东八区。"""
     if not cfg.get("enabled"):
         return False
     if now is None:
         now = datetime.now(timezone(timedelta(hours=8)))
-    if last_run == now.strftime("%Y-%m-%d"):
+    if isinstance(state, str):  # 兼容老调用（只传 last_run 字符串）
+        state = {"last_success": state, "attempts": {}, "last_attempt_at": ""}
+    if not isinstance(state, dict):
+        state = {}
+    today = now.strftime("%Y-%m-%d")
+    if str(state.get("last_success") or "") == today:
         return False
-    return (now.hour, now.minute) >= (cfg.get("hour", 9), cfg.get("minute", 0))
+    if (now.hour, now.minute) < (cfg.get("hour", 9), cfg.get("minute", 0)):
+        return False
+    attempts = int((state.get("attempts") or {}).get(today) or 0)
+    if attempts >= AUTOMATION_DAILY_MAX_ATTEMPTS:
+        return False
+    last_at = str(state.get("last_attempt_at") or "")
+    if last_at:
+        try:
+            prev = datetime.fromisoformat(last_at)
+            if prev.tzinfo is None:
+                prev = prev.replace(tzinfo=now.tzinfo)
+            if (prev.strftime("%Y-%m-%d") == today
+                    and (now - prev).total_seconds() < AUTOMATION_DAILY_RETRY_MINUTES * 60):
+                return False
+        except ValueError:
+            pass
+    return True
 
 
 def _automation_daily_steps(plan, wanted):
@@ -1035,15 +1113,20 @@ def _automation_daily_run():
     cfg = _automation_daily_cfg()
     plan = _automation_plan()
     steps = _automation_daily_steps(plan, cfg["steps"])
-    if not steps:
-        log("automation daily: 没有可执行的签到步骤，跳过")
-        return None
     day = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    if not steps:
+        # 没有可跑的步骤（平台全停用等）：今天本来就没活干，记为完成，
+        # 否则调度器会每 30 秒重试一次并刷日志。
+        log("automation daily: 没有可执行的签到步骤，跳过")
+        _automation_daily_mark_success(day)
+        return None
     job = {"id": secrets.token_urlsafe(12), "status": "queued",
            "plan_version": plan["version"], "idempotency_key": "daily-" + day,
            "created_at": _automation_now(), "updated_at": _automation_now(),
            "started_at": None, "finished_at": None, "current_step": "",
            "current_index": 0, "completed": 0,
+           # 标记这是每日任务：收尾时要按结果决定「今天算完成」还是「稍后重试」。
+           "daily": True, "daily_day": day,
            "counts": {s: 0 for s in ("succeeded", "skipped", "failed", "partial",
                                      "unknown", "submitted")},
            "steps": steps}
@@ -1060,7 +1143,7 @@ def _automation_daily_run():
             for old_key, old_job in list(_automation_idempotency.items()):
                 if old_job == old:
                     _automation_idempotency.pop(old_key, None)
-    _automation_daily_mark(day)
+    _automation_daily_note_attempt(day)
     log("automation daily: 触发 %s（%s）" % (job["id"], ",".join(s["step_id"] for s in steps)))
     threading.Thread(target=_automation_run_step, args=(job["id"], 0), daemon=True).start()
     return job["id"]
@@ -1070,7 +1153,7 @@ def _automation_daily_loop():
     while True:
         try:
             cfg = _automation_daily_cfg()
-            if _automation_daily_due(cfg, _automation_daily_last_run()):
+            if _automation_daily_due(cfg, _automation_daily_state()):
                 _automation_daily_run()
         except Exception as exc:
             log("automation daily loop error: %s: %s" % (type(exc).__name__, exc))
