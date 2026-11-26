@@ -2600,6 +2600,73 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(outcomes, ['no_healthy_account', 'ok'])   # 用错误分类而非裸状态码
         self.assertTrue(all(r['total'] == 0 for r in body['rows']))  # token 未知不造假
 
+    def test_codearts_keepalive_interval_and_call(self):
+        """codearts 保活：间隔解析 + 调用形状 + 停用/失败分支。
+
+        token 只有约 2 小时有效期，且引擎不持久化 expires_at 导致 watchdog
+        无法提前刷新；不主动续期就会出现「首次 401 → 10 分钟冷却」的窗口
+        （实测 2026-11-26 19:57–20:02 全部 503）。
+        """
+        from unittest.mock import Mock
+
+        scope = isolated(ROOT / 'router.py',
+                         {'_codearts_keepalive_cfg', '_codearts_keepalive_once'},
+                         {'CONFIG': {}, 'CODECARTS_KEEPALIVE_MINUTES': 30})
+        cfg = scope['_codearts_keepalive_cfg']
+
+        # 缺省 → 30 分钟
+        self.assertEqual(cfg(), 1800.0)
+        # 显式值
+        scope['CONFIG']['codearts_keepalive_minutes'] = 15
+        self.assertEqual(cfg(), 900.0)
+        # 0 / 负数 → 关闭
+        for off in (0, -5):
+            scope['CONFIG']['codearts_keepalive_minutes'] = off
+            self.assertEqual(cfg(), 0, off)
+        # 非法值 → 回退默认
+        scope['CONFIG']['codearts_keepalive_minutes'] = "abc"
+        self.assertEqual(cfg(), 1800.0)
+        # 下限 60 秒，防把上游打爆
+        scope['CONFIG']['codearts_keepalive_minutes'] = 0.1
+        self.assertEqual(cfg(), 60.0)
+
+        # 调用形状：对 codearts 发 POST /admin/api/keepalive，bearer 鉴权
+        calls = []
+
+        def fake_engine(up, method, path, body=None, auth=None, timeout=None):
+            calls.append((up.get('name'), method, path, body, auth, timeout))
+            return {'ok': True, 'message': '保活完成: 1 成功'}
+
+        scope.update(_upstream_by_name=lambda n: {'name': 'codearts'} if n == 'codearts' else None,
+                     platform_enabled=lambda n: True,
+                     engine_request=fake_engine)
+        out = scope['_codearts_keepalive_once']()
+        self.assertTrue(out['ok'])
+        self.assertEqual(calls, [('codearts', 'POST', '/admin/api/keepalive', {}, 'bearer', 120)])
+
+        # 平台停用 → 跳过，不打引擎
+        calls.clear()
+        scope['platform_enabled'] = lambda n: False
+        out = scope['_codearts_keepalive_once']()
+        self.assertTrue(out['ok'])
+        self.assertTrue(out.get('skipped'))
+        self.assertEqual(calls, [])
+
+        # 引擎拒绝 → ok False 带原因
+        scope['platform_enabled'] = lambda n: True
+        scope['engine_request'] = Mock(return_value={'ok': False, 'message': 'token 已失效'})
+        out = scope['_codearts_keepalive_once']()
+        self.assertFalse(out['ok'])
+        self.assertIn('token', out['error'])
+
+        # 传输异常 → ok False，不抛给线程
+        def boom(*args, **kwargs):
+            raise OSError('connection refused')
+        scope['engine_request'] = boom
+        out = scope['_codearts_keepalive_once']()
+        self.assertFalse(out['ok'])
+        self.assertIn('OSError', out['error'])
+
     def test_automation_job_concurrent_reuse_and_retry_boundary(self):
         from concurrent.futures import ThreadPoolExecutor
         from types import SimpleNamespace

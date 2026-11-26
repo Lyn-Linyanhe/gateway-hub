@@ -1077,6 +1077,69 @@ def _automation_daily_loop():
         time.sleep(30)
 
 
+# ---------------------------------------------------------------------------
+# codearts token 保活：access token 约 2 小时过期，引擎自身的 watchdog 靠不住
+# ---------------------------------------------------------------------------
+#: 默认每 30 分钟续期一次；config.json 的 `codearts_keepalive_minutes` 可改，0 关闭。
+CODECARTS_KEEPALIVE_MINUTES = 30
+#: 启动后首次续期的延迟：网关刚起来时引擎多半也刚校验过 token，不必立刻再打一次；
+#: 但也不能等到一个完整周期——如果启动时 token 只剩几分钟，等 30 分钟就晚了。
+CODECARTS_KEEPALIVE_FIRST_DELAY = 20.0
+
+
+def _codearts_keepalive_cfg():
+    """保活间隔（秒）；0 表示关闭。非法值回退默认，下限 60 秒防打爆上游。"""
+    raw = CONFIG.get("codearts_keepalive_minutes", CODECARTS_KEEPALIVE_MINUTES)
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        minutes = float(CODECARTS_KEEPALIVE_MINUTES)
+    if minutes <= 0:
+        return 0
+    return max(60.0, minutes * 60.0)
+
+
+def _codearts_keepalive_once():
+    """对 codearts 调一次保活续期。返回 {ok, skipped?, error?}。
+
+    引擎的 auth 文件不持久化 expires_at，watchdog 无法按到期时刻提前刷新——
+    token 过期后只能等某次请求吃到 401 才去续，而那次 401 还会把账号打进
+    10 分钟错误冷却。实测 2026-11-26 19:57–20:02 全部 503 no_healthy_account
+    （all accounts unavailable (disabled/cooldown)）就是这个窗口。
+
+    主动续期把窗口消掉：/admin/api/keepalive 会 refreshed/validated 各账号。
+    """
+    up = _upstream_by_name("codearts")
+    if not up:
+        return {"ok": True, "skipped": True, "msg": "未配置 codearts"}
+    if not platform_enabled("codearts"):
+        return {"ok": True, "skipped": True, "msg": "codearts 已停用"}
+    try:
+        result = engine_request(up, "POST", "/admin/api/keepalive", {},
+                                auth="bearer", timeout=120)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    if isinstance(result, dict) and result.get("ok") is False:
+        return {"ok": False,
+                "error": str(result.get("message") or result.get("error") or "引擎拒绝保活")}
+    return {"ok": True, "result": result}
+
+
+def _codearts_keepalive_loop(interval):
+    """后台续期线程：先等 FIRST_DELAY，然后每个 interval 跑一次。"""
+    time.sleep(CODECARTS_KEEPALIVE_FIRST_DELAY)
+    while True:
+        try:
+            out = _codearts_keepalive_once()
+            if not out.get("ok"):
+                log("codearts 保活失败：%s" % (out.get("error") or "未知原因"))
+            elif not out.get("skipped"):
+                log("codearts 保活成功（token 已续期）")
+        except Exception as exc:
+            log("codearts keepalive loop error: %s: %s" % (type(exc).__name__, exc))
+        time.sleep(interval)
+
+
 def _automation_public(job):
     with _automation_lock:
         out = json.loads(json.dumps(job, ensure_ascii=False))
@@ -6355,6 +6418,11 @@ def main():
             daily["time"], ",".join(daily["steps"]) or "计划内全部签到步骤"))
     else:
         log("每日自动化未启用（config.json 的 automation_daily.enabled）")
+    keepalive = _codearts_keepalive_cfg()
+    if keepalive:
+        threading.Thread(target=_codearts_keepalive_loop, args=(keepalive,),
+                         daemon=True).start()
+        log("codearts 保活已启用：每 %.0f 分钟续期一次 token" % (keepalive / 60))
     try:
         server = Server(("127.0.0.1", port), Handler)
     except OSError as exc:
