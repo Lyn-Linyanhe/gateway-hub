@@ -2960,7 +2960,7 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  fetchImpl=async p=>reply(p.startsWith('/api/usage')?{rows}:{items:[]});
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:null,known:0,total:1,models:[{model:'qwen4-max',rate_per_mtok:null,rate_source:'unknown',est_tokens:null,note:'余额待测，暂不估算',samples:0}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/待测/);
- assert.match(el('overview-estimate').innerHTML,/0\/1 个启用账号/);
+ assert.match(el('overview-estimate').innerHTML,/0\/1 账号/);
  // 余额为 null 时不能渲染成「0 分」（卡片版把数值与单位分成两个 span）
  assert.doesNotMatch(el('overview-estimate').innerHTML,/<span class="est-bal">0<\/span>/);
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:0,known:1,total:1,models:[{model:'qwen4-max',rate_per_mtok:51.02,rate_source:'anchored',est_tokens:0,note:'短样本相对价 × 钱包实测均价锚定',samples:3,sample_tokens:1000000,sample_hours:24}]}]}};renderEstimate()");

@@ -145,37 +145,39 @@ td.num,th.num{text-align:right}
 .bar>i.low{background:var(--orange)}
 .name-cell{font-weight:600}
 .sub-cell{font-size:11px;color:var(--dim2)}
-/* ── 额度预估：平台一行 + 横排模型块（大数字是主角，平台/单价退为注释）── */
-.est-list{display:flex;flex-direction:column;gap:18px}
-.est-plat-block{display:block}
-.est-plat-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
-  padding-bottom:8px;margin-bottom:10px;border-bottom:1px solid var(--line)}
-.est-plat{font-size:13.5px;font-weight:700;color:var(--fg)}
-.est-bal{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
-.est-bal.dim{color:var(--dim2);font-size:12.5px;font-weight:600}
-.est-unit{font-size:11px;color:var(--dim2);font-weight:500;margin-left:3px}
-.est-meta{font-size:11px;color:var(--dim2)}
-.est-err{font-size:11.5px;color:var(--orange);margin-bottom:8px}
-/* 横排：窄屏自动折行，每块最小 150px，避免挤压大数字 */
-.est-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:10px}
-.est-tile{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel2)}
-.est-tile-num{font-size:26px;font-weight:800;letter-spacing:-.8px;line-height:1.1;
+/* ── 额度预估：平台横排并排，列内模型纵向堆叠（大数字是主角）── */
+/* 平台数少（2-4 个）时一行铺开，跨平台可直接对比；窄屏自动折行。 */
+.est-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
+  gap:14px;align-items:start}
+.est-plat-block{min-width:0}
+.est-plat-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;
+  padding-bottom:7px;margin-bottom:9px;border-bottom:1px solid var(--line)}
+.est-plat{font-size:13px;font-weight:700;color:var(--fg)}
+.est-bal{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums}
+.est-bal.dim{color:var(--dim2);font-size:12px;font-weight:600}
+.est-unit{font-size:10.5px;color:var(--dim2);font-weight:500;margin-left:2px}
+.est-meta{font-size:10.5px;color:var(--dim2)}
+.est-err{font-size:11px;color:var(--orange);margin-bottom:7px}
+/* 列内模型纵向堆叠 */
+.est-tiles{display:flex;flex-direction:column;gap:8px}
+.est-tile{border:1px solid var(--line);border-radius:11px;padding:11px 13px;background:var(--panel2)}
+.est-tile-num{font-size:24px;font-weight:800;letter-spacing:-.8px;line-height:1.1;
   color:var(--accent);font-variant-numeric:tabular-nums}
-.est-tile-label{font-size:10.5px;color:var(--dim2);font-weight:600;
+.est-tile-label{font-size:10px;color:var(--dim2);font-weight:600;
   letter-spacing:.5px;text-transform:uppercase;margin-top:-1px}
-.est-tile-model{font-size:12px;font-weight:600;margin-top:9px;overflow-wrap:anywhere;color:var(--fg)}
+.est-tile-model{font-size:11.5px;font-weight:600;margin-top:8px;overflow-wrap:anywhere;color:var(--fg)}
 .est-tile-meta{display:flex;justify-content:space-between;gap:8px;
-  font-size:11px;color:var(--dim);margin-top:4px}
+  font-size:10.5px;color:var(--dim);margin-top:3px}
 .est-tile-meta.est-dim{color:var(--dim2);display:block}
 .est-rate{white-space:nowrap;font-variant-numeric:tabular-nums}
-.est-empty{font-size:12px;color:var(--dim2);padding:6px 0}
-.est-folded{margin-top:10px}
-.est-folded>summary{font-size:11.5px;color:var(--dim);cursor:pointer;
-  padding:5px 8px;border-radius:8px;background:var(--panel);border:1px solid var(--line)}
+.est-empty{font-size:11.5px;color:var(--dim2);padding:5px 0}
+.est-folded{margin-top:8px}
+.est-folded>summary{font-size:11px;color:var(--dim);cursor:pointer;
+  padding:4px 7px;border-radius:7px;background:var(--panel);border:1px solid var(--line)}
 .est-folded>summary:hover{color:var(--fg)}
-.est-folded-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding:0 2px}
-.est-folded-list>span{font-size:11px;color:var(--dim2);background:var(--panel);
-  border:1px solid var(--line);border-radius:6px;padding:3px 7px}
+.est-folded-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px;padding:0 2px}
+.est-folded-list>span{font-size:10.5px;color:var(--dim2);background:var(--panel);
+  border:1px solid var(--line);border-radius:6px;padding:2px 6px}
 /* 账号序号列：窄、等宽、弱化，只为「数得清」服务，不抢账号名的注意力 */
 th.seq-cell,td.seq-cell{width:1%;white-space:nowrap;text-align:right;padding-right:2px;
   font-variant-numeric:tabular-nums;color:var(--dim2);font-size:12px;font-weight:500}
@@ -2619,11 +2621,11 @@ function renderEstimate(){
     tb.innerHTML='<div class="empty">预估加载中…</div>';
     return;
   }
-  // 每平台一行：标题行给「平台 + 余额」，下面是横排的模型块。
-  // 模型块把「预计 token」做成视觉主角（大字号），平台与单价退为注释——
-  // 用户关心的是「这个模型还能用多久」，不是平台名或单价本身。
+  // 平台横向并排：每个平台一列（列内模型纵向堆叠），跨平台一眼对比。
+  // 模型块里「预计 token」是大数字主角，平台名/单价/样本量退为注释。
   // 样本不足的模型折叠成一行计数（原来每个占一行「待测」，同一件事重复多遍）。
   let html='';
+  const blocks=[];
   for(const p of d.platforms){
     const errors=[p.error, p.usage_error?`用量读取失败：${p.usage_error}`:''].filter(Boolean);
     const known=p.known??p.enabled??0, total=p.total??p.enabled??0;
@@ -2645,7 +2647,6 @@ function renderEstimate(){
         <div class="est-tile-label">tokens</div>
         <div class="est-tile-model mono">${esc(m.model)}</div>
         <div class="est-tile-meta">
-          <span>${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
           <span class="est-rate">${Number(m.rate_per_mtok).toFixed(2)} <span class="est-unit">${esc(p.balance_unit||'分')}/Mtok</span></span>
         </div>
         ${detail?`<div class="est-tile-meta est-dim">${esc(detail)}</div>`:''}
@@ -2653,22 +2654,23 @@ function renderEstimate(){
       </div>`;
     }).join('');
     const folded=unpriced.length
-      ? `<details class="est-folded"><summary>另有 ${unpriced.length} 个模型样本不足，暂不预估</summary>
+      ? `<details class="est-folded"><summary>另有 ${unpriced.length} 个模型样本不足</summary>
            <div class="est-folded-list">${unpriced.map(m=>`<span class="mono">${esc(m.model)}</span>`).join('')}</div>
          </details>`
       : '';
     const body=priced.length?`<div class="est-tiles">${tiles}</div>`
       :'<div class="est-empty">暂无可预估的模型（样本不足）</div>';
-    html+=`<div class="est-plat-block">
+    blocks.push(`<div class="est-plat-block">
       <div class="est-plat-head">
         <span class="est-plat">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
         ${bal}
-        <span class="est-meta">${known}/${total} 个启用账号</span>
+        <span class="est-meta">${known}/${total} 账号</span>
       </div>
       ${errors.map(e=>`<div class="est-err">${esc(e)}</div>`).join('')}
       ${body}${folded}
-    </div>`;
+    </div>`);
   }
+  html=blocks.join('');
   tb.innerHTML=html||'<div class="empty">暂无数据</div>';
   const noteEl=document.getElementById('overview-estimate-note');
   if(noteEl){
