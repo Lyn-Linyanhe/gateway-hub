@@ -30,7 +30,11 @@
       "api_key": "xhx-your-key",
       "repo": "rsfree/xhx2api",
       "launch": {
-        "command": ["xhx2api.exe", "-config", "config.json"],
+        "command": [
+          "xhx2api.exe",
+          "-config",
+          "config.json"
+        ],
         "cwd": "..\\xiaohuanxiong2api"
       }
     },
@@ -41,7 +45,10 @@
       "panel_password": "replace-with-your-engine-panel-password",
       "repo": "shuishuipingan/trae2api-hub",
       "launch": {
-        "command": ["python", "trae_proxy.py"],
+        "command": [
+          "python",
+          "trae_proxy.py"
+        ],
         "cwd": "..\\trae2api-hub",
         "env": {
           "QODER_DISABLE": "1",
@@ -60,6 +67,12 @@
   "auto_multipliers": {},
   "qwenwork_reset_at": "",
   "model_caps": {
-    "qwenwork/frontier-1": {"vision": true}
+    "qwenwork/frontier-1": {
+      "vision": true
+    }
+  },
+  "automation_daily": {
+    "enabled": true,
+    "time": "09:00"
   }
 }

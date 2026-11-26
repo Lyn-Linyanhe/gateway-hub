@@ -3,7 +3,7 @@ import ast
 import hashlib
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import secrets
@@ -1228,6 +1228,44 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(scope['_upstream_health'](
             {'name': 'codearts', 'base_url': 'http://127.0.0.1:7866'}))
         self.assertTrue(seen['url'].endswith('/healthz'))
+
+    def test_automation_daily_cfg_parses_and_falls_back(self):
+        scope = isolated(ROOT / 'router.py', {'_automation_daily_cfg'},
+                         {'CONFIG': {'automation_daily': {'enabled': True, 'time': '09:30'}}})
+        cfg = scope['_automation_daily_cfg']()
+        self.assertTrue(cfg['enabled'])
+        self.assertEqual(cfg['time'], '09:30')
+        self.assertEqual((cfg['hour'], cfg['minute']), (9, 30))
+        bad = isolated(ROOT / 'router.py', {'_automation_daily_cfg'},
+                       {'CONFIG': {'automation_daily': {'enabled': True, 'time': '25:99'}}})
+        self.assertEqual(bad['_automation_daily_cfg']()['time'], '09:00')   # 笔误不影响定时器
+        missing = isolated(ROOT / 'router.py', {'_automation_daily_cfg'}, {'CONFIG': {}})
+        self.assertFalse(missing['_automation_daily_cfg']()['enabled'])
+
+    def test_automation_daily_due_respects_time_and_last_run(self):
+        scope = isolated(ROOT / 'router.py', {'_automation_daily_due'},
+                         {'datetime': datetime, 'timedelta': timedelta, 'timezone': timezone})
+        due = scope['_automation_daily_due']
+        cfg = {'enabled': True, 'hour': 9, 'minute': 0}
+        tz = timezone(timedelta(hours=8))
+        self.assertFalse(due(dict(cfg, enabled=False), '',
+                             datetime(2026, 11, 26, 10, 0, tzinfo=tz)))
+        self.assertFalse(due(cfg, '', datetime(2026, 11, 26, 8, 59, tzinfo=tz)))
+        self.assertTrue(due(cfg, '', datetime(2026, 11, 26, 9, 0, tzinfo=tz)))
+        self.assertTrue(due(cfg, '2026-11-25', datetime(2026, 11, 26, 9, 0, tzinfo=tz)))
+        self.assertFalse(due(cfg, '2026-11-26', datetime(2026, 11, 26, 18, 0, tzinfo=tz)))
+
+    def test_automation_daily_steps_only_checkin_and_supported(self):
+        plan = {'steps': [
+            {'step_id': 'a.checkin', 'kind': 'checkin', 'supported': True},
+            {'step_id': 'b.checkin', 'kind': 'checkin', 'supported': False},
+            {'step_id': 'a.task', 'kind': 'task', 'supported': True},
+        ]}
+        scope = isolated(ROOT / 'router.py', {'_automation_daily_steps'})
+        steps = scope['_automation_daily_steps']
+        self.assertEqual([s['step_id'] for s in steps(plan, [])], ['a.checkin'])
+        # 显式列表也过滤掉未启用平台的步骤
+        self.assertEqual([s['step_id'] for s in steps(plan, ['a.task', 'b.checkin'])], ['a.task'])
 
     def test_codearts_checkin_and_automation_specs_registered(self):
         paths = constant(ROOT / 'router.py', 'CHECKIN_PATHS')

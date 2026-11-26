@@ -21,7 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
@@ -954,6 +954,127 @@ def _automation_start(job):
     with _automation_lock:
         _automation_jobs[job["id"]] = job
     threading.Thread(target=_automation_run_step, args=(job["id"], 0), daemon=True).start()
+
+
+# ---- 每日定时自动化：到点自动跑签到 ----
+#
+# 网关此前只有「手动触发」的自动化 job；各引擎自己的签到调度各自为政
+# （xhx2api 9 点、codearts2api watchdog 30 分钟一轮）。这里补一条统一的
+# 每日任务：到点按计划里所有 supported 的 checkin 步骤跑一遍。
+#
+# 状态落盘只为「今天已跑过」，不保存业务结果；签到接口本身都是幂等的，
+# 所以即使网关在跑完后立刻重启、状态文件来不及写，重复执行也安全。
+
+AUTOMATION_DAILY_STATE = os.path.join(HERE, "automation_daily.json")
+_automation_daily_lock = threading.Lock()
+
+
+def _automation_daily_cfg():
+    """config.json 的 automation_daily：{enabled, time:"HH:MM", steps:[step_id]}。
+
+    steps 为空 = 计划里所有 checkin 步骤；显式给列表则只跑列出的。
+    时间非法时退回 09:00——一个笔误不该让定时器整天停摆。
+    """
+    cfg = CONFIG.get("automation_daily")
+    if not isinstance(cfg, dict):
+        return {"enabled": False, "time": "09:00", "hour": 9, "minute": 0, "steps": []}
+    hour, minute = 9, 0
+    text = str(cfg.get("time") or "09:00")
+    try:
+        head, _, tail = text.partition(":")
+        hour, minute = int(head), int(tail or 0)
+        if not (0 <= hour < 24 and 0 <= minute < 60):
+            raise ValueError(text)
+    except (TypeError, ValueError):
+        hour, minute = 9, 0
+    steps = [s.strip() for s in (cfg.get("steps") or [])
+             if isinstance(s, str) and s.strip()]
+    return {"enabled": bool(cfg.get("enabled")), "time": "%02d:%02d" % (hour, minute),
+            "hour": hour, "minute": minute, "steps": steps}
+
+
+def _automation_daily_last_run():
+    try:
+        with open(AUTOMATION_DAILY_STATE, encoding="utf-8") as handle:
+            return str(json.load(handle).get("last_run") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _automation_daily_mark(day):
+    tmp = AUTOMATION_DAILY_STATE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"last_run": day}, handle)
+        os.replace(tmp, AUTOMATION_DAILY_STATE)
+    except OSError:
+        pass
+
+
+def _automation_daily_due(cfg, last_run, now=None):
+    """到点且今天没跑过 → True。now 固定东八区，与账号签到口径一致。"""
+    if not cfg.get("enabled"):
+        return False
+    if now is None:
+        now = datetime.now(timezone(timedelta(hours=8)))
+    if last_run == now.strftime("%Y-%m-%d"):
+        return False
+    return (now.hour, now.minute) >= (cfg.get("hour", 9), cfg.get("minute", 0))
+
+
+def _automation_daily_steps(plan, wanted):
+    """从当前计划里挑出要跑的签到步骤；只保留 supported（平台启用且已配置）。"""
+    by_id = {s["step_id"]: s for s in plan.get("steps", [])}
+    ids = wanted or [s["step_id"] for s in plan.get("steps", []) if s.get("kind") == "checkin"]
+    return [dict(by_id[step_id]) for step_id in ids
+            if step_id in by_id and by_id[step_id].get("supported")]
+
+
+def _automation_daily_run():
+    """建一个只含签到步骤的 job 并立刻开始执行；返回 job id 或 None。"""
+    cfg = _automation_daily_cfg()
+    plan = _automation_plan()
+    steps = _automation_daily_steps(plan, cfg["steps"])
+    if not steps:
+        log("automation daily: 没有可执行的签到步骤，跳过")
+        return None
+    day = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    job = {"id": secrets.token_urlsafe(12), "status": "queued",
+           "plan_version": plan["version"], "idempotency_key": "daily-" + day,
+           "created_at": _automation_now(), "updated_at": _automation_now(),
+           "started_at": None, "finished_at": None, "current_step": "",
+           "current_index": 0, "completed": 0,
+           "counts": {s: 0 for s in ("succeeded", "skipped", "failed", "partial",
+                                     "unknown", "submitted")},
+           "steps": steps}
+    with _automation_lock:
+        _automation_jobs[job["id"]] = job
+        _automation_idempotency["daily-" + day] = job["id"]
+        while len(_automation_jobs) > _AUTOMATION_JOB_LIMIT:
+            old = next((jid for jid, item in _automation_jobs.items()
+                        if item.get("status") not in ("queued", "running")
+                        and jid != job["id"]), None)
+            if old is None:
+                break
+            _automation_jobs.pop(old, None)
+            for old_key, old_job in list(_automation_idempotency.items()):
+                if old_job == old:
+                    _automation_idempotency.pop(old_key, None)
+    _automation_daily_mark(day)
+    log("automation daily: 触发 %s（%s）" % (job["id"], ",".join(s["step_id"] for s in steps)))
+    threading.Thread(target=_automation_run_step, args=(job["id"], 0), daemon=True).start()
+    return job["id"]
+
+
+def _automation_daily_loop():
+    while True:
+        try:
+            cfg = _automation_daily_cfg()
+            if _automation_daily_due(cfg, _automation_daily_last_run()):
+                _automation_daily_run()
+        except Exception as exc:
+            log("automation daily loop error: %s: %s" % (type(exc).__name__, exc))
+        time.sleep(30)
 
 
 def _automation_public(job):
@@ -3663,6 +3784,16 @@ PLATFORM_BALANCE_UNIT = {
     "trae": "Trae 积分（信用）",
 }
 
+#: 不参与「额度可用量预估」的平台。
+#:
+#: codearts 的引擎既不提供积分余额（`credits` 恒为 0，只记录「领取动作成功」
+#: 而非「领到多少」），也没有任何用量端点（/usage/recent、/admin/api/usage
+#: 全是 404）。列进预估只会得到一行 HTTPError + 一串「待测」，是纯噪音。
+#: 上游华为云 CodeArts 的积分余额在网页 portal 的私有接口里，需要 portal
+#: session 而非 API token；2026-11-26 的二进制逆向与抓包都没能稳定挖出路径。
+#: 它的签到状态与 token 有效期仍在账号页正常展示。
+ESTIMATE_EXCLUDED = {"codearts"}
+
 
 def estimate_snapshot(force=False):
     """额度预估：每个平台、每个模型分别按实测有效单价（分/Mtok）估算。
@@ -3684,6 +3815,9 @@ def estimate_snapshot(force=False):
     out = []
     for up in active_upstreams():
         name = up["name"]
+        if name in ESTIMATE_EXCLUDED:
+            # 引擎不提供余额与用量，估不出来（见 ESTIMATE_EXCLUDED 注释）。
+            continue
         st = platform_status(up)
         accounts = [a for a in st.get("accounts", []) if a.get("enabled")]
         known_balances = [v for v in (_known_num(a.get("remain")) for a in accounts) if v is not None]
@@ -6105,6 +6239,13 @@ def main():
     names = ", ".join(u["name"] + ":" + u["base_url"] for u in CONFIG["upstreams"])
     log(f"gateway-hub v{VERSION} 启动 port={port} upstreams=[{names}]")
     log("API Key 已配置（请在本机 config.json 中查看）")
+    daily = _automation_daily_cfg()
+    if daily["enabled"]:
+        threading.Thread(target=_automation_daily_loop, daemon=True).start()
+        log("每日自动化已启用：%s（%s）" % (
+            daily["time"], ",".join(daily["steps"]) or "计划内全部签到步骤"))
+    else:
+        log("每日自动化未启用（config.json 的 automation_daily.enabled）")
     try:
         server = Server(("127.0.0.1", port), Handler)
     except OSError as exc:
