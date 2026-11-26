@@ -492,7 +492,8 @@ class GatewayTests(unittest.TestCase):
         handler._send_json = Mock()
         self.ns.update(urllib=urllib,
                        CONFIG={'upstreams': [{'name': 'raccoon'}]},
-                       CHECKIN_PATHS={'raccoon': ('/panel/api/checkin_all', 'bearer')})
+                       CHECKIN_PATHS={'raccoon': ('/panel/api/checkin_all', 'bearer')},
+                       _checkin_timeout=lambda name: 600)
         for upstream_result in ({}, {'ok': False, 'failed': 0}, None):
             with self.subTest(result=upstream_result):
                 self.ns['engine_request'] = Mock(return_value=upstream_result)
@@ -1548,7 +1549,8 @@ class GatewayTests(unittest.TestCase):
     def test_checkin_zero_of_n_is_not_ok(self):
         from unittest.mock import Mock
         self.ns.update(CONFIG={'upstreams':[{'name':'qoder'}]},
-                       CHECKIN_PATHS={'qoder':('/accounts/checkin','panel')})
+                       CHECKIN_PATHS={'qoder':('/accounts/checkin','panel')},
+                       _checkin_timeout=lambda name: 15)
         for payload, expected_ok, expected_partial in (
                 ({'results':[{'uid':'a'},{'ok':False}]}, False, False),
                 ({'results':[{'ok':True},{'ok':False}]}, False, True),
