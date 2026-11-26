@@ -1232,6 +1232,14 @@ class GatewayTests(unittest.TestCase):
             {'name': 'codearts', 'base_url': 'http://127.0.0.1:7866'}))
         self.assertTrue(seen['url'].endswith('/healthz'))
 
+    def test_checkin_timeout_covers_long_claimers(self):
+        scope = isolated(ROOT / 'router.py', {'_checkin_timeout'},
+                         {'CHECKIN_TIMEOUTS': constant(ROOT / 'router.py', 'CHECKIN_TIMEOUTS')})
+        timeout = scope['_checkin_timeout']
+        self.assertEqual(timeout('raccoon'), 600)
+        self.assertEqual(timeout('codearts'), 600)   # 多活动领取，15s 不够
+        self.assertEqual(timeout('trae'), 15)
+
     def test_automation_daily_cfg_parses_and_falls_back(self):
         scope = isolated(ROOT / 'router.py', {'_automation_daily_cfg'},
                          {'CONFIG': {'automation_daily': {'enabled': True, 'time': '09:30'}}})
@@ -2952,7 +2960,7 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  fetchImpl=async p=>reply(p.startsWith('/api/usage')?{rows}:{items:[]});
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:null,known:0,total:1,models:[{model:'qwen4-max',rate_per_mtok:null,rate_source:'unknown',est_tokens:null,note:'余额待测，暂不估算',samples:0}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/待测/);
- assert.match(el('overview-estimate').innerHTML,/已知 0\/1/);
+ assert.match(el('overview-estimate').innerHTML,/0\/1 个启用账号/);
  // 余额为 null 时不能渲染成「0 分」（卡片版把数值与单位分成两个 span）
  assert.doesNotMatch(el('overview-estimate').innerHTML,/<span class="est-bal">0<\/span>/);
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:0,known:1,total:1,models:[{model:'qwen4-max',rate_per_mtok:51.02,rate_source:'anchored',est_tokens:0,note:'短样本相对价 × 钱包实测均价锚定',samples:3,sample_tokens:1000000,sample_hours:24}]}]}};renderEstimate()");

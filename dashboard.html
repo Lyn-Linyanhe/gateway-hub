@@ -145,26 +145,31 @@ td.num,th.num{text-align:right}
 .bar>i.low{background:var(--orange)}
 .name-cell{font-weight:600}
 .sub-cell{font-size:11px;color:var(--dim2)}
-/* ── 额度预估：卡片列表（不用表格，避免 13 行溢出 max-height 出现内嵌滚动条）── */
-.est-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
-.est-card{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--panel2)}
-.est-card-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
-  padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--line)}
+/* ── 额度预估：平台一行 + 横排模型块（大数字是主角，平台/单价退为注释）── */
+.est-list{display:flex;flex-direction:column;gap:18px}
+.est-plat-block{display:block}
+.est-plat-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+  padding-bottom:8px;margin-bottom:10px;border-bottom:1px solid var(--line)}
 .est-plat{font-size:13.5px;font-weight:700;color:var(--fg)}
-.est-bal{font-size:19px;font-weight:800;letter-spacing:-.3px;font-variant-numeric:tabular-nums}
-.est-bal.dim{color:var(--dim2);font-size:15px;font-weight:600}
-.est-unit{font-size:11px;color:var(--dim2);font-weight:500}
+.est-bal{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+.est-bal.dim{color:var(--dim2);font-size:12.5px;font-weight:600}
+.est-unit{font-size:11px;color:var(--dim2);font-weight:500;margin-left:3px}
 .est-meta{font-size:11px;color:var(--dim2)}
 .est-err{font-size:11.5px;color:var(--orange);margin-bottom:8px}
-.est-model{padding:8px 0;border-bottom:1px dashed var(--line)}
-.est-model:last-of-type{border-bottom:none}
-.est-model-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
-.est-model-name{font-size:12.5px;font-weight:600;overflow-wrap:anywhere}
-.est-rate{font-size:12px;color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
-.est-model-foot{display:flex;gap:10px;flex-wrap:wrap;margin-top:3px}
-.est-tokens{font-size:12px;font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums}
+/* 横排：窄屏自动折行，每块最小 150px，避免挤压大数字 */
+.est-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:10px}
+.est-tile{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel2)}
+.est-tile-num{font-size:26px;font-weight:800;letter-spacing:-.8px;line-height:1.1;
+  color:var(--accent);font-variant-numeric:tabular-nums}
+.est-tile-label{font-size:10.5px;color:var(--dim2);font-weight:600;
+  letter-spacing:.5px;text-transform:uppercase;margin-top:-1px}
+.est-tile-model{font-size:12px;font-weight:600;margin-top:9px;overflow-wrap:anywhere;color:var(--fg)}
+.est-tile-meta{display:flex;justify-content:space-between;gap:8px;
+  font-size:11px;color:var(--dim);margin-top:4px}
+.est-tile-meta.est-dim{color:var(--dim2);display:block}
+.est-rate{white-space:nowrap;font-variant-numeric:tabular-nums}
 .est-empty{font-size:12px;color:var(--dim2);padding:6px 0}
-.est-folded{margin-top:8px}
+.est-folded{margin-top:10px}
 .est-folded>summary{font-size:11.5px;color:var(--dim);cursor:pointer;
   padding:5px 8px;border-radius:8px;background:var(--panel);border:1px solid var(--line)}
 .est-folded>summary:hover{color:var(--fg)}
@@ -2614,37 +2619,37 @@ function renderEstimate(){
     tb.innerHTML='<div class="empty">预估加载中…</div>';
     return;
   }
-  // 卡片列表而不是表格：每平台一张卡，无内嵌滚动条（表格版 13 行必然溢出
-  // max-height，逼出双层滚动）。样本不足的模型折叠成一行计数，避免「待测」
-  // 占满屏幕——它们是同一件事的重复。
+  // 每平台一行：标题行给「平台 + 余额」，下面是横排的模型块。
+  // 模型块把「预计 token」做成视觉主角（大字号），平台与单价退为注释——
+  // 用户关心的是「这个模型还能用多久」，不是平台名或单价本身。
+  // 样本不足的模型折叠成一行计数（原来每个占一行「待测」，同一件事重复多遍）。
   let html='';
   for(const p of d.platforms){
     const errors=[p.error, p.usage_error?`用量读取失败：${p.usage_error}`:''].filter(Boolean);
     const known=p.known??p.enabled??0, total=p.total??p.enabled??0;
     const bal=p.balance!=null
-      ? `<span class="est-bal">${fmt(p.balance)}</span> <span class="est-unit">${esc(p.balance_unit||'分')}</span>`
-      : '<span class="est-bal dim">待测</span>';
+      ? `<span class="est-bal">${fmt(p.balance)}</span><span class="est-unit">${esc(p.balance_unit||'分')}</span>`
+      : '<span class="est-bal dim">余额待测</span>';
     const models=(p.models||[]);
-    // 只把有实测单价的模型铺开；其余折叠。
     const priced=models.filter(m=>m.rate_per_mtok!=null);
     const unpriced=models.filter(m=>m.rate_per_mtok==null);
-    const modelRows=priced.map(m=>{
-      const scope=m.balance_scope
-        ?`<span class="est-meta">${esc(m.balance_scope)}${m.model_balance!=null?` · 可用 ${fmt(m.model_balance)}`:' · 余额待测'}</span>`:'';
+    const tiles=priced.map(m=>{
+      // 单模型可用余额优先（跨区/分池时与平台总额不同），否则用平台余额。
+      const usable=m.model_balance!=null?m.model_balance:p.balance;
+      const tokens=m.est_tokens!=null?fmtTok(m.est_tokens):'—';
       const detail=[m.samples?`${m.samples} 条样本`:null,
-                    m.sample_tokens?`${fmtTok(m.sample_tokens)} tok`:null,
-                    m.sample_hours!=null?`覆盖 ${m.sample_hours}h`:null]
+                    m.sample_hours!=null?`${m.sample_hours}h`:null]
                    .filter(Boolean).join(' · ');
-      return `<div class="est-model">
-        <div class="est-model-head">
-          <span class="mono est-model-name">${esc(m.model)}</span>
+      return `<div class="est-tile">
+        <div class="est-tile-num">${tokens}</div>
+        <div class="est-tile-label">tokens</div>
+        <div class="est-tile-model mono">${esc(m.model)}</div>
+        <div class="est-tile-meta">
+          <span>${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
           <span class="est-rate">${Number(m.rate_per_mtok).toFixed(2)} <span class="est-unit">${esc(p.balance_unit||'分')}/Mtok</span></span>
         </div>
-        <div class="est-model-foot">
-          <span class="est-tokens">≈ ${m.est_tokens!=null?fmtTok(m.est_tokens):'—'} tokens</span>
-          ${detail?`<span class="est-meta">${esc(detail)}</span>`:''}
-          ${scope}
-        </div>
+        ${detail?`<div class="est-tile-meta est-dim">${esc(detail)}</div>`:''}
+        ${m.balance_scope?`<div class="est-tile-meta est-dim">${esc(m.balance_scope)}${usable!=null?` · 可用 ${fmt(usable)}`:''}</div>`:''}
       </div>`;
     }).join('');
     const folded=unpriced.length
@@ -2652,12 +2657,13 @@ function renderEstimate(){
            <div class="est-folded-list">${unpriced.map(m=>`<span class="mono">${esc(m.model)}</span>`).join('')}</div>
          </details>`
       : '';
-    const body=modelRows||'<div class="est-empty">暂无可预估的模型（样本不足）</div>';
-    html+=`<div class="est-card">
-      <div class="est-card-head">
+    const body=priced.length?`<div class="est-tiles">${tiles}</div>`
+      :'<div class="est-empty">暂无可预估的模型（样本不足）</div>';
+    html+=`<div class="est-plat-block">
+      <div class="est-plat-head">
         <span class="est-plat">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
         ${bal}
-        <span class="est-meta">已知 ${known}/${total} 个启用账号</span>
+        <span class="est-meta">${known}/${total} 个启用账号</span>
       </div>
       ${errors.map(e=>`<div class="est-err">${esc(e)}</div>`).join('')}
       ${body}${folded}
