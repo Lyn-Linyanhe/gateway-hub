@@ -1,0 +1,57 @@
+--- pure
+
++++ cur
+
+@@ -1242,4 +1242,8 @@
+
+         # global setting by AccountPool.apply_reserve_credits(); 0 disables it.
+         self.reserve_credits = 0
++        # 该账号是否已经跨过 reserve 门槛。跨过之后可以一路用完，不会被门槛
++        # 从中间切断；余额归零后重新回到「未激活」，等充值/签到攒回门槛以上
++        # 才会再次放开。运行时状态，不落盘（重启后按当前余额重新判定）。
++        self.reserve_activated = False
+         # Expiring-credits preference: while this account's soonest-expiring
+         # credit package is inside this many days, the pool hands the account
+@@ -1569,4 +1573,11 @@
+
+         A positive reserve exempts models the realm catalogue marks free;
+         paid, unknown, and model-less calls retain the account-level guard.
++
++        The reserve is a *parking* threshold, not a hard floor. Once an
++        account's balance has crossed above the reserve it stays usable while
++        it spends down, so a running conversation is not cut in half the moment
++        the balance dips below the threshold it was activated with. It is
++        parked again when the balance is exhausted, and becomes eligible only
++        after a refresh shows it back above the reserve.
+         """
+         reserve = int(self.reserve_credits or 0)
+@@ -1585,5 +1596,14 @@
+
+         except (TypeError, ValueError):
+             return False
+-        return remain <= reserve
++        if remain <= 0:
++            # Truly exhausted: never handed out, activated or not.
++            return True
++        if remain > reserve:
++            # Above the reserve: usable, and remember that it has qualified.
++            self.reserve_activated = True
++            return False
++        # Below the reserve but not empty: only accounts that never qualified
++        # are held back. An activated account keeps serving until it empties.
++        return not bool(getattr(self, "reserve_activated", False))
+ 
+     def consume_credit(self, amount):
+@@ -4886,5 +4906,10 @@
+
+         with self._lock:
+             for account in self.accounts:
+-                account.reserve_credits = _realm_limit(values, account.realm)
++                new_reserve = _realm_limit(values, account.realm)
++                # 门槛值变了就重新判定一次「是否够格」：否则把门槛从 0 调高
++                # 时，之前从未跨过门槛的账号会因为残留的激活标记而被直接放行。
++                if new_reserve != int(account.reserve_credits or 0):
++                    account.reserve_activated = False
++                account.reserve_credits = new_reserve
+                 if free_models is not None:
+                     account.free_models = frozenset(

@@ -1,0 +1,106 @@
+diff --git a/qoder_accounts.py b/qoder_accounts.py
+index da75131..ea56de8 100644
+--- a/qoder_accounts.py
++++ b/qoder_accounts.py
+@@ -3445,8 +3445,24 @@ class Account(object):
+ 
+ 
+     def _checkin_stamped_today(self):
+-        """#25-e：本地今天是否已盖章（防重复写盘的短路判据）。"""
+-        return str(self.last_checkin or "").startswith(time.strftime("%Y-%m-%d"))
++        """#25-e：本地是否已在**当前签到窗口**盖章（防重复写盘的短路判据）。
++
++        官方每日奖励按 10:00（UTC+8）刷新，不是自然日 00:00。旧实现比
++        "%Y-%m-%d" 日期：任何 10:00 之前的尝试（调度器 09:00 档，或用户在
++        09:xx 手点一次）碰到的是**上一个窗口**的 CLAIMED 活动，却把今天
++        盖了章 —— 10:00 之后 can_checkin() 恒 False（启动补签也被挡），
++        看板显示「今日已签」而当天 100 Credits 还没到账。
++        窗口起点与 next_checkin_window() 同源：下一个 10:00 边界 - 24h。
++        """
++        raw = str(self.last_checkin or "")
++        if not raw:
++            return False
++        try:
++            ts = time.mktime(time.strptime(raw[:19], "%Y-%m-%d %H:%M:%S"))
++        except (ValueError, OverflowError):
++            # 兼容非标准时间串：退回自然日判断，至少不会误判成"未签"
++            return raw.startswith(time.strftime("%Y-%m-%d"))
++        return ts >= next_checkin_window()[0] - 86400
+ 
+     def _note_quota_anomaly(self, raw, reason):
+         """#25-d：记录一次「不可信的 quota 响应」并**保留旧快照**。
+diff --git a/qoder_proxy.py b/qoder_proxy.py
+index 9febef5..d668412 100644
+--- a/qoder_proxy.py
++++ b/qoder_proxy.py
+@@ -1386,10 +1386,28 @@ def _refreshable_accounts(accounts):
+ 
+ 
+ def account_views(realm=None):
+-    """List view of every account, including a live readiness flag."""
++    """List view of every account, including a live readiness flag.
++
++    附带账号级并发：当前租约数（team_leases 在飞）+ 闸门上限（0=不限）。
++    团队/企业号默认 1；个人号不走闸门，给 0 表示不限。网关账号页直接展示。
++    """
+     if not POOL:
+         return []
+-    return POOL.list_public(realm=realm)
++    rows = POOL.list_public(realm=realm)
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        try:
++            acc = POOL.get(row.get("uid"))
++            if acc is None:
++                continue
++            row["inflight"] = len(getattr(acc, "team_leases", {}) or {})
++            row["concurrencyLimit"] = (_team_max_concurrency()
++                                       if _team_guard_on(acc) else 0)
++        except Exception:
++            row.setdefault("inflight", 0)
++            row.setdefault("concurrencyLimit", 0)
++    return rows
+ 
+ 
+ _CREDITS_SUMMARY_NOTE = ("registered values only; freshness depends on "
+diff --git a/qoder_scheduler.py b/qoder_scheduler.py
+index 2d20d6b..3973581 100644
+--- a/qoder_scheduler.py
++++ b/qoder_scheduler.py
+@@ -504,6 +504,13 @@ class Scheduler(object):
+         self._save_state()
+ 
+     def status(self):
++        # next_run_time 只在 _apply_schedule()（启动/改排程）时算过一次，之后
++        # 不随时间推进——实测进程跑过一天后仍显示「昨天 21:00」。读状态时重算
++        # 一次，面板/网关看到的「下次巡检」才不是过期值。
++        try:
++            self._calc_next_fire()
++        except Exception:
++            pass
+         return {
+             "enabled": self.enabled,
+             "checkin_times": self._fmt_times(self.checkin_times),
+diff --git a/tests/_test_account_checkin_status.py b/tests/_test_account_checkin_status.py
+index b2a95c1..fff5f29 100644
+--- a/tests/_test_account_checkin_status.py
++++ b/tests/_test_account_checkin_status.py
+@@ -14,12 +14,15 @@ declare_suite(__file__, ["qoder_accounts.py", "dashboard.html"])
+ print("[acct] 今日签到状态")
+ _acc = A.Account({"uid": "u-ck-1", "realm": "cn", "accessToken": "t"})
+ check("初始为未签到", _acc._checkin_stamped_today() is False)
+-_acc.last_checkin = time.strftime("%Y-%m-%d") + " 09:00:00"
+-check("今天签到过 -> True", _acc._checkin_stamped_today() is True)
++_acc.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
++check("当前签到窗口内签到过 -> True", _acc._checkin_stamped_today() is True)
+ _pub = _acc.public()
+ check("public() 暴露 checkedInToday", _pub.get("checkedInToday") is True, _pub.get("checkedInToday"))
+ check("public() 暴露 lastCheckinDate", _pub.get("lastCheckinDate") == time.strftime("%Y-%m-%d"),
+       _pub.get("lastCheckinDate"))
++# 10:00 刷新窗口：昨天 09:00 已属于上一个窗口，不应被当成当前窗口已签。
++_acc.last_checkin = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400)) + " 09:00:00"
++check("跨窗口的旧签到不算今天", _acc._checkin_stamped_today() is False)
+ check("public() 暴露 lastCreditsDelta 字段（可为 None）",
+       "lastCreditsDelta" in _pub and "lastCreditsDeltaAt" in _pub)
+ 

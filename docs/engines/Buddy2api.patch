@@ -1,0 +1,1721 @@
+diff --git a/database.py b/database.py
+index 539b654..c070154 100644
+--- a/database.py
++++ b/database.py
+@@ -393,11 +393,15 @@ def init_db():
+             completion_tokens INTEGER DEFAULT 0,
+             total_tokens    INTEGER DEFAULT 0,
+             credit          REAL DEFAULT 0,
++            cached_tokens   INTEGER,
++            cacheable_tokens INTEGER,
+             finish_reason   TEXT,
+             duration_ms     INTEGER,
+             status_code     INTEGER,
+             error_msg       TEXT,
+-            created_at      INTEGER
++            created_at      INTEGER,
++            reasoning       TEXT,
++            reasoning_effort TEXT
+         );
+ 
+         CREATE TABLE IF NOT EXISTS settings (
+@@ -432,6 +436,8 @@ def init_db():
+         _migrate_api_keys(conn)
+         _migrate_workbuddy_regions(conn)
+         _migrate_logs_provider(conn)
++        _migrate_logs_reasoning(conn)
++        _migrate_logs_cache(conn)
+         _migrate_logs_resolved_model(conn)
+         conn.execute("""
+             CREATE TABLE IF NOT EXISTS api_key_daily_usage (
+@@ -678,6 +684,27 @@ def _migrate_logs_provider(conn: sqlite3.Connection):
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider)")
+ 
+ 
++def _migrate_logs_reasoning(conn: sqlite3.Connection):
++    """思考状态列（gateway-hub 聚合看板的推理强度展示用）：mode + 具体档位。"""
++    cols = {r["name"] for r in conn.execute("PRAGMA table_info(logs)").fetchall()}
++    if "reasoning" not in cols:
++        conn.execute("ALTER TABLE logs ADD COLUMN reasoning TEXT")
++    if "reasoning_effort" not in cols:
++        conn.execute("ALTER TABLE logs ADD COLUMN reasoning_effort TEXT")
++
++
++def _migrate_logs_cache(conn: sqlite3.Connection):
++    """上游 prompt cache 计量列：cached_tokens / cacheable_tokens（NULL=未知）。"""
++    if conn.in_transaction:
++        conn.commit()
++    cols = {r["name"] for r in conn.execute("PRAGMA table_info(logs)").fetchall()}
++    if "cached_tokens" not in cols:
++        conn.execute("ALTER TABLE logs ADD COLUMN cached_tokens INTEGER")
++    if "cacheable_tokens" not in cols:
++        conn.execute("ALTER TABLE logs ADD COLUMN cacheable_tokens INTEGER")
++    conn.commit()
++
++
+ def _migrate_logs_resolved_model(conn: sqlite3.Connection):
+     # Schema DDL must not ride an already-open transaction: init_db's
+     # executescript leaves one open (Python 3.13 no longer commits for it), and
+@@ -1255,14 +1282,16 @@ def add_log(data: dict):
+             INSERT INTO logs
+                 (api_key_id, api_key_name, account_id, account_name, model, stream,
+                  prompt_tokens, completion_tokens, total_tokens, credit,
++                 cached_tokens, cacheable_tokens,
+                  finish_reason, duration_ms, status_code, error_msg, provider, resolved_model, created_at)
+-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
++            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         """, (
+             data.get("api_key_id"), data.get("api_key_name"),
+             data.get("account_id"), data.get("account_name"),
+             data.get("model", ""), data.get("stream", 0),
+             data.get("prompt_tokens", 0), data.get("completion_tokens", 0),
+             data.get("total_tokens", 0), data.get("credit", 0),
++            data.get("cached_tokens"), data.get("cacheable_tokens"),
+             data.get("finish_reason", ""), data.get("duration_ms", 0),
+             data.get("status_code", 200), data.get("error_msg", ""),
+             data.get("provider") or "workbuddy",
+@@ -1283,8 +1312,10 @@ def record_request(data: dict):
+                 INSERT INTO logs
+                     (api_key_id, api_key_name, account_id, account_name, model, resolved_model, stream,
+                      prompt_tokens, completion_tokens, total_tokens, credit,
+-                     finish_reason, duration_ms, status_code, error_msg, provider, created_at)
+-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
++                     cached_tokens, cacheable_tokens,
++                     finish_reason, duration_ms, status_code, error_msg, provider, created_at,
++                     reasoning, reasoning_effort)
++                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 """,
+                 (
+                     data.get("api_key_id"), data.get("api_key_name"),
+@@ -1293,9 +1324,11 @@ def record_request(data: dict):
+                     data.get("stream", 0),
+                     data.get("prompt_tokens", 0), data.get("completion_tokens", 0),
+                     data.get("total_tokens", 0), data.get("credit", 0),
++                    data.get("cached_tokens"), data.get("cacheable_tokens"),
+                     data.get("finish_reason", ""), data.get("duration_ms", 0),
+                     data.get("status_code", 200), data.get("error_msg", ""),
+                     data.get("provider") or "workbuddy", now,
++                    data.get("reasoning"), data.get("reasoning_effort"),
+                 ),
+             )
+             if data.get("account_id") and data.get("increment_usage", True):
+diff --git a/providers/qwenwork/chat.py b/providers/qwenwork/chat.py
+index 5c8d0b5..967301f 100644
+--- a/providers/qwenwork/chat.py
++++ b/providers/qwenwork/chat.py
+@@ -1,628 +1,766 @@
+-"""QwenWork chat client. Isolated COSY/SSE stack; never uses WorkBuddy fingerprint."""
+-
+-from __future__ import annotations
+-
+-import json
+-import time
+-import uuid
+-from typing import AsyncGenerator
+-
+-import httpx
+-
+-from tls_context import TLS_CONTEXT
+-
+-import rate_limiter
+-
+-import auth_manager
+-import database as db
++"""QwenWork chat client. Isolated COSY/SSE stack; never uses WorkBuddy fingerprint."""
++
++from __future__ import annotations
++
++import json
++import time
++import uuid
++from typing import AsyncGenerator
++
++import httpx
++
++from tls_context import TLS_CONTEXT
++
++import rate_limiter
++
++import auth_manager
++import database as db
+ from providers.usage import credit_amount, token_counts
+-from reasoning_controls import resolve_reasoning_control
+-from providers.qwenwork import cosy
+-from providers.qwenwork.encode import EncodeError
+-from providers.qwenwork.constants import (
+-    BUILD,
+-    BUSINESS_PRODUCT,
+-    BUSINESS_TYPE,
+-    CHANNEL_ID,
+-    CHAT_PATH,
+-    CHAT_QUERY,
+-    CLIENT_TYPE,
+-    COSY_VERSION,
+-    DATA_POLICY,
+-    GATEWAY,
+-    IDE_VERSION,
+-    LOGIN_VERSION,
+-    MACHINE_OS,
+-    MACHINE_TYPE,
+-    RELEASE_VERSION,
+-    RETRYABLE_STATUS,
+-    SCENE,
+-    USER_AGENT,
+-)
+-from providers.qwenwork.token import is_token_expired, refresh_account
+-
+-
+-def translate_model(model: str) -> str:
+-    import aliases
+-
+-    inner = (model or "qwork-advanced").strip() or "qwork-advanced"
+-    return aliases.resolve(CHANNEL_ID, inner)
+-
+-
+-def chat_url() -> str:
+-    return f"{GATEWAY}{CHAT_PATH}?{CHAT_QUERY}"
+-
+-
+-def _packed_request(account: dict, raw: str, model: str) -> tuple[str, dict[str, str], str]:
+-    from providers.qwenwork.encode import prepare_infer
+-
+-    uid, name, email, token = _ids(account)
+-    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+-    machine_id = str(extra.get("login_device_id") or "")
+-    prepared = prepare_infer(
+-        body=raw,
+-        model_key=model,
+-        machine_id=machine_id,
+-        uid=uid,
+-        name=name,
+-        email=email,
+-        access_token=token,
+-    )
+-    headers = static_headers(model, str(uuid.uuid4()), machine_id)
+-    headers.update(prepared.headers)
+-    return prepared.url, headers, prepared.body
+-
+-
+-def _ids(account: dict) -> tuple[str, str, str, str]:
+-    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+-    uid = str(account.get("uid") or extra.get("uid") or "")
+-    name = str(account.get("nickname") or account.get("name") or extra.get("name") or "")
+-    email = str(extra.get("email") or "")
+-    token = str(account.get("access_token") or "")
+-    return uid, name, email, token
+-
+-
+-def _log(api_key_info, account, model_name, stream, prompt_t, completion_t, total_t,
+-         finish_reason, status_code, error_msg, t0, increment_usage=True, *, usage=None):
+-    try:
+-        db.record_request(
+-            {
+-                "api_key_id": api_key_info["id"] if api_key_info else None,
+-                "api_key_name": api_key_info["name"] if api_key_info else None,
+-                "account_id": account["id"] if account else None,
+-                "account_name": account.get("name") if account else None,
+-                "provider": CHANNEL_ID,
+-                "model": model_name,
+-                "resolved_model": (api_key_info.get("_resolved_model")
+-                                   if isinstance(api_key_info, dict) else None) or model_name,
+-                "stream": 1 if stream else 0,
+-                "prompt_tokens": prompt_t,
+-                "completion_tokens": completion_t,
+-                "total_tokens": total_t,
++from reasoning_controls import resolve_reasoning_control
++from providers.qwenwork import cosy
++from providers.qwenwork.encode import EncodeError
++from providers.qwenwork.constants import (
++    BUILD,
++    BUSINESS_PRODUCT,
++    BUSINESS_TYPE,
++    CHANNEL_ID,
++    CHAT_PATH,
++    CHAT_QUERY,
++    CLIENT_TYPE,
++    COSY_VERSION,
++    DATA_POLICY,
++    GATEWAY,
++    IDE_VERSION,
++    LOGIN_VERSION,
++    MACHINE_OS,
++    MACHINE_TYPE,
++    RELEASE_VERSION,
++    RETRYABLE_STATUS,
++    SCENE,
++    USER_AGENT,
++)
++from providers.qwenwork.token import is_token_expired, refresh_account
++
++
++def translate_model(model: str) -> str:
++    import aliases
++
++    inner = (model or "qwork-advanced").strip() or "qwork-advanced"
++    return aliases.resolve(CHANNEL_ID, inner)
++
++
++def chat_url() -> str:
++    return f"{GATEWAY}{CHAT_PATH}?{CHAT_QUERY}"
++
++
++def _packed_request(account: dict, raw: str, model: str) -> tuple[str, dict[str, str], str]:
++    from providers.qwenwork.encode import prepare_infer
++
++    uid, name, email, token = _ids(account)
++    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
++    machine_id = str(extra.get("login_device_id") or "")
++    prepared = prepare_infer(
++        body=raw,
++        model_key=model,
++        machine_id=machine_id,
++        uid=uid,
++        name=name,
++        email=email,
++        access_token=token,
++    )
++    headers = static_headers(model, str(uuid.uuid4()), machine_id)
++    headers.update(prepared.headers)
++    return prepared.url, headers, prepared.body
++
++
++def _ids(account: dict) -> tuple[str, str, str, str]:
++    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
++    uid = str(account.get("uid") or extra.get("uid") or "")
++    name = str(account.get("nickname") or account.get("name") or extra.get("name") or "")
++    email = str(extra.get("email") or "")
++    token = str(account.get("access_token") or "")
++    return uid, name, email, token
++
++
++def _log(api_key_info, account, model_name, stream, prompt_t, completion_t, total_t,
++         finish_reason, status_code, error_msg, t0, increment_usage=True, *, usage=None,
++         reasoning=None, reasoning_effort=None):
++    try:
++        details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
++        cached = details.get("cached_tokens") if isinstance(details, dict) else None
++        cacheable = details.get("cacheable_tokens") if isinstance(details, dict) else None
++        db.record_request(
++            {
++                "api_key_id": api_key_info["id"] if api_key_info else None,
++                "api_key_name": api_key_info["name"] if api_key_info else None,
++                "account_id": account["id"] if account else None,
++                "account_name": account.get("name") if account else None,
++                "provider": CHANNEL_ID,
++                "model": model_name,
++                "resolved_model": (api_key_info.get("_resolved_model")
++                                   if isinstance(api_key_info, dict) else None) or model_name,
++                "stream": 1 if stream else 0,
++                "prompt_tokens": prompt_t,
++                "completion_tokens": completion_t,
++                "total_tokens": total_t,
+                 "credit": credit_amount(usage),
+-                "finish_reason": finish_reason,
+-                "duration_ms": int((time.time() - t0) * 1000),
+-                "status_code": status_code,
+-                "error_msg": error_msg,
+-                "increment_usage": increment_usage,
+-            }
+-        )
+-    except Exception:
+-        pass
+-
+-
+-def _split_messages(payload: dict) -> tuple[str, list]:
+-    system_parts = []
+-    messages = []
+-    for item in payload.get("messages") or []:
+-        if not isinstance(item, dict):
+-            continue
+-        role = item.get("role") or "user"
+-        if role == "system":
+-            content = item.get("content") or ""
+-            if isinstance(content, list):
+-                content = "".join(
+-                    part.get("text", "") if isinstance(part, dict) else str(part)
+-                    for part in content
+-                )
+-            if content:
+-                system_parts.append(str(content))
+-            continue
+-        messages.append(item)
+-    return "\n\n".join(system_parts), messages
+-
+-
+-def _last_user_text(messages: list) -> str:
+-    for item in reversed(messages):
+-        if not isinstance(item, dict) or item.get("role") != "user":
+-            continue
+-        content = item.get("content")
+-        if isinstance(content, str):
+-            return content
+-    return ""
+-
+-
+-def build_body(payload: dict) -> tuple[dict, str, str]:
+-    model = translate_model(str(payload.get("model") or "qwork-advanced"))
+-    request_id = str(payload.get("request_id") or uuid.uuid4())
+-    session_id = str(payload.get("session_id") or uuid.uuid4())
+-    system, messages = _split_messages(payload)
+-    if system:
+-        messages = [{"role": "system", "content": system}, *messages]
+-    last_user = _last_user_text(messages)
+-    reasoning_control = resolve_reasoning_control(payload)
+-    is_reasoning = reasoning_control.enabled is True
+-    parameters = {}
+-    for key in ("temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty"):
+-        if key in payload and payload[key] is not None:
+-            parameters[key] = payload[key]
+-    if "max_tokens" not in parameters:
+-        parameters["max_tokens"] = 32000
+-    body = {
+-        "request_id": request_id,
+-        "request_set_id": str(payload.get("request_set_id") or request_id),
+-        "chat_record_id": str(payload.get("chat_record_id") or request_id),
+-        "session_id": session_id,
+-        "stream": True,
+-        "chat_task": "FREE_INPUT",
+-        "chat_context": {
+-            "text": last_user,
+-            "features": [],
+-            "extra": {
+-                "context": [],
+-                "modelConfig": {"key": model, "is_reasoning": is_reasoning},
+-                "originalContent": last_user,
+-            },
+-            "chatPrompt": "",
+-            "imageUrls": None,
+-        },
+-        "is_reply": True,
+-        "is_retry": False,
+-        "source": 1,
+-        "version": "3",
+-        "agent_id": "agent_common",
+-        "task_id": str(payload.get("task_id") or "common"),
+-        "session_type": "qoder_work",
+-        "aliyun_user_type": "",
+-        "model_config": {
+-            "key": model,
+-            "display_name": model,
+-            "model": "",
+-            "format": "openai",
+-            "is_vl": model in {
+-                "qwork-auto", "qwork-advanced", "qwork-ultimate",
+-                "pro", "flash", "qwen3.8-max-preview",
+-            },
+-            "is_reasoning": is_reasoning,
+-            "api_key": "",
+-            "url": "",
+-            "source": "system",
+-            "max_input_tokens": 1000000,
+-        },
+-        "system": system,
+-        "messages": messages,
+-        "tools": payload.get("tools") or [],
+-        "parameters": parameters,
+-        # Catalog lookup reads these fields. Cosy-Business-* headers do not replace them.
+-        "business": {
+-            "product": BUSINESS_PRODUCT,
+-            "type": BUSINESS_TYPE,
+-            "version": "1",
+-            "feature_switches": {},
+-        },
+-    }
+-    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+-    return body, raw, model
+-
+-
+-def static_headers(model: str, request_id: str, machine_id: str = "") -> dict[str, str]:
+-    headers = {
+-        "Accept": "text/event-stream",
+-        "Content-Type": "application/json",
+-        "User-Agent": USER_AGENT,
+-        "X-Request-Id": request_id,
+-        "X-QwenWork-Version": IDE_VERSION,
+-        "X-QwenWork-Release-Version": RELEASE_VERSION,
+-        "X-QwenWork-Build": BUILD,
+-        "X-QwenWork-Platform": "win32",
+-        "X-QwenWork-Arch": "x64",
+-        "X-QwenWork-Channel": "stable",
+-        "Cosy-Version": COSY_VERSION,
+-        "Cosy-ClientType": CLIENT_TYPE,
+-        "Cosy-Business-Product": BUSINESS_PRODUCT,
+-        "Cosy-Business-Type": BUSINESS_TYPE,
+-        "Cosy-Scene": SCENE,
+-        "Cosy-MachineOS": MACHINE_OS,
+-        "Cosy-MachineType": MACHINE_TYPE,
+-        "Cosy-Data-Policy": DATA_POLICY,
+-        "Login-Version": LOGIN_VERSION,
+-        "X-Model-Key": model,
+-        "X-Model-Source": "system",
+-        "x-model-key": model,
+-        "x-internal-model-key": model,
+-        "x-model-source": "system",
+-        "Cache-Control": "no-cache",
+-        "Connection": "keep-alive",
+-        "Accept-Encoding": "identity",
+-    }
+-    if machine_id:
+-        headers["Cosy-MachineId"] = machine_id
+-        headers["Cosy-MachineToken"] = machine_id
+-    return headers
+-
+-
+-def _headers_for(account: dict, url: str, body: str, model: str, request_id: str) -> dict[str, str]:
+-    uid, name, email, token = _ids(account)
+-    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
+-    machine_id = str(extra.get("login_device_id") or "")
+-    headers = static_headers(model, request_id, machine_id)
+-    headers.update(
+-        cosy.auth_headers(
+-            uid=uid,
+-            name=name,
+-            email=email,
+-            access_token=token,
+-            url=url,
+-            body=body,
+-            timestamp=int(time.time()),
+-            request_id=uuid.uuid4().hex,
+-        )
+-    )
+-    return headers
+-
+-
+-def envelope_error(raw: str) -> str | None:
+-    text = (raw or "").strip()
+-    if not text:
+-        return None
+-    try:
+-        outer = json.loads(text)
+-    except json.JSONDecodeError:
+-        return None
+-    if not isinstance(outer, dict):
+-        return None
+-    status = outer.get("statusCodeValue")
+-    inner = outer.get("body")
+-    payload = inner
+-    if isinstance(inner, str):
+-        try:
+-            payload = json.loads(inner)
+-        except json.JSONDecodeError:
+-            payload = {"message": inner}
+-    if isinstance(status, int) and status >= 400:
+-        if isinstance(payload, dict):
+-            return str(payload.get("message") or payload.get("code") or inner or status)
+-        return str(inner or status)
+-    if isinstance(payload, dict) and str(payload.get("code") or "") in {"400", "401", "403"}:
+-        return str(payload.get("message") or payload.get("code"))
+-    return None
+-
+-
+-def usage_from_payload(raw: str) -> tuple[dict, str]:
+-    try:
+-        item = json.loads(raw)
+-    except json.JSONDecodeError:
+-        return {}, ""
+-    if not isinstance(item, dict):
+-        return {}, ""
+-    usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+-    choices = item.get("choices") if isinstance(item.get("choices"), list) else []
+-    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+-    finish = str(choice.get("finish_reason") or "")
+-    return usage, finish
+-
+-
+-def unwrap_sse_payload(raw: str) -> list[str]:
+-    """Peel the QwenWork outer envelope; return inner OpenAI SSE data payloads."""
+-    text = raw.strip()
+-    if not text or text == "[DONE]" or text == "{}":
+-        return []
+-    if envelope_error(text):
+-        return []
+-    try:
+-        outer = json.loads(text)
+-    except json.JSONDecodeError:
+-        return [text]
+-    if not isinstance(outer, dict):
+-        return [text]
+-    if "choices" in outer or outer.get("object") in {"chat.completion.chunk", "chat.completion"}:
+-        return [text]
+-    inner = outer.get("body")
+-    if inner is None:
+-        return []
+-    if isinstance(inner, (dict, list)):
+-        dumped = json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
+-        return [] if dumped in {"{}", "[]"} else [dumped]
+-    inner_text = str(inner).strip()
+-    if not inner_text or inner_text in {"[DONE]", "{}", "null"}:
+-        return []
+-    return [inner_text]
+-
+-
+-def _aggregate(chunks: list[dict], model: str) -> dict:
+-    content = []
+-    reasoning = []
+-    tool_calls: dict[int, dict] = {}
+-    finish = "stop"
+-    usage = {}
+-    response_id = "qwenwork"
+-    for item in chunks:
+-        if not isinstance(item, dict):
+-            continue
+-        response_id = item.get("id") or response_id
++                "cached_tokens": cached,
++                "cacheable_tokens": cacheable,
++                "finish_reason": finish_reason,
++                "duration_ms": int((time.time() - t0) * 1000),
++                "status_code": status_code,
++                "error_msg": error_msg,
++                "increment_usage": increment_usage,
++                "reasoning": reasoning,
++                "reasoning_effort": reasoning_effort,
++            }
++        )
++    except Exception:
++        pass
++
++
++def _split_messages(payload: dict) -> tuple[str, list]:
++    system_parts = []
++    messages = []
++    for item in payload.get("messages") or []:
++        if not isinstance(item, dict):
++            continue
++        role = item.get("role") or "user"
++        if role == "system":
++            content = item.get("content") or ""
++            if isinstance(content, list):
++                content = "".join(
++                    part.get("text", "") if isinstance(part, dict) else str(part)
++                    for part in content
++                )
++            if content:
++                system_parts.append(str(content))
++            continue
++        messages.append(item)
++    return "\n\n".join(system_parts), messages
++
++
++def _last_user_text(messages: list) -> str:
++    for item in reversed(messages):
++        if not isinstance(item, dict) or item.get("role") != "user":
++            continue
++        content = item.get("content")
++        if isinstance(content, str):
++            return content
++    return ""
++
++
++def build_body(payload: dict) -> tuple[dict, str, str]:
++    model = translate_model(str(payload.get("model") or "qwork-advanced"))
++    request_id = str(payload.get("request_id") or uuid.uuid4())
++    session_id = str(payload.get("session_id") or uuid.uuid4())
++    system, messages = _split_messages(payload)
++    if system:
++        messages = [{"role": "system", "content": system}, *messages]
++    last_user = _last_user_text(messages)
++    reasoning_control = resolve_reasoning_control(payload)
++    is_reasoning = reasoning_control.enabled is True
++    parameters = {}
++    for key in ("temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty"):
++        if key in payload and payload[key] is not None:
++            parameters[key] = payload[key]
++    if "max_tokens" not in parameters:
++        parameters["max_tokens"] = 32000
++    body = {
++        "request_id": request_id,
++        "request_set_id": str(payload.get("request_set_id") or request_id),
++        "chat_record_id": str(payload.get("chat_record_id") or request_id),
++        "session_id": session_id,
++        "stream": True,
++        "chat_task": "FREE_INPUT",
++        "chat_context": {
++            "text": last_user,
++            "features": [],
++            "extra": {
++                "context": [],
++                "modelConfig": {"key": model, "is_reasoning": is_reasoning},
++                "originalContent": last_user,
++            },
++            "chatPrompt": "",
++            "imageUrls": None,
++        },
++        "is_reply": True,
++        "is_retry": False,
++        "source": 1,
++        "version": "3",
++        "agent_id": "agent_common",
++        "task_id": str(payload.get("task_id") or "common"),
++        "session_type": "qoder_work",
++        "aliyun_user_type": "",
++        "model_config": {
++            "key": model,
++            "display_name": model,
++            "model": "",
++            "format": "openai",
++            "is_vl": model in {
++                "qwork-auto", "qwork-advanced", "qwork-ultimate",
++                "pro", "flash", "qwen3.8-max-preview",
++            },
++            "is_reasoning": is_reasoning,
++            "api_key": "",
++            "url": "",
++            "source": "system",
++            "max_input_tokens": 1000000,
++        },
++        "system": system,
++        "messages": messages,
++        "tools": payload.get("tools") or [],
++        "parameters": parameters,
++        # Catalog lookup reads these fields. Cosy-Business-* headers do not replace them.
++        "business": {
++            "product": BUSINESS_PRODUCT,
++            "type": BUSINESS_TYPE,
++            "version": "1",
++            "feature_switches": {},
++        },
++    }
++    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
++    return body, raw, model
++
++
++def static_headers(model: str, request_id: str, machine_id: str = "") -> dict[str, str]:
++    headers = {
++        "Accept": "text/event-stream",
++        "Content-Type": "application/json",
++        "User-Agent": USER_AGENT,
++        "X-Request-Id": request_id,
++        "X-QwenWork-Version": IDE_VERSION,
++        "X-QwenWork-Release-Version": RELEASE_VERSION,
++        "X-QwenWork-Build": BUILD,
++        "X-QwenWork-Platform": "win32",
++        "X-QwenWork-Arch": "x64",
++        "X-QwenWork-Channel": "stable",
++        "Cosy-Version": COSY_VERSION,
++        "Cosy-ClientType": CLIENT_TYPE,
++        "Cosy-Business-Product": BUSINESS_PRODUCT,
++        "Cosy-Business-Type": BUSINESS_TYPE,
++        "Cosy-Scene": SCENE,
++        "Cosy-MachineOS": MACHINE_OS,
++        "Cosy-MachineType": MACHINE_TYPE,
++        "Cosy-Data-Policy": DATA_POLICY,
++        "Login-Version": LOGIN_VERSION,
++        "X-Model-Key": model,
++        "X-Model-Source": "system",
++        "x-model-key": model,
++        "x-internal-model-key": model,
++        "x-model-source": "system",
++        "Cache-Control": "no-cache",
++        "Connection": "keep-alive",
++        "Accept-Encoding": "identity",
++    }
++    if machine_id:
++        headers["Cosy-MachineId"] = machine_id
++        headers["Cosy-MachineToken"] = machine_id
++    return headers
++
++
++def _headers_for(account: dict, url: str, body: str, model: str, request_id: str) -> dict[str, str]:
++    uid, name, email, token = _ids(account)
++    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
++    machine_id = str(extra.get("login_device_id") or "")
++    headers = static_headers(model, request_id, machine_id)
++    headers.update(
++        cosy.auth_headers(
++            uid=uid,
++            name=name,
++            email=email,
++            access_token=token,
++            url=url,
++            body=body,
++            timestamp=int(time.time()),
++            request_id=uuid.uuid4().hex,
++        )
++    )
++    return headers
++
++
++def _envelope_error_obj(outer) -> str | None:
++    """Envelope error from an already parsed payload (shared by str/stream paths)."""
++    if not isinstance(outer, dict):
++        return None
++    status = outer.get("statusCodeValue")
++    inner = outer.get("body")
++    payload = inner
++    if isinstance(inner, str):
++        try:
++            payload = json.loads(inner)
++        except json.JSONDecodeError:
++            payload = {"message": inner}
++    if isinstance(status, int) and status >= 400:
++        if isinstance(payload, dict):
++            return str(payload.get("message") or payload.get("code") or inner or status)
++        return str(inner or status)
++    if isinstance(payload, dict) and str(payload.get("code") or "") in {"400", "401", "403"}:
++        return str(payload.get("message") or payload.get("code"))
++    return None
++
++
++def envelope_error(raw: str) -> str | None:
++    text = (raw or "").strip()
++    if not text:
++        return None
++    try:
++        outer = json.loads(text)
++    except json.JSONDecodeError:
++        return None
++    return _envelope_error_obj(outer)
++
++
++def _usage_from_obj(item) -> tuple[dict, str]:
++    if not isinstance(item, dict):
++        return {}, ""
++    usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
++    choices = item.get("choices") if isinstance(item.get("choices"), list) else []
++    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
++    finish = str(choice.get("finish_reason") or "")
++    return usage, finish
++
++
++def usage_from_payload(raw: str) -> tuple[dict, str]:
++    try:
++        item = json.loads(raw)
++    except json.JSONDecodeError:
++        return {}, ""
++    return _usage_from_obj(item)
++
++
++def _unwrap_parsed(outer) -> list:
++    """Inner payloads from a parsed dict; dict/list stays parsed, strings stay text."""
++    if "choices" in outer or outer.get("object") in {"chat.completion.chunk", "chat.completion"}:
++        return [outer]
++    inner = outer.get("body")
++    if inner is None:
++        return []
++    if isinstance(inner, (dict, list)):
++        return [inner] if inner else []
++    inner_text = str(inner).strip()
++    if not inner_text or inner_text in {"[DONE]", "{}", "null"}:
++        return []
++    return [inner_text]
++
++
++def unwrap_sse_payload(raw: str) -> list[str]:
++    """Peel the QwenWork outer envelope; return inner OpenAI SSE data payloads."""
++    text = raw.strip()
++    if not text or text == "[DONE]" or text == "{}":
++        return []
++    if envelope_error(text):
++        return []
++    try:
++        outer = json.loads(text)
++    except json.JSONDecodeError:
++        return [text]
++    if not isinstance(outer, dict):
++        return [text]
++    return [value if isinstance(value, str)
++            else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++            for value in _unwrap_parsed(outer)]
++
++
++def _argument_text(value) -> str:
++    if isinstance(value, str):
++        return value
++    try:
++        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++    except (TypeError, ValueError):
++        return str(value)
++
++
++class _ToolCallAssembler:
++    """Keep parallel tool calls separate across malformed upstream indexes."""
++
++    def __init__(self):
++        self.slots = {}
++        self.by_id = {}
++        self.by_raw = {}
++        self.next_index = {}
++
++    def _new(self, choice_index):
++        index = self.next_index.get(choice_index, 0)
++        self.next_index[choice_index] = index + 1
++        slot = {"id": "", "index": index, "type": "function",
++                "function": {"name": "", "arguments": ""}}
++        self.slots[(choice_index, index)] = slot
++        return slot
++
++    def add(self, choice_index, call):
++        try:
++            raw_index = int(call.get("index") or 0)
++        except (TypeError, ValueError):
++            raw_index = 0
++        raw_key = (choice_index, raw_index)
++        cid = str(call.get("id") or "")
++        slot = self.by_id.get((choice_index, cid)) if cid else None
++        if slot is None:
++            slot = self.by_raw.get(raw_key)
++        if slot is None or (cid and slot.get("id") and slot["id"] != cid):
++            slot = self._new(choice_index)
++        if cid:
++            slot["id"] = cid
++            self.by_id[(choice_index, cid)] = slot
++        self.by_raw[raw_key] = slot
++        if call.get("type"):
++            slot["type"] = call["type"]
++        fn = call.get("function") or {}
++        if fn.get("name"):
++            slot["function"]["name"] = str(fn["name"])
++        if "arguments" in fn and fn.get("arguments") not in (None, ""):
++            slot["function"]["arguments"] += _argument_text(fn["arguments"])
++        return slot
++
++    def for_choice(self, choice_index):
++        return [slot for (choice, _), slot in sorted(self.slots.items())
++                if choice == choice_index]
++
++
++def _aggregate(chunks: list[dict], model: str) -> dict:
++    states = {}
++    calls = _ToolCallAssembler()
++    usage = {}
++    response_id = "qwenwork"
++    for item in chunks:
++        if not isinstance(item, dict):
++            continue
++        response_id = item.get("id") or response_id
+         if isinstance(item.get("usage"), dict):
+             usage.update(item["usage"])
+-        choice = (item.get("choices") or [{}])[0]
+-        finish = choice.get("finish_reason") or finish
+-        delta = choice.get("delta") or {}
+-        if delta.get("content"):
+-            content.append(str(delta["content"]))
+-        if delta.get("reasoning_content"):
+-            reasoning.append(str(delta["reasoning_content"]))
+-        for call in delta.get("tool_calls") or []:
+-            index = int(call.get("index") or 0)
+-            slot = tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+-            if call.get("id"):
+-                slot["id"] = call["id"]
+-            if call.get("type"):
+-                slot["type"] = call["type"]
+-            fn = call.get("function") or {}
+-            if fn.get("name"):
+-                slot["function"]["name"] = fn["name"]
+-            if fn.get("arguments"):
+-                slot["function"]["arguments"] += str(fn["arguments"])
+-    message = {"role": "assistant", "content": "".join(content)}
+-    if reasoning:
+-        message["reasoning_content"] = "".join(reasoning)
+-    if tool_calls:
+-        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+-    return {
+-        "id": response_id,
+-        "object": "chat.completion",
+-        "model": model,
+-        "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
+-        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+-    }
+-
+-
+-async def _pick(tried: set[int]) -> dict | None:
+-    account = auth_manager.pick_account(tried, provider=CHANNEL_ID)
+-    if account and is_token_expired(account):
+-        try:
+-            account = await refresh_account(account)
+-        except Exception:
+-            account = None
+-    if account:
+-        return account
+-    expired = [
+-        row
+-        for row in db.list_accounts(provider=CHANNEL_ID)
+-        if row.get("status") == "expired" and row.get("id") not in tried
+-    ]
+-    for row in expired:
+-        try:
+-            return await refresh_account(row)
+-        except Exception:
+-            continue
+-    return None
+-
+-
+-async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
+-    client_wants_stream = bool(payload.get("stream"))
+-    log_model = None
+-    if isinstance(api_key_info, dict):
+-        log_model = api_key_info.get("_log_model")
+-    body, raw, upstream_model = build_body(payload)
+-    model_name = log_model if log_model is not None else payload.get("model", upstream_model)
+-    request_id = str(body.get("request_id") or uuid.uuid4())
+-
+-    if client_wants_stream:
+-        return ("stream", _stream(raw, request_id, upstream_model, api_key_info, model_name))
+-
+-    tried: set[int] = set()
+-    last_error = None
+-    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID)
+-    for attempt in range(max_attempts):
+-        account = await _pick(tried)
+-        if not account:
+-            break
+-        tried.add(account["id"])
+-        t0 = time.time()
+-        try:
+-            url, headers, packed = _packed_request(account, raw, upstream_model)
+-            chunks: list[dict] = []
+-            async with rate_limiter.account_slot(account), httpx.AsyncClient(verify=TLS_CONTEXT, timeout=120.0) as client:
+-                async with client.stream("POST", url, headers=headers, content=packed) as response:
+-                    if response.status_code >= 400:
+-                        text = (await response.aread()).decode("utf-8", errors="replace")[:400]
+-                        auth_manager.mark_account_failure(account["id"], response.status_code)
+-                        last_error = (
+-                            "error",
+-                            (response.status_code, {"error": {"message": text, "type": "server_error"}}),
+-                        )
+-                        _log(
+-                            api_key_info, account, model_name, False, 0, 0, 0,
+-                            "retry" if response.status_code in RETRYABLE_STATUS and attempt < max_attempts - 1 else "error",
+-                            response.status_code, text, t0,
+-                            increment_usage=response.status_code not in RETRYABLE_STATUS or attempt == max_attempts - 1,
+-                        )
+-                        if response.status_code not in RETRYABLE_STATUS:
+-                            return last_error
+-                        continue
+-                    auth_manager.mark_account_success(account["id"])
+-                    async for line in response.aiter_lines():
+-                        if not line.startswith("data:"):
+-                            continue
+-                        data = line[5:].strip()
+-                        env_err = envelope_error(data)
+-                        if env_err:
+-                            last_error = (
+-                                "error",
+-                                (400, {"error": {"message": env_err, "type": "invalid_request_error"}}),
+-                            )
+-                            chunks = []
+-                            break
+-                        for inner in unwrap_sse_payload(data):
+-                            try:
+-                                chunks.append(json.loads(inner))
+-                            except json.JSONDecodeError:
+-                                continue
+-            if last_error and last_error[0] == "error" and last_error[1][0] == 400 and not chunks:
+-                _log(api_key_info, account, model_name, False, 0, 0, 0, "error", 400, str(last_error[1][1])[:400], t0)
+-                return last_error
+-            aggregated = _aggregate(chunks, model_name)
+-            usage = aggregated.get("usage") or {}
+-            _log(
+-                api_key_info, account, model_name, False,
+-                int(usage.get("prompt_tokens") or 0),
+-                int(usage.get("completion_tokens") or 0),
+-                int(usage.get("total_tokens") or 0),
+-                aggregated["choices"][0].get("finish_reason") or "stop",
++        for choice in item.get("choices") or []:
++            if not isinstance(choice, dict):
++                continue
++            choice_index = int(choice.get("index") or 0)
++            state = states.setdefault(choice_index, {"content": [], "reasoning": [], "finish": "stop"})
++            state["finish"] = choice.get("finish_reason") or state["finish"]
++            delta = choice.get("delta") or {}
++            if delta.get("content"):
++                state["content"].append(str(delta["content"]))
++            if delta.get("reasoning_content"):
++                state["reasoning"].append(str(delta["reasoning_content"]))
++            for call in delta.get("tool_calls") or []:
++                calls.add(choice_index, call)
++    choices = []
++    for index, state in sorted(states.items()):
++        message = {"role": "assistant", "content": "".join(state["content"])}
++        if state["reasoning"]:
++            message["reasoning_content"] = "".join(state["reasoning"])
++        tool_calls = calls.for_choice(index)
++        if tool_calls:
++            message["tool_calls"] = [{k: v for k, v in call.items() if k != "index"}
++                                     for call in tool_calls]
++        choices.append({"index": index, "message": message, "finish_reason": state["finish"]})
++    return {
++        "id": response_id,
++        "object": "chat.completion",
++        "model": model,
++        "choices": choices,
++        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
++    }
++
++
++class _StreamError(Exception):
++    """A successful HTTP response did not contain a completed chat."""
++
++
++class _CompletionState:
++    """One event contract for buffered and streaming consumers."""
++
++    def __init__(self):
++        self.usage = {}
++        self.finish = ""
++        self.done = False
++        self.choices = set()
++        self.finished = set()
++        self.tools = _ToolCallAssembler()
++
++    def feed(self, raw):
++        if raw.strip() == "[DONE]":
++            self.done = True
++            return []
++        try:
++            outer = json.loads(raw)
++        except json.JSONDecodeError:
++            return []
++        if not isinstance(outer, dict):
++            return []
++        error = _envelope_error_obj(outer)
++        if error:
++            raise _StreamError(error)
++        if outer.get("error"):
++            raise _StreamError(str(outer["error"]))
++        if str(outer.get("body") or "").strip() == "[DONE]":
++            self.done = True
++        usage, finish = _usage_from_obj(outer)
++        self.usage.update(usage)
++        events = []
++        for inner in _unwrap_parsed(outer):
++            try:
++                item = inner if isinstance(inner, (dict, list)) else json.loads(inner)
++            except (json.JSONDecodeError, TypeError):
++                continue
++            if not isinstance(item, dict):
++                continue
++            if item.get("error"):
++                raise _StreamError(str(item["error"]))
++            choices = item.get("choices")
++            if not isinstance(choices, list):
++                continue
++            if isinstance(item.get("usage"), dict):
++                self.usage.update(item["usage"])
++            for choice in choices:
++                if not isinstance(choice, dict):
++                    raise _StreamError("Invalid upstream choice")
++                try:
++                    index = int(choice.get("index") or 0)
++                except (TypeError, ValueError):
++                    raise _StreamError("Invalid upstream choice index") from None
++                delta = choice.get("delta", choice.get("message", {}))
++                if not isinstance(delta, dict):
++                    raise _StreamError("Invalid upstream delta")
++                choice["delta"] = delta
++                self.choices.add(index)
++                if choice.get("finish_reason"):
++                    self.finished.add(index)
++                    self.finish = str(choice["finish_reason"])
++                for call in delta.get("tool_calls") or []:
++                    if not isinstance(call, dict) or not isinstance(call.get("function", {}), dict):
++                        raise _StreamError("Invalid upstream tool call")
++                    slot = self.tools.add(index, call)
++                    call["index"] = slot["index"]
++                    fn = call.get("function") or {}
++                    if fn.get("arguments") is not None:
++                        fn["arguments"] = _argument_text(fn["arguments"])
++            events.append(item)
++        return events
++
++    def require_complete(self):
++        if not self.choices:
++            raise _StreamError("Upstream returned no chat choices")
++        if not self.done and not self.choices.issubset(self.finished):
++            raise _StreamError("Upstream stream ended before completion")
++
++
++async def _pick(tried: set[int]) -> dict | None:
++    account = auth_manager.pick_account(tried, provider=CHANNEL_ID)
++    if account and is_token_expired(account):
++        try:
++            account = await refresh_account(account)
++        except Exception:
++            account = None
++    if account:
++        return account
++    expired = [
++        row
++        for row in db.list_accounts(provider=CHANNEL_ID)
++        if row.get("status") == "expired" and row.get("id") not in tried
++    ]
++    for row in expired:
++        try:
++            return await refresh_account(row)
++        except Exception:
++            continue
++    return None
++
++
++async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
++    client_wants_stream = bool(payload.get("stream"))
++    log_model = None
++    if isinstance(api_key_info, dict):
++        log_model = api_key_info.get("_log_model")
++    body, raw, upstream_model = build_body(payload)
++    model_name = log_model if log_model is not None else payload.get("model", upstream_model)
++    request_id = str(body.get("request_id") or uuid.uuid4())
++    # build_body 内部的 reasoning_control 是局部变量；请求日志要记思考状态，
++    # 这里按同一套规则重新解析一次（纯计算，无副作用）
++    reasoning_control = resolve_reasoning_control(payload)
++
++    if client_wants_stream:
++        return ("stream", _stream(raw, request_id, upstream_model, api_key_info, model_name,
++                                  reasoning_control=reasoning_control))
++
++    tried: set[int] = set()
++    last_error = None
++    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID)
++    for attempt in range(max_attempts):
++        account = await _pick(tried)
++        if not account:
++            break
++        tried.add(account["id"])
++        t0 = time.time()
++        state = _CompletionState()
++        try:
++            url, headers, packed = _packed_request(account, raw, upstream_model)
++            chunks: list[dict] = []
++            async with rate_limiter.account_slot(account), httpx.AsyncClient(verify=TLS_CONTEXT, timeout=120.0) as client:
++                async with client.stream("POST", url, headers=headers, content=packed) as response:
++                    if response.status_code >= 400:
++                        text = (await response.aread()).decode("utf-8", errors="replace")[:400]
++                        auth_manager.mark_account_failure(account["id"], response.status_code)
++                        last_error = (
++                            "error",
++                            (response.status_code, {"error": {"message": text, "type": "server_error"}}),
++                        )
++                        _log(
++                            api_key_info, account, model_name, False, 0, 0, 0,
++                            "retry" if response.status_code in RETRYABLE_STATUS and attempt < max_attempts - 1 else "error",
++                            response.status_code, text, t0,
++                            increment_usage=response.status_code not in RETRYABLE_STATUS or attempt == max_attempts - 1,
++                        )
++                        if response.status_code not in RETRYABLE_STATUS:
++                            return last_error
++                        continue
++                    async for line in response.aiter_lines():
++                        if line.startswith("data:"):
++                            chunks.extend(state.feed(line[5:].strip()))
++            state.require_complete()
++            auth_manager.mark_account_success(account["id"])
++            aggregated = _aggregate(chunks, model_name)
++            aggregated["usage"] = state.usage or aggregated["usage"]
++            usage = aggregated.get("usage") or {}
++            _log(
++                api_key_info, account, model_name, False,
++                int(usage.get("prompt_tokens") or 0),
++                int(usage.get("completion_tokens") or 0),
++                int(usage.get("total_tokens") or 0),
++                aggregated["choices"][0].get("finish_reason") or "stop",
+                 200, "", t0, usage=usage,
+-            )
+-            return ("json", aggregated)
+-        except (httpx.HTTPError, EncodeError) as exc:
+-            auth_manager.mark_account_failure(account["id"], 503)
+-            last_error = ("error", (503, {"error": {"message": str(exc)[:240], "type": "server_error"}}))
+-            continue
+-    return last_error or (
+-        "error",
+-        (503, {
+-            "error": {
+-                "message": "No available accounts",
+-                "type": "channel_unavailable",
+-                "code": "channel_unavailable",
+-                "channel": CHANNEL_ID,
+-            }
+-        }),
+-    )
+-
+-
+-async def _stream(raw: str, request_id: str, upstream_model: str, api_key_info, model_name: str) -> AsyncGenerator[bytes, None]:
+-    tried: set[int] = set()
+-    last_error = b'data: {"error":{"message":"No available accounts"}}\n\n'
+-    last_status = 503
+-    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID)
+-    for attempt in range(max_attempts):
+-        account = await _pick(tried)
+-        if not account:
+-            break
+-        tried.add(account["id"])
+-        t0 = time.time()
+-        output_started = False
+-        usage: dict = {}
+-        finish = "stop"
+-        try:
+-            url, headers, packed = _packed_request(account, raw, upstream_model)
+-            async with rate_limiter.account_slot(account), httpx.AsyncClient(verify=TLS_CONTEXT, timeout=None) as client:
+-                async with client.stream("POST", url, headers=headers, content=packed) as response:
+-                    last_status = response.status_code
+-                    if response.status_code >= 400:
+-                        text = (await response.aread()).decode("utf-8", errors="replace")[:400]
+-                        auth_manager.mark_account_failure(account["id"], response.status_code)
+-                        last_error = f"data: {json.dumps({'error': {'message': text}}, ensure_ascii=False)}\n\n".encode()
+-                        if response.status_code not in RETRYABLE_STATUS:
+-                            yield last_error
+-                            _log(api_key_info, account, model_name, True, 0, 0, 0, "error", response.status_code, text, t0)
+-                            return
+-                        continue
+-                    auth_manager.mark_account_success(account["id"])
+-                    async for line in response.aiter_lines():
+-                        if not line:
+-                            continue
+-                        if not line.startswith("data:"):
+-                            continue
+-                        data = line[5:].strip()
+-                        env_err = envelope_error(data)
+-                        if env_err:
+-                            last_error = f"data: {json.dumps({'error': {'message': env_err}}, ensure_ascii=False)}\n\n".encode()
+-                            if not output_started:
+-                                yield last_error
+-                            _log(api_key_info, account, model_name, True, 0, 0, 0, "error", 400, env_err, t0)
+-                            return
+-                        outer_usage, outer_finish = usage_from_payload(data)
+-                        if outer_usage:
+-                            usage.update(outer_usage)
+-                        if outer_finish:
+-                            finish = outer_finish
+-                        for inner in unwrap_sse_payload(data):
+-                            inner_usage, inner_finish = usage_from_payload(inner)
+-                            if inner_usage:
+-                                usage.update(inner_usage)
+-                            if inner_finish:
+-                                finish = inner_finish
+-                            output_started = True
+-                            yield f"data: {inner}\n\n".encode("utf-8")
+-            prompt_t = int(usage.get("prompt_tokens") or 0)
+-            completion_t = int(usage.get("completion_tokens") or 0)
+-            total_t = int(usage.get("total_tokens") or (prompt_t + completion_t))
+-            _log(api_key_info, account, model_name, True, prompt_t, completion_t, total_t, finish, 200, "", t0, usage=usage)
++                reasoning=reasoning_control.mode,
++                reasoning_effort=reasoning_control.effort,
++            )
++            return ("json", aggregated)
++        except (httpx.HTTPError, EncodeError, _StreamError) as exc:
++            status = 502 if isinstance(exc, _StreamError) else 503
++            message = str(exc).strip()[:240] or type(exc).__name__
++            auth_manager.mark_account_failure(account["id"], status)
++            last_error = ("error", (status, {"error": {"message": message, "type": "server_error"}}))
++            _log(api_key_info, account, model_name, False, *token_counts(state.usage),
++                 "error", status, message, t0, increment_usage=attempt == max_attempts - 1)
++            continue
++    return last_error or (
++        "error",
++        (503, {
++            "error": {
++                "message": "No available accounts",
++                "type": "channel_unavailable",
++                "code": "channel_unavailable",
++                "channel": CHANNEL_ID,
++            }
++        }),
++    )
++
++
++async def _stream(raw: str, request_id: str, upstream_model: str, api_key_info, model_name: str,
++                  reasoning_control=None) -> AsyncGenerator[bytes, None]:
++    tried: set[int] = set()
++    last_error = b'data: {"error":{"message":"No available accounts"}}\n\n'
++    last_status = 503
++    max_attempts = auth_manager.account_attempt_limit(CHANNEL_ID)
++    for attempt in range(max_attempts):
++        account = await _pick(tried)
++        if not account:
++            break
++        tried.add(account["id"])
++        t0 = time.time()
++        output_started = False
++        state = _CompletionState()
++        try:
++            url, headers, packed = _packed_request(account, raw, upstream_model)
++            async with rate_limiter.account_slot(account), httpx.AsyncClient(verify=TLS_CONTEXT, timeout=None) as client:
++                async with client.stream("POST", url, headers=headers, content=packed) as response:
++                    last_status = response.status_code
++                    if response.status_code >= 400:
++                        text = (await response.aread()).decode("utf-8", errors="replace")[:400]
++                        auth_manager.mark_account_failure(account["id"], response.status_code)
++                        last_error = f"data: {json.dumps({'error': {'message': text}}, ensure_ascii=False)}\n\n".encode()
++                        if response.status_code not in RETRYABLE_STATUS:
++                            yield last_error
++                            _log(api_key_info, account, model_name, True, 0, 0, 0, "error", response.status_code, text, t0)
++                            return
++                        continue
++                    async for line in response.aiter_lines():
++                        if not line.startswith("data:"):
++                            continue
++                        for item in state.feed(line[5:].strip()):
++                            output_started = True
++                            yield f"data: {json.dumps(item, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
++            state.require_complete()
++            auth_manager.mark_account_success(account["id"])
++            _log(api_key_info, account, model_name, True, *token_counts(state.usage),
++                 state.finish or "stop", 200, "", t0, usage=state.usage,
++                 reasoning=getattr(reasoning_control, "mode", None),
++                 reasoning_effort=getattr(reasoning_control, "effort", None))
++            yield b"data: [DONE]\n\n"
++            return
++        except (httpx.HTTPError, EncodeError, _StreamError) as exc:
++            message = str(exc).strip()[:240] or type(exc).__name__
++            last_status = 502 if isinstance(exc, _StreamError) or output_started else 503
++            last_error = f"data: {json.dumps({'error': {'message': message, 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n".encode()
++            auth_manager.mark_account_failure(account["id"], last_status)
+             if output_started:
+-                yield b"data: [DONE]\n\n"
+-            return
+-        except (httpx.HTTPError, EncodeError) as exc:
+-            if output_started:
+-                _log(api_key_info, account, model_name, True, *token_counts(usage),
+-                     "error", 502, str(exc).strip() or type(exc).__name__, t0, usage=usage)
++                _log(api_key_info, account, model_name, True, *token_counts(state.usage),
++                     "error", last_status, message, t0, usage=state.usage)
++                yield last_error
+                 return
+-            auth_manager.mark_account_failure(account["id"], 503)
+-            last_error = f"data: {json.dumps({'error': {'message': str(exc)[:240]}}, ensure_ascii=False)}\n\n".encode()
+-            last_status = 503
+-            continue
+-    yield last_error
+-    _log(api_key_info, None, model_name, True, 0, 0, 0, "error", last_status, "stream failed", time.time())
+-
+-
+-async def test_chat(account: dict, model: str = "qwork-advanced", prompt: str = "ping") -> dict:
+-    payload = {
+-        "model": model or "qwork-advanced",
+-        "messages": [{"role": "user", "content": prompt or "ping"}],
+-        "stream": False,
+-        "max_tokens": 64,
+-    }
+-    t0 = time.time()
+-    body, raw, upstream_model = build_body(payload)
+-    try:
+-        url, headers, packed = _packed_request(account, raw, upstream_model)
+-        chunks: list[dict] = []
+-        async with rate_limiter.account_slot(account), httpx.AsyncClient(verify=TLS_CONTEXT, timeout=45.0) as client:
+-            async with client.stream("POST", url, headers=headers, content=packed) as response:
+-                status = response.status_code
+-                if status >= 400:
+-                    text = (await response.aread()).decode("utf-8", errors="replace")[:400]
+-                    return {
+-                        "ok": False,
+-                        "status_code": status,
+-                        "duration_ms": int((time.time() - t0) * 1000),
+-                        "message": text,
+-                    }
+-                async for line in response.aiter_lines():
+-                    if not line.startswith("data:"):
+-                        continue
+-                    data = line[5:].strip()
+-                    env_err = envelope_error(data)
+-                    if env_err:
+-                        return {
+-                            "ok": False,
+-                            "status_code": 400,
+-                            "duration_ms": int((time.time() - t0) * 1000),
+-                            "message": env_err,
+-                        }
+-                    for inner in unwrap_sse_payload(data):
+-                        try:
+-                            chunks.append(json.loads(inner))
+-                        except json.JSONDecodeError:
+-                            continue
+-    except httpx.HTTPError as exc:
+-        return {"ok": False, "status_code": 0, "duration_ms": int((time.time() - t0) * 1000), "message": str(exc)[:240]}
+-    aggregated = _aggregate(chunks, upstream_model)
+-    message_obj = ((aggregated.get("choices") or [{}])[0].get("message") or {})
+-    message = message_obj.get("content") or message_obj.get("reasoning_content") or ""
+-    return {
+-        "ok": True,
+-        "status_code": 200,
+-        "duration_ms": int((time.time() - t0) * 1000),
+-        "model": aggregated.get("model"),
+-        "message": str(message)[:240],
+-        "usage": aggregated.get("usage") or {},
+-    }
++            _log(api_key_info, account, model_name, True, *token_counts(state.usage),
++                 "retry", last_status, message, t0, usage=state.usage, increment_usage=False)
++            continue
++    yield last_error
++    _log(api_key_info, None, model_name, True, 0, 0, 0, "error", last_status, "stream failed", time.time())
++
++
++async def test_chat(account: dict, model: str = "qwork-advanced", prompt: str = "ping") -> dict:
++    payload = {
++        "model": model or "qwork-advanced",
++        "messages": [{"role": "user", "content": prompt or "ping"}],
++        "stream": False,
++        "max_tokens": 64,
++    }
++    t0 = time.time()
++    body, raw, upstream_model = build_body(payload)
++    try:
++        url, headers, packed = _packed_request(account, raw, upstream_model)
++        chunks: list[dict] = []
++        async with rate_limiter.account_slot(account), httpx.AsyncClient(verify=TLS_CONTEXT, timeout=45.0) as client:
++            async with client.stream("POST", url, headers=headers, content=packed) as response:
++                status = response.status_code
++                if status >= 400:
++                    text = (await response.aread()).decode("utf-8", errors="replace")[:400]
++                    return {
++                        "ok": False,
++                        "status_code": status,
++                        "duration_ms": int((time.time() - t0) * 1000),
++                        "message": text,
++                    }
++                async for line in response.aiter_lines():
++                    if not line.startswith("data:"):
++                        continue
++                    data = line[5:].strip()
++                    env_err = envelope_error(data)
++                    if env_err:
++                        return {
++                            "ok": False,
++                            "status_code": 400,
++                            "duration_ms": int((time.time() - t0) * 1000),
++                            "message": env_err,
++                        }
++                    for inner in unwrap_sse_payload(data):
++                        try:
++                            chunks.append(json.loads(inner))
++                        except json.JSONDecodeError:
++                            continue
++    except httpx.HTTPError as exc:
++        return {"ok": False, "status_code": 0, "duration_ms": int((time.time() - t0) * 1000), "message": str(exc)[:240]}
++    aggregated = _aggregate(chunks, upstream_model)
++    message_obj = ((aggregated.get("choices") or [{}])[0].get("message") or {})
++    message = message_obj.get("content") or message_obj.get("reasoning_content") or ""
++    return {
++        "ok": True,
++        "status_code": 200,
++        "duration_ms": int((time.time() - t0) * 1000),
++        "model": aggregated.get("model"),
++        "message": str(message)[:240],
++        "usage": aggregated.get("usage") or {},
++    }
+diff --git a/providers/qwenwork/store.py b/providers/qwenwork/store.py
+index 45a94c4..d1d4704 100644
+--- a/providers/qwenwork/store.py
++++ b/providers/qwenwork/store.py
+@@ -116,6 +116,18 @@ def _jwt_exp_ms(token: str) -> int:
+         return 0
+ 
+ 
++def _jwt_claims(token: str) -> dict:
++    """读 JWT payload（不验签）：只用来识别 token 的 sub 与企业作用域。"""
++    try:
++        parts = str(token or "").split(".")
++        if len(parts) < 2:
++            return {}
++        data = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
++        return data if isinstance(data, dict) else {}
++    except (ValueError, TypeError, json.JSONDecodeError):
++        return {}
++
++
+ def session_to_account(document: dict, source: str = "") -> dict:
+     user = document.get("user") if isinstance(document.get("user"), dict) else {}
+     uid = str(user.get("id") or user.get("uid") or document.get("uid") or "")
+@@ -123,6 +135,19 @@ def session_to_account(document: dict, source: str = "") -> dict:
+     email = str(user.get("email") or "")
+     access = str(document.get("token") or document.get("access_token") or document.get("device_token") or "")
+     refresh = str(document.get("refreshToken") or document.get("refresh_token") or "")
++    # QwenWork 桌面端切工作区时会出现「user 资料是企业身份、token 还是个人作用域」
++    # 的混合态。只信 token 自己的 is_biz/sub：否则会把企业号写成个人号的镜像。
++    claims = _jwt_claims(access)
++    token_sub = str(claims.get("sub") or claims.get("user_id") or "")
++    token_is_biz = bool(claims.get("is_biz"))
++    user_is_biz = bool(user.get("isBiz"))
++    org_id = str(user.get("orgId") or "")
++    trusted_biz = bool(user_is_biz and token_is_biz)
++    mismatch = []
++    if user_is_biz and not token_is_biz:
++        mismatch.append("客户端 token 是个人作用域（is_biz=false），企业额度不会生效")
++    if token_sub and uid and token_sub != uid:
++        mismatch.append(f"token 属于 {token_sub[:8]}，账号资料是 {uid[:8]}")
+     extra = {
+         "email": email,
+         "login_device_id": str(document.get("loginDeviceId") or document.get("machine_id") or ""),
+@@ -130,7 +155,21 @@ def session_to_account(document: dict, source: str = "") -> dict:
+         "refresh_strategy": str(document.get("refreshStrategy") or "device_token"),
+         "source": source or "import",
+         "client_version": IDE_VERSION,
++        "org_id": org_id,
++        "org_name": str(user.get("orgName") or ""),
++        "plan_name": str(user.get("planName") or ""),
++        "team_id": str(user.get("teamId") or ""),
++        "token_sub": token_sub,
++        "token_is_biz": token_is_biz,
+     }
++    if mismatch:
++        extra["identity_mismatch"] = {
++            "message": "；".join(mismatch),
++            "user_uid": uid,
++            "token_sub": token_sub,
++            "user_is_biz": user_is_biz,
++            "token_is_biz": token_is_biz,
++        }
+     expires_at = iso_to_ms(document.get("expiresAt") or document.get("expires_at")) or _jwt_exp_ms(access)
+     refresh_expires_at = iso_to_ms(
+         document.get("refreshTokenExpiresAt") or document.get("refresh_expires_at")
+@@ -145,8 +184,10 @@ def session_to_account(document: dict, source: str = "") -> dict:
+         "refresh_expires_at": refresh_expires_at,
+         "provider": CHANNEL_ID,
+         "domain": "gateway.qwenwork.cn",
++        "account_type": "enterprise" if trusted_biz else "personal",
++        "enterprise_id": org_id if trusted_biz else "",
+         "extra": extra,
+-        "status": "active",
++        "status": "inactive" if mismatch else "active",
+     }
+ 
+ 
+@@ -329,23 +370,47 @@ def upsert_account(parsed: dict) -> dict:
+     import database as db
+ 
+     uid = str(parsed.get("uid") or "")
++    extra = parsed.get("extra") if isinstance(parsed.get("extra"), dict) else {}
++    mismatch = extra.get("identity_mismatch") if isinstance(extra.get("identity_mismatch"), dict) else None
+     if uid:
+         for row in db.list_accounts(provider=CHANNEL_ID):
+             if str(row.get("uid") or "") == uid:
+                 patch = {
++                    "nickname": parsed.get("nickname") or row.get("nickname") or "",
++                    "name": parsed.get("name") or row.get("name") or "",
++                    "extra": parsed.get("extra") or row.get("extra") or {},
++                }
++                if mismatch:
++                    # 身份不一致的 token 绝不覆盖已有账号：否则企业号会被写成
++                    # 个人号的镜像（余额、额度全跟着个人号走）。
++                    row_claims = _jwt_claims(row.get("access_token") or "")
++                    row_sub = str(row_claims.get("sub") or row_claims.get("user_id") or "")
++                    if row_sub and row_sub == uid:
++                        # 现有账号的 token 本来就是本人：只合并企业资料，
++                        # 不把这次混合态导入的告警盖到健康账号上。
++                        merged = dict(row.get("extra") or {})
++                        merged.update({k: v for k, v in extra.items() if k != "identity_mismatch"})
++                        patch["extra"] = merged
++                        db.update_account(row["id"], patch)
++                        return {"id": row["id"], "updated": True, "skipped_token": True}
++                    patch["status"] = row.get("status") or "inactive"
++                    db.update_account(row["id"], patch)
++                    return {"id": row["id"], "updated": True,
++                            "identity_mismatch": mismatch.get("message") or ""}
++                patch.update({
+                     "access_token": parsed.get("access_token") or "",
+                     "refresh_token": parsed.get("refresh_token") or "",
+                     "expires_at": parsed.get("expires_at") or 0,
+                     "refresh_expires_at": parsed.get("refresh_expires_at") or 0,
+-                    "nickname": parsed.get("nickname") or row.get("nickname") or "",
+-                    "name": parsed.get("name") or row.get("name") or "",
+-                    "extra": parsed.get("extra") or row.get("extra") or {},
++                    "account_type": parsed.get("account_type") or "personal",
++                    "enterprise_id": parsed.get("enterprise_id") or "",
+                     "status": "active",
+-                }
++                })
+                 db.update_account(row["id"], patch)
+                 return {"id": row["id"], "updated": True}
+     aid = db.add_account(parsed)
+-    return {"id": aid, "updated": False}
++    return {"id": aid, "updated": False,
++            "identity_mismatch": (mismatch or {}).get("message") or ""}
+ 
+ 
+ def _is_relative_to(path: Path, root: Path) -> bool:
+diff --git a/providers/qwenwork/token.py b/providers/qwenwork/token.py
+index f3e7afb..2293aa4 100644
+--- a/providers/qwenwork/token.py
++++ b/providers/qwenwork/token.py
+@@ -18,7 +18,12 @@ from providers.qwenwork.constants import (
+     OPENAPI_USER_AGENT,
+     REFRESH_PATH,
+ )
+-from providers.qwenwork.store import iso_to_ms, read_official_session, write_refreshed_auth
++from providers.qwenwork.store import (
++    _jwt_claims,
++    iso_to_ms,
++    read_official_session,
++    write_refreshed_auth,
++)
+ 
+ 
+ class QwenWorkAuthError(RuntimeError):
+@@ -114,6 +119,13 @@ def _official_replacement(account: dict) -> dict | None:
+     account_uid = str(account.get("uid") or "")
+     if official_uid and account_uid and official_uid != account_uid:
+         return None
++    # 只认「profile 与 token 属于同一人」的官方会话：QwenWork 客户端会出现
++    # user=柳业宏(企业)、token=0686(个人) 的混合态，光比 profile uid 会把
++    # 个人 token 采纳进企业账号（2026-11-16 实测事故）。
++    claims = _jwt_claims(official.get("access_token") or "")
++    token_sub = str(claims.get("sub") or claims.get("user_id") or "")
++    if token_sub and account_uid and token_sub != account_uid:
++        return None
+     official_refresh = str(official.get("refresh_token") or "")
+     if not official_refresh or official_refresh == str(account.get("refresh_token") or ""):
+         return None
+@@ -177,7 +189,13 @@ async def _refresh_once(account: dict) -> dict:
+     auth_path = extra.get("auth_path")
+     if auth_path:
+         try:
+-            write_refreshed_auth(Path(auth_path), patch)
++            # auth-v2.dat 是官方客户端共用的单文件：只有刷新出的 token 属于
++            # 这个文件的主人时才写回，否则会把企业会话覆盖成个人会话。
++            official = read_official_session(Path(auth_path))
++            owner = str((official or {}).get("uid") or "")
++            sub = str(_jwt_claims(patch.get("access_token") or "").get("sub") or "")
++            if not owner or not sub or sub == owner:
++                write_refreshed_auth(Path(auth_path), patch)
+         except Exception:
+             pass
+     fresh = db.get_account(account["id"])
+diff --git a/server.py b/server.py
+index 37004e8..79f83ea 100644
+--- a/server.py
++++ b/server.py
+@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+ from starlette.concurrency import run_in_threadpool
+ from streaming import ClosingStreamingResponse
+-from request_logging import FailureLogMiddleware, bind_request
++from request_logging import FailureLogMiddleware, bind_request
+ 
+ import database as db
+ import auth_manager
+@@ -93,7 +93,7 @@ async def _lifespan(_app):
+ 
+ 
+ app = FastAPI(title="Buddy 2 API", version=VERSION, lifespan=_lifespan)
+-app.add_middleware(FailureLogMiddleware)
++app.add_middleware(FailureLogMiddleware)
+ _CORS_ORIGINS = _cors_origins()
+ 
+ app.add_middleware(
+@@ -459,7 +459,7 @@ async def chat_completions(
+     )
+     payload = await _read_json_object(request)
+ 
+-    bind_request(api_key_info, payload)
++    bind_request(api_key_info, payload)
+     messages = payload.get("messages") or []
+     if not isinstance(messages, list) or not messages or not all(isinstance(message, dict) for message in messages):
+         raise HTTPException(status_code=400, detail={"error": {"message": "messages is required", "type": "invalid_request_error"}})
+@@ -506,7 +506,7 @@ async def resp_responses(
+         lambda: _check_client_auth(authorization, x_api_key, consume_quota=False)
+     )
+     payload = await _read_json_object(request)
+-    bind_request(api_key_info, payload)
++    bind_request(api_key_info, payload)
+     if "input" not in payload:
+         raise HTTPException(
+             status_code=400,
+@@ -658,6 +658,10 @@ async def admin_list_accounts(authorization: str | None = Header(default=None)):
+         s["phone"] = a.get("phone", "")
+         s["account_type"] = a.get("account_type", "")
+         s["enterprise_id"] = a.get("enterprise_id", "")
++        extra = a.get("extra") if isinstance(a.get("extra"), dict) else {}
++        s["identity_mismatch"] = extra.get("identity_mismatch")
++        s["org_name"] = extra.get("org_name") or ""
++        s["plan_name"] = extra.get("plan_name") or ""
+         s["domain"] = a.get("domain", "")
+         s["weight"] = int(a.get("weight") or 1)
+         s["priority"] = int(a.get("priority") or 0)

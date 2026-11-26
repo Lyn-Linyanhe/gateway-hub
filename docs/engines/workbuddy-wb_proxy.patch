@@ -1,0 +1,175 @@
+--- wb_proxy.py.2.2.1-pure
+
++++ wb_proxy.py.current
+
+@@ -18439,6 +18439,44 @@
+
+         # 宁可不说也不说错的。
+         return None
+     return epoch
++
++
++def note_stream_limit(account, model, detail, error_finish=False):
++    """流内/流尾的限额失败也要记账，否则下一次选号还会撞同一个 (账号, 模型)。
++
++    open_upstream 的 HTTP 429 分支会给账号记 (账号, 模型) 冷却，但流式响应
++    一旦开了头（HTTP 200 已发），失败走的是流收尾/中断路径，那里此前只记
++    用量行、不给账号记任何冷却——「对话进行到一半被限额」之后紧接着的下一次
++    请求会再次选中同一个账号，直到某次上游在开流前用 HTTP 429 拒绝为止。
++
++    这里复用同一套分类器：6004（带重置墙钟的额度用满）→ note_model_cap 落盘
++    并挂冷却；软限流形状（频率限制文本 / 14003）→ unscoped 阶梯；其余带重置
++    时刻的 → 按墙钟冷却。上游以 finish_reason="error" 收尾但正文不可识别时，
++    给一次 60s 的单模型短窗口（保守但远好于立刻再撞一次）。返回 True 表示
++    记了账，调用方可以据此换号重试。
++    """
++    detail = str(detail or "")[:600]
++    reset_at = parse_rate_limit_reset(detail) if detail else None
++    soft = bool(detail) and rate_limit_is_soft_shape(detail)
++    cap = bool(detail) and rate_limit_is_cap(detail)
++    if not (reset_at or soft or cap):
++        if not error_finish:
++            return False
++        account.note_error("upstream stream finished with error", model=model,
++                           cooldown=60.0)
++        log("account %s: stream finished with error, parking '%s' for 60s"
++            % (account.uid[:8], model))
++        return True
++    if cap:
++        # 与 429 分支同一落盘口径：6004 的重置时刻是上游给的事实，跨重启成立。
++        account.note_model_cap(model, reset_at)
++    wait = (max(1.0, reset_at - time.time()) if reset_at
++            else account.note_unscoped_rate(model) if soft else 60.0)
++    account.note_error("stream limit (model throttled)", model=model,
++                       until=reset_at, cooldown=wait, detail=detail)
++    log("account %s: mid-stream limit, parking '%s' for %.0fs"
++        % (account.uid[:8], model, wait))
++    return True
+ 
+ 
+ def _iso_utc(epoch):
+@@ -29958,10 +29996,19 @@
+
+                     prebuilt_body=forwarded, pin_account=account,
+                     defer_egress_success=True,
+                     **key_open_kwargs(getattr(self, "key_entry", None)))
++            def reopen_other_account():
++                # 换号重试：不带 pin（面板的全局钉住仍由 pinned_account() 生效）。
++                # 调用方必须先记账冷却，选号的 ready(model) 才会避开刚失败的
++                # (账号, 模型) 组合；会话亲和也拦不住 ready 的排除。
++                return open_upstream(
++                    payload, session_key=session_key, target_realm=req_realm,
++                    prebuilt_body=forwarded,
++                    defer_egress_success=True,
++                    **key_open_kwargs(getattr(self, "key_entry", None)))
+             if want_stream:
+                 return self._chat_stream_response(
+                     upstream, model, fp, account, t_start, effort=effort,
+-                    reopen=reopen_stream)
++                    reopen=reopen_stream, reopen_switch=reopen_other_account)
+             return self._chat_nonstream_response(
+                 upstream, model, fp, account, t_start, effort=effort)
+ 
+@@ -30088,7 +30135,7 @@
+
+ 
+     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
+                               reopen=None, headers_sent=False, retried=False,
+-                              realm=None):
++                              realm=None, reopen_switch=None):
+             if not headers_sent:
+                 self.send_response(200)
+                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+@@ -30111,6 +30158,9 @@
+
+             synthesized_calls = False
+             pending_finish = None
+             stream_error = False
++            # 上游在流内发的错误帧正文（{"error": {...}}）：收尾/中断时交给
++            # note_stream_limit 做限额记账。此前只透传给客户端，引擎自己不解析。
++            stream_error_text = None
+             # 写出缓冲：一个读取块里的事件合成一次 write。
+             # wfile 是 wbufsize=0 的**无缓冲**文件（StreamRequestHandler 默认），
+             # 每个 chunk 直接落成一次 sendall —— 一次 syscall 加一次 GIL 交还。
+@@ -30195,6 +30245,9 @@
+
+                                 # then ends without billable usage. Re-emitted once
+                                 # below, after the finish frame.
+                                 maybe.pop("usage", None)
++                            if maybe.get("error") is not None and stream_error_text is None:
++                                stream_error_text = json.dumps(
++                                    maybe["error"], ensure_ascii=False)
+                             for ch in (maybe.get("choices") or []):
+                                 delta = ch.get("delta") or {}
+                                 if delta.get("reasoning_content"):
+@@ -30267,24 +30320,29 @@
+
+                     # The egress did not finish the read; record it here instead
+                     # of at header time so the streak can actually grow.
+                     wb_egress.note_transient(egress_key)
++                # 流内可能已经收到过限额错误帧才断开：命中分类器就记 (账号, 模型)
++                # 冷却，下一次选号自动避开；普通网络中断不命中、不记账。
++                limited = note_stream_limit(account, model, stream_error_text)
+                 if not emitted and reopen is not None:
+-                    # Nothing reached the client yet, so a transparent retry on
+-                    # the same account/egress looks like a TCP reconnect. One
+-                    # retry only; the recursive call reuses the sent headers.
++                    # Nothing reached the client yet, so a transparent retry
++                    # looks like a TCP reconnect. One retry only; the
++                    # recursive call reuses the sent headers. 刚记了限额账就
++                    # 换一个账号：pin 在失败账号上重连只会再失败一次。
++                    retry_open = reopen_switch if (limited and reopen_switch is not None) else reopen
+                     try:
+                         upstream.close()
+                     except Exception:
+                         pass
+                     new_upstream = None
+                     try:
+-                        new_upstream, new_account, new_effort = reopen()
++                        new_upstream, new_account, new_effort = retry_open()
+                     except Exception:
+                         new_upstream = None
+                     if new_upstream is not None:
+                         try:
+                             return self._chat_stream_response(
+                                 new_upstream, model, fp, new_account, t_start,
+-                                effort=new_effort, reopen=None,
++                                effort=new_effort, reopen=None, reopen_switch=None,
+                                 headers_sent=True, retried=True, realm=realm)
+                         finally:
+                             try:
+@@ -30327,6 +30385,33 @@
+
+                     }
+             outcome = "failed" if pending_finish == "error" else "completed"
+             if outcome == "failed":
++                # 上游以 finish_reason="error" 收尾（或流内发过错误帧后收尾）：
++                # 同样要过限额记账，否则下一轮选号立刻再撞同一 (账号, 模型)。
++                limited = note_stream_limit(account, model, stream_error_text,
++                                            error_finish=True)
++                if not emitted and limited and reopen_switch is not None:
++                    # 首帧就报限额、客户端还没有收到任何字节：换号重发对它
++                    # 完全透明。只换一次；再失败就走下面的错误收尾。
++                    try:
++                        upstream.close()
++                    except Exception:
++                        pass
++                    new_upstream = None
++                    try:
++                        new_upstream, new_account, new_effort = reopen_switch()
++                    except Exception:
++                        new_upstream = None
++                    if new_upstream is not None:
++                        try:
++                            return self._chat_stream_response(
++                                new_upstream, model, fp, new_account, t_start,
++                                effort=new_effort, reopen=None, reopen_switch=None,
++                                headers_sent=True, retried=True, realm=realm)
++                        finally:
++                            try:
++                                new_upstream.close()
++                            except Exception:
++                                pass
+                 record_error(getattr(upstream, "_wb_billed_model", model), 502, "upstream stream finished with error",
+                              elapsed_ms=wall, account=account.uid,
+                              usage=last_usage, stream=True, ttft_ms=first_ms,

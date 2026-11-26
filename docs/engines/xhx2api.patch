@@ -1,0 +1,198 @@
+diff --git a/go.mod b/go.mod
+index 682a2ff..8cf7c4b 100644
+--- a/go.mod
++++ b/go.mod
+@@ -4,4 +4,4 @@ go 1.22
+ 
+ require github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+ 
+-require golang.org/x/net v0.23.0 // indirect
++require golang.org/x/net v0.23.0
+diff --git a/internal/upstream/account.go b/internal/upstream/account.go
+index 6e25d75..8d47e8b 100644
+--- a/internal/upstream/account.go
++++ b/internal/upstream/account.go
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -125,7 +126,9 @@ func (c *Client) BalancePackages(ctx context.Context, a *auth.Auth) ([]CreditPac
+ 	if err != nil {
+ 		return nil, EntUsage{}, err
+ 	}
+-	dailyExpire := c.dailyBatchExpiry(ctx, a)
++	// 每日积分的到期时刻同样要按 FEFO 扣掉已消耗（见 dailyBatchRemain）。
++	// usage.Daily<=0 时函数直接返回 0，不会给空桶配到期日。
++	dailyExpire, _ := c.dailyBatchRemain(ctx, a, usage.Daily)
+ 	wallet := []struct {
+ 		name   string
+ 		value  int64
+@@ -146,22 +149,32 @@ func (c *Client) BalancePackages(ctx context.Context, a *auth.Auth) ([]CreditPac
+ 	return packs, usage, nil
+ }
+ 
+-// dailyBatchExpiry 查 bills，取每日发放批次里最早的**未过期**到期时刻（unix 秒）。
+-// 失败静默返回 0（构成页照常显示余额，只是到期分布缺这一列）。
++// dailyBatchRemain 返回「最早会作废的那批每日积分」的到期时刻与**剩余**额度。
+ //
+-// 用 income 口径：每日积分有效期 7 天，而 type=all 的窗口对重度账号只有 1~2 天，
+-// 会把 5 天后才到期的那批整个漏掉，报出比实际更晚的到期时间。
+-func (c *Client) dailyBatchExpiry(ctx context.Context, a *auth.Auth) int64 {
++// 必须按 FEFO 扣掉已消耗部分，不能直接累加发放流水：bills 的 income 是历史
++// 发放记录，永不变化。一个号 11-22 领过 300 分、11-23 就花光了，流水里那笔
++// 记录仍然在、expire_at 也还没到——直接上报会得出「300 分 11-28 要作废」，
++// 而它早就没了。上游 balance 的 daily_points 才是现存每日积分的权威口径：
++// 发放总额减去它，就是已经消耗掉的量；FEFO 意味着消耗先吃最早到期的批次，
++// 所以剩余额度要**从最早批次往后倒推**。
++//
++// dailyRemain<=0 直接返回 0：每日积分已清零，任何未过期批次都已被吃光。
++func (c *Client) dailyBatchRemain(ctx context.Context, a *auth.Auth, dailyRemain int64) (expire, points int64) {
++	if dailyRemain <= 0 {
++		return 0, 0
++	}
+ 	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
+ 	if err != nil {
+-		return 0
++		return 0, 0
+ 	}
+ 	data, err := payloadOf(resp, "积分流水")
+ 	if err != nil {
+-		return 0
++		return 0, 0
+ 	}
+ 	now := time.Now()
+-	var earliest int64
++	type batch struct{ exp, pts int64 }
++	var batches []batch
++	var total int64
+ 	items, _ := data["items"].([]any)
+ 	for _, raw := range items {
+ 		item, _ := raw.(map[string]any)
+@@ -170,13 +183,33 @@ func (c *Client) dailyBatchExpiry(ctx context.Context, a *auth.Auth) int64 {
+ 		}
+ 		exp := parseRFC3339(text(item, "expire_at"))
+ 		if exp <= 0 || time.Unix(exp, 0).Before(now) {
++			continue // 已过期：这批积分无论如何都不在了
++		}
++		pts := mustInt(item["points"])
++		if pts <= 0 {
+ 			continue
+ 		}
+-		if earliest == 0 || exp < earliest {
+-			earliest = exp
++		batches = append(batches, batch{exp: exp, pts: pts})
++		total += pts
++	}
++	if len(batches) == 0 {
++		return 0, 0
++	}
++	sort.Slice(batches, func(i, j int) bool { return batches[i].exp < batches[j].exp })
++	// 已消耗量 = 未过期批次的发放总额 - 现存每日积分；负数说明上游口径
++	// 有出入（例如跨批次的调整），按 0 处理，不虚增。
++	consumed := total - dailyRemain
++	if consumed < 0 {
++		consumed = 0
++	}
++	for _, b := range batches {
++		if consumed >= b.pts {
++			consumed -= b.pts // 整批已吃光
++			continue
+ 		}
++		return b.exp, b.pts - consumed
+ 	}
+-	return earliest
++	return 0, 0 // 全部批次都已吃光
+ }
+ 
+ // UserEntUsageDetailWithExpiry 在余额之外补上「最早会作废的那批积分」。
+@@ -185,55 +218,19 @@ func (c *Client) dailyBatchExpiry(ctx context.Context, a *auth.Auth) int64 {
+ // 面板「到期」列与到期提醒卡片就一直是空的。真正带到期语义的只有积分流水：
+ // 每笔 daily_grant 都有自己的 expire_at，上游按「失效时刻先后」扣减（FEFO），
+ // 所以「最近会作废的那批」= 所有未过期批次里最早的那个 expire_at。
++//
++// 金额必须是**扣掉已消耗后的剩余**（见 dailyBatchRemain）：拿发放额度上报
++// 会把早已花光的批次也算进去，虚报到吓人的程度。
+ func (c *Client) UserEntUsageDetailWithExpiry(ctx context.Context, a *auth.Auth) (EntUsage, error) {
+ 	usage, err := c.UserEntUsageDetail(ctx, a)
+ 	if err != nil {
+ 		return usage, err
+ 	}
+-	expire, points := c.earliestBatchExpiry(ctx, a)
++	expire, points := c.dailyBatchRemain(ctx, a, usage.Daily)
+ 	usage.Expire, usage.ExpirePoints = expire, points
+ 	return usage, nil
+ }
+ 
+-// earliestBatchExpiry 返回「最早过期的那批每日积分」的到期时刻与它的积分额。
+-//
+-// 只报时刻不够：账号余额里往往混着不会过期的奖励/充值积分，面板若拿可用总额
+-// 去算「哪天会作废多少」，会得出「6490 分 5 天后全没」这种吓人的假数。
+-func (c *Client) earliestBatchExpiry(ctx context.Context, a *auth.Auth) (expire, points int64) {
+-	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
+-	if err != nil {
+-		return 0, 0
+-	}
+-	data, err := payloadOf(resp, "积分流水")
+-	if err != nil {
+-		return 0, 0
+-	}
+-	now := time.Now()
+-	byExpire := map[int64]int64{}
+-	items, _ := data["items"].([]any)
+-	for _, raw := range items {
+-		item, _ := raw.(map[string]any)
+-		if item == nil || text(item, "biz_type") != "daily_grant" {
+-			continue
+-		}
+-		exp := parseRFC3339(text(item, "expire_at"))
+-		if exp <= 0 || time.Unix(exp, 0).Before(now) {
+-			continue
+-		}
+-		pts := mustInt(item["points"])
+-		if pts <= 0 {
+-			continue
+-		}
+-		byExpire[exp] += pts
+-	}
+-	for exp, pts := range byExpire {
+-		if expire == 0 || exp < expire {
+-			expire, points = exp, pts
+-		}
+-	}
+-	return expire, points
+-}
+-
+ // parseRFC3339 把上游时间戳（2006-01-02T15:04:05+08:00）转 unix 秒；解析不了返回 0。
+ func parseRFC3339(s string) int64 {
+ 	if s == "" {
+diff --git a/internal/upstream/points_audit.go b/internal/upstream/points_audit.go
+index a1082b8..2902eec 100644
+--- a/internal/upstream/points_audit.go
++++ b/internal/upstream/points_audit.go
+@@ -43,7 +43,13 @@ type PointAudit struct {
+ 	Reward  int64         `json:"reward"`
+ 	Topup   int64         `json:"topup"`
+ 	Expire  int64         `json:"expire"` // unix 秒，0 = 不过期
+-	Sources []PointSource `json:"sources"`
++	// ExpirePoints 是上面那个时刻会作废的积分额，只算每日积分批次。
++	//
++	// 必须单独透出：Remain 是账号总余额，混着不会过期的奖励/充值积分。
++	// 面板若拿 Remain 配 Expire 展示，会得出「5972 分 2 天后全没」这种
++	// 假警报——实际只有最早那批每日积分（通常 300 分）会作废。
++	ExpirePoints int64         `json:"expire_points"`
++	Sources      []PointSource `json:"sources"`
+ 	// Spent7d 是近 7 天消耗的积分（负数流水取绝对值）。
+ 	Spent7d int64 `json:"spent_7d"`
+ 	// SpentToday 是今天（东八区）已经消耗的积分。
+@@ -72,6 +78,7 @@ func (c *Client) PointAudit(ctx context.Context, a *auth.Auth) (*PointAudit, err
+ 	audit := &PointAudit{
+ 		UID: a.UID, Remain: usage.Remain, Daily: usage.Daily,
+ 		Reward: usage.Reward, Topup: usage.Topup, Expire: usage.Expire,
++		ExpirePoints: usage.ExpirePoints,
+ 	}
+ 
+ 	agg := map[string]*PointSource{}

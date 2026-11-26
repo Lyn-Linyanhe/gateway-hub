@@ -1,0 +1,151 @@
+// account_expiry_test.go 每日积分到期口径：必须按 FEFO 扣掉已消耗。
+//
+// 这里钉死的是一个真实踩过的坑：bills 的 income 是历史发放记录、永不变化，
+// 一个号领过 300 分、第二天花光，那条记录和它的 expire_at 都还在。若直接
+// 累加发放额度上报，就会得出「300 分要作废」，而它早就没了。上游 balance
+// 的 daily_points 才是现存每日积分的权威口径。
+package upstream
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/rsfree/xhx2api/internal/auth"
+)
+
+// newExpiryTestClient 起一个假上游：/balance 回固定余额，/bills 回固定流水。
+func newExpiryTestClient(t *testing.T, daily int64, bills []map[string]any) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/balance":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "message": "ok",
+				"data": map[string]any{
+					"available_points": 5871 + daily,
+					"daily_points":     daily,
+					"reward_points":    5871,
+					"monthly_points":   0,
+					"topup_points":     0,
+				},
+			})
+		case r.URL.Path == "/bills":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "message": "ok",
+				"data": map[string]any{"items": bills},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := New()
+	c.points = srv.URL
+	return c
+}
+
+func TestDailyBatchRemainDeductsConsumed(t *testing.T) {
+	future := func(days int) string {
+		return time.Now().Add(time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
+	}
+	past := func(days int) string {
+		return time.Now().Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
+	}
+	grant := func(points int64, expire string) map[string]any {
+		return map[string]any{
+			"biz_type": "daily_grant", "points": points, "expire_at": expire,
+		}
+	}
+
+	cases := []struct {
+		name       string
+		daily      int64 // 上游 daily_points（现存每日积分）
+		bills      []map[string]any
+		wantExpire bool
+		wantPoints int64
+	}{
+		{
+			// 真实踩坑场景：发过 300、daily_points=0（已花光），不该报临期。
+			name:       "已花光不报临期",
+			daily:      0,
+			bills:      []map[string]any{grant(300, future(2))},
+			wantExpire: false,
+			wantPoints: 0,
+		},
+		{
+			// 一分没花：整批 300 都还在。
+			name:       "未消耗整批保留",
+			daily:      300,
+			bills:      []map[string]any{grant(300, future(2))},
+			wantExpire: true,
+			wantPoints: 300,
+		},
+		{
+			// 花掉 120：最早那批只剩 180。
+			name:       "部分消耗按剩余报",
+			daily:      180,
+			bills:      []map[string]any{grant(300, future(2))},
+			wantExpire: true,
+			wantPoints: 180,
+		},
+		{
+			// 两批（早 300 / 晚 300），现存 350 → 早批吃光、晚批剩 50。
+			name:       "FEFO 先吃最早批次",
+			daily:      350,
+			bills:      []map[string]any{grant(300, future(2)), grant(300, future(5))},
+			wantExpire: true,
+			wantPoints: 50,
+		},
+		{
+			// 两批都吃光。
+			name:       "全部吃光不报",
+			daily:      0,
+			bills:      []map[string]any{grant(300, future(2)), grant(300, future(5))},
+			wantExpire: false,
+			wantPoints: 0,
+		},
+		{
+			// 只有已过期批次：无论如何都不在了。
+			name:       "忽略已过期批次",
+			daily:      300,
+			bills:      []map[string]any{grant(300, past(1))},
+			wantExpire: false,
+			wantPoints: 0,
+		},
+		{
+			// reward_grant 不会过期，不参与。
+			name: "奖励积分不参与",
+			daily: 300,
+			bills: []map[string]any{
+				grant(300, future(2)),
+				{"biz_type": "reward_grant", "points": 3000, "expire_at": ""},
+			},
+			wantExpire: true,
+			wantPoints: 300,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newExpiryTestClient(t, tc.daily, tc.bills)
+			expire, points := c.dailyBatchRemain(context.Background(), &auth.Auth{}, tc.daily)
+			if tc.wantExpire && expire == 0 {
+				t.Fatalf("期望有到期时刻，实际为 0")
+			}
+			if !tc.wantExpire && expire != 0 {
+				t.Fatalf("期望无到期时刻，实际 %d", expire)
+			}
+			if points != tc.wantPoints {
+				t.Fatalf("到期额度 = %d, want %d", points, tc.wantPoints)
+			}
+		})
+	}
+}
+
+var _ = fmt.Sprintf // 占位，避免 fmt 未使用时报错
