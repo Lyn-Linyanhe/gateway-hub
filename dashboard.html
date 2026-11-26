@@ -907,10 +907,10 @@ try{
     if(mq&&mq.addEventListener) mq.addEventListener('change',()=>{ if(themePref()==='auto') applyTheme(); });
   }
 }catch(e){}
-const PLATFORM_LABEL = {workbuddy:'WorkBuddy', qoder:'Qoder', qwenwork:'千问办公', raccoon:'小浣熊', trae:'Trae'};
-const PF_COLOR={workbuddy:'var(--accent)', qoder:'#0891b2', qwenwork:'var(--orange)', raccoon:'#7c3aed', trae:'#0dbd8b'};
+const PLATFORM_LABEL = {workbuddy:'WorkBuddy', qoder:'Qoder', qwenwork:'千问办公', raccoon:'小浣熊', trae:'Trae', codearts:'码道 CodeArts'};
+const PF_COLOR={workbuddy:'var(--accent)', qoder:'#0891b2', qwenwork:'var(--orange)', raccoon:'#7c3aed', trae:'#0dbd8b', codearts:'#d946ef'};
 /* 平台遍历统一用这份顺序：新接平台只改这里，避免图表/汇总漏掉某个平台 */
-const PF_ORDER=['workbuddy','qoder','qwenwork','raccoon','trae'];
+const PF_ORDER=['workbuddy','qoder','qwenwork','raccoon','trae','codearts'];
 function showGate(){
   const gate=document.getElementById('gate');
   if(gate.open) return;
@@ -2135,13 +2135,21 @@ function renderPlatforms(platforms){
       const no=++seq;
       const unknown=knownNumber(a.remain)===null;
       const pct=!unknown&&a.size?Math.min(100,a.remain/a.size*100):0;
-      // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡
+      // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡。
+      // 国际版到账状态只有三种可信来源（见 router.py 的 granted 关联）：
+      //   confirmed = 今天的积分发放记录里能找到由本机打卡动作触发的那笔
+      //   executed  = 对话跑完了，但没有对应的发放（奖励延迟或未发）
+      //   failed    = 最近一次执行报错
+      // 不要把「对话跑完」当成「已到账」：实测 ok=true 里有「0 段输出」。
       const punched=intlPunched(a);
+      const rewardName=a.daily_chat_reward_name?`${a.daily_chat_reward_name} ${fmt(a.daily_chat_reward_size||0)} 分`:'';
       const ck=(a.realm==='intl')
         ?(punched
-          ?(a.daily_chat_verified!==true
-            ?'<span class="pill orange" title="引擎已记录今日执行；上游未提供奖励到账凭据">已执行·到账待确认</span>'
-            :'<span class="pill green" title="'+esc(a.last_daily_chat||'')+'">今日已打卡</span>')
+          ?(a.daily_chat_verified===true
+            ?`<span class="pill green" title="今日积分发放记录里有本机打卡触发的发放${rewardName?'：'+esc(rewardName):''}">已打卡·已到账</span>`
+            :(a.daily_chat_error
+              ?`<span class="pill red" title="${esc(a.daily_chat_error)}">执行报错</span>`
+              :'<span class="pill orange" title="对话已执行完成，但今天的积分发放记录里没有找到由本次打卡触发的发放（可能延迟到账或未发放）">已执行·未见发放</span>'))
           :(a.daily_chat_error
             ?'<span class="pill red" title="'+esc(a.daily_chat_error)+'">打卡失败</span>'
             :'<span class="pill orange">待打卡</span>'))
@@ -2185,9 +2193,9 @@ function renderPlatforms(platforms){
         <td>${realmPill(a)}</td>
         <td class="num">${creditCell}</td>
         <td>${barCell}</td>
-        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?(a.daily_chat_verified!==true
-          ?`<div class="sub-cell">奖励到账状态未知</div>`
-          :`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`):''}${(a.realm==='intl'&&!punched&&a.daily_chat_error)?`<div class="sub-cell" title="${esc(a.daily_chat_error)}">${esc(String(a.daily_chat_error).slice(0,46))}${String(a.daily_chat_error).length>46?'…':''}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
+        <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?(a.daily_chat_verified===true
+          ?`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}${rewardName?' · '+esc(rewardName):''}</div>`
+          :`<div class="sub-cell" title="今天的积分发放记录里没有由本次打卡触发的发放">未匹配到发放记录</div>`):''}${(a.realm==='intl'&&!punched&&a.daily_chat_error)?`<div class="sub-cell" title="${esc(a.daily_chat_error)}">${esc(String(a.daily_chat_error).slice(0,46))}${String(a.daily_chat_error).length>46?'…':''}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
     };
     // 多区域时插分组标题行；序号跨组连续（平台内 1..N），不按组重排。
     const rows=groups.map(g=>{
@@ -2980,7 +2988,7 @@ function renderAutoCards(){
     let foot;
     if(p.name==='qwenwork') foot='每日积分由上游发放；保活执行结果与奖励到账分别确认。凭证或余额状态异常时，请检查官方客户端及账号状态。';
     else if(p.name==='raccoon') foot=`已签 ${signed}/${accs.length} · 每日积分由小浣熊上游发放，签到按钮用于领取当日额度。`;
-    else if(p.name==='workbuddy') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际已确认 ${intlDone}/${intlAccs.length}${intlUnverified?` · 到账待确认 ${intlUnverified}`:''}${punch?` · 待打卡 ${punch}`:''} · 定时调度器每天自动执行，按钮用于立即补做。`;
+    else if(p.name==='workbuddy') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际已到账 ${intlDone}/${intlAccs.length}${intlUnverified?` · 已执行未见发放 ${intlUnverified}`:''}${punch?` · 待打卡 ${punch}`:''} · 「已到账」= 积分发放记录里能找到本次打卡触发的那笔；定时调度器每天自动执行，按钮用于立即补做。`;
     else if(p.name==='trae') foot=`国内已签 ${cnSigned}/${cnAccs.length} · 国际版没有签到接口，不计入分母；积分来自官方 entitlement 快照，签到用于领当日积分。`;
     else foot=`已签 ${signed}/${accs.length} · 定时 09:00 / 10:05 / 21:00 自动签到，按钮用于补做。`;
     const groups=(AUTO_BUTTONS[p.name]||[]).map((g,gi)=>
@@ -3031,7 +3039,7 @@ async function loadAuto(){
       const intlFail=intl.filter(a=>!intlPunched(a)&&a.daily_chat_error).length;
       let line=`${PLATFORM_LABEL[p.name]||p.name}: ${p.health?'在线':'离线'} · ${p.accounts.length} 账号`;
       if(p.name==='qwenwork') line+=' · 上游自动发放';
-      else if(p.name==='workbuddy') line+=` · 国内已签 ${cnSigned}/${cn.length} · 国际打卡 ${intlDone}/${intl.length}`+(intlUnverified?`（${intlUnverified} 到账待确认）`:'')+(intlFail?`（${intlFail} 失败）`:'');
+      else if(p.name==='workbuddy') line+=` · 国内已签 ${cnSigned}/${cn.length} · 国际打卡 ${intlDone}/${intl.length}`+(intlUnverified?`（${intlUnverified} 未见发放）`:'')+(intlFail?`（${intlFail} 失败）`:'');
       else line+=` · 已签 ${signed}`;
       return line;
     });

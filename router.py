@@ -740,6 +740,7 @@ _AUTOMATION_STEP_SPECS = (
     ("trae.checkin", "Trae · 签到", "checkin", "trae", ""),
     ("trae.tasks.travel", "Trae · 领取 Pro 福利包", "task", "trae", "travel"),
     ("raccoon.checkin", "小浣熊 · 签到", "checkin", "raccoon", ""),
+    ("codearts.checkin", "码道 CodeArts · 签到领积分", "checkin", "codearts", ""),
     ("workbuddy.scheduler", "WorkBuddy · 提交补充巡检", "engine", "workbuddy", "scheduler/trigger"),
 )
 
@@ -809,7 +810,7 @@ def _automation_checkin(name):
         return {"ok": False, "error": "没有签到接口"}
     try:
         result = engine_request(up, "POST", path, {}, auth=auth_kind,
-                                timeout=600 if name == "raccoon" else 15)
+                                timeout=600 if name in ("raccoon", "codearts") else 15)
     except Exception:
         # A timed-out check-in might have completed upstream; don't enable retries.
         return {"unknown": True, "error": "签到结果未知，请刷新账号状态确认"}
@@ -1028,8 +1029,8 @@ def _launch_spec(up):
 def _upstream_health(up, timeout=3):
     """轻量健康检查（只读 /health），用于进程启动确认和设置页状态。"""
     try:
-        # xhx2api（raccoon）用 /healthz；其它 hub 系引擎用 /health。
-        health_path = "/healthz" if up.get("name") == "raccoon" else "/health"
+        # xhx2api（raccoon）/ codearts2api（codearts）用 /healthz；其它 hub 系引擎用 /health。
+        health_path = "/healthz" if up.get("name") in ("raccoon", "codearts") else "/health"
         req = urllib.request.Request(up["base_url"].rstrip("/") + health_path)
         with _urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
@@ -2396,9 +2397,44 @@ def normalize_trae(a):
     }
 
 
+def normalize_codearts(a):
+    """codearts2api /admin/api/overview 的账号行 → 看板形状。
+
+    引擎不查积分余额：`credits` 恒为 0 且注释写明「未查询真实余额」，所以
+    remain 必须是 None——填 0 会被看板当成「已用完」，填别的就是假数据。
+    能展示的是登录态：token 剩余有效期、冷却、禁用、最近错误、并发占用。
+
+    `checkin` 是 {ok, message, checked_at}；checked_at 为 RFC3339，取日期部分
+    与东八区今天比较。
+    """
+    uid = str(a.get("uid") or a.get("name") or "")
+    ck = a.get("checkin") if isinstance(a.get("checkin"), dict) else {}
+    checked_at = str(ck.get("checked_at") or "")[:10]
+    cool_until = _iso_epoch(a.get("cool_until")) if a.get("cooling") else None
+    return {
+        "uid": uid,
+        "name": a.get("nickname") or a.get("user_name") or (uid[:8] if uid else "?"),
+        "sub": "码道 · token " + str(a.get("token_remaining") or "?"),
+        "enabled": not a.get("disabled"),
+        "remain": None,
+        "size": None,
+        "pct": "",
+        "checked_in": bool(ck.get("ok")) and checked_at == _shanghai_today(),
+        "can_checkin": True,
+        "can_daily_chat": None,
+        "realm": "cn",
+        "streak": None,
+        "inflight": a.get("active_concurrent"),
+        "concurrency_limit": a.get("max_concurrent"),
+        "cooldown_until": cool_until or None,
+        "cooldown_kind": a.get("cool_kind") or None,
+        "last_error": (str(a.get("reason") or a.get("last_error") or "").strip()[:200] or None),
+    }
+
+
 NORMALIZERS = {"workbuddy": normalize_wb, "qoder": normalize_qoder,
                "qwenwork": normalize_buddy, "raccoon": normalize_raccoon,
-               "trae": normalize_trae}
+               "trae": normalize_trae, "codearts": normalize_codearts}
 
 
 def _signable_account(a):
@@ -2686,6 +2722,7 @@ def platform_status(up):
                       "qoder": "credits.expires_at",
                       "raccoon": "points audit",
                       "trae": "entitlement packs",
+                      "codearts": "engine 不提供积分余额/到期",
                       "qwenwork": "qwenwork_reset_at configuration"}
     out = {"name": name, "base_url": up["base_url"], "health": False, "accounts": [],
            "inflight": _inflight.get(name, 0), "error": "",
@@ -2693,8 +2730,8 @@ def platform_status(up):
            "data_state": "unknown", "balance_state": "unknown",
            "expiry_state": "unknown", "expiry_source": expiry_sources.get(name, "")}
     try:
-        # hub 系引擎是 /health；xhx2api 用 /healthz（同样是 JSON status=ok）。
-        health_path = "/healthz" if name == "raccoon" else "/health"
+        # hub 系引擎是 /health；xhx2api 与 codearts2api 用 /healthz（同样是 JSON status=ok）。
+        health_path = "/healthz" if name in ("raccoon", "codearts") else "/health"
         req = urllib.request.Request(up["base_url"].rstrip("/") + health_path)
         with _urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode("utf-8"))
@@ -2751,6 +2788,12 @@ def platform_status(up):
             for a in items:
                 if isinstance(a, dict) and by_uid:
                     a["_audit"] = by_uid.get(str(a.get("uid") or ""))
+        elif name == "codearts":
+            # codearts2api 的账号清单在 /admin/api/overview（Bearer = 引擎 api_key）。
+            # 引擎不查积分余额（credits 恒 0），所以这里只取账号状态；临期行为空。
+            data = engine_request(up, "GET", "/admin/api/overview", auth="bearer")
+            items = data.get("accounts") if isinstance(data, dict) else data
+            items = items or []
         else:
             # hub 系 /accounts 默认只返回当前区域视图，realm=all 才是全池
             data = engine_request(up, "GET", "/accounts?realm=all")
@@ -2821,10 +2864,44 @@ def platform_status(up):
                 for hr in rows:
                     if isinstance(hr, dict) and hr.get("uid"):
                         latest.setdefault(str(hr["uid"]), hr)
+                # 到账证据只能来自积分包发放记录：引擎 /accounts/credits/grants 会把
+                # 每个包的 create_time 与最近一次本机打卡动作做时间关联（窗口
+                # -2h/+10min），action.task == daily_chat 才算「这次打卡带来的发放」。
+                # 活动历史里的 ok=true 只证明「对话跑完了」——实测有「0 段输出」也算
+                # 成功，与发分无关；只看它会把「跑过但没发分」误报成已到账。
+                granted = {}
+                try:
+                    grants = engine_request(up, "GET", "/accounts/credits/grants", timeout=8)
+                    grows = (grants.get("rows") or []) if isinstance(grants, dict) else []
+                    today = time.strftime("%Y-%m-%d", time.localtime())
+                    for gr in grows:
+                        if not isinstance(gr, dict):
+                            continue
+                        act = gr.get("action")
+                        if not isinstance(act, dict) or act.get("task") != "daily_chat":
+                            continue
+                        if not str(gr.get("create_iso") or "").startswith(today):
+                            continue
+                        gid = str(gr.get("uid") or "")
+                        if gid:
+                            granted.setdefault(gid, []).append(gr)
+                except Exception:
+                    granted = {}
                 for row in intl_rows:
-                    row["daily_chat_verified"] = None
-                    row["daily_chat_reward_status"] = "unknown"
-                    hit = latest.get(str(row.get("uid") or ""))
+                    uid = str(row.get("uid") or "")
+                    hit = latest.get(uid)
+                    # confirmed=有本机打卡触发的今日发放；executed=对话跑完但无对应
+                    # 发放（奖励可能延迟或未发）；failed 走下面的 error 分支。
+                    if granted.get(uid):
+                        row["daily_chat_verified"] = True
+                        row["daily_chat_reward_status"] = "confirmed"
+                        g = granted[uid][0]
+                        row["daily_chat_reward_name"] = str(g.get("name") or "")
+                        row["daily_chat_reward_size"] = g.get("size")
+                    else:
+                        row["daily_chat_verified"] = False
+                        row["daily_chat_reward_status"] = (
+                            "executed" if (hit and hit.get("ok") is not False) else "unknown")
                     if hit and hit.get("ok") is False and not row.get("daily_chatted_today"):
                         row["daily_chat_error"] = str(hit.get("message") or "")[:240]
                         row["daily_chat_error_at"] = hit.get("ts")
@@ -3875,6 +3952,8 @@ CHECKIN_PATHS = {
     "qoder": ("/accounts/checkin", "panel"),
     "trae": ("/accounts/checkin", "panel"),
     "raccoon": ("/panel/api/checkin_all", "bearer"),
+    # codearts2api 的签到要逐个账号去上游领活动积分，走管理端点（Bearer）。
+    "codearts": ("/admin/api/checkin", "bearer"),
     # qwenwork 没有签到动作：每日积分由上游自动发放（见 _api_checkin 特判）。
     # 不放进这里，避免把「令牌保活」当签到去调用（那条路 100% 超时/失败）。
 }
