@@ -5,6 +5,8 @@ config.json.bak*
 *.log
 qwenwork_tracker.json
 qwenwork_wallet_history.jsonl
+automation_daily.json
+automation_daily.json.tmp
 *.jsonl
 dash_check.tmp.js
 __pycache__/
