@@ -810,7 +810,7 @@ def _automation_checkin(name):
         return {"ok": False, "error": "没有签到接口"}
     try:
         result = engine_request(up, "POST", path, {}, auth=auth_kind,
-                                timeout=600 if name in ("raccoon", "codearts") else 15)
+                                timeout=_checkin_timeout(name))
     except Exception:
         # A timed-out check-in might have completed upstream; don't enable retries.
         return {"unknown": True, "error": "签到结果未知，请刷新账号状态确认"}
@@ -4124,6 +4124,14 @@ def estimate_snapshot(force=False):
         _estimate_cache.update(ts=now, data=data)
     return data
 
+#: 签到要逐个账号去上游领活动积分的平台，超时放宽到 10 分钟；其余 15s 足够。
+CHECKIN_TIMEOUTS = {"raccoon": 600, "codearts": 600}
+
+
+def _checkin_timeout(name):
+    return CHECKIN_TIMEOUTS.get(name, 15)
+
+
 CHECKIN_PATHS = {
     "workbuddy": ("/accounts/checkin", "panel"),
     "qoder": ("/accounts/checkin", "panel"),
@@ -5048,8 +5056,8 @@ class Handler(BaseHTTPRequestHandler):
         if not spec:
             return self._deny(400, f"平台 `{name}` 没有可代执行的签到")
         path, kind = spec
-        # 小浣熊要逐个账号领积分，可能跑几分钟；其余平台保持 15s 默认。
-        timeout = 600 if name == "raccoon" else 15
+        # 小浣熊/码道要逐个账号领积分，可能跑几分钟；其余平台保持 15s 默认。
+        timeout = _checkin_timeout(name)
         try:
             result = engine_request(up, "POST", path, {}, auth=kind, timeout=timeout)
         except urllib.error.HTTPError as exc:
