@@ -145,6 +145,14 @@ td.num,th.num{text-align:right}
 .bar>i.low{background:var(--orange)}
 .name-cell{font-weight:600}
 .sub-cell{font-size:11px;color:var(--dim2)}
+/* 账号序号列：窄、等宽、弱化，只为「数得清」服务，不抢账号名的注意力 */
+th.seq-cell,td.seq-cell{width:1%;white-space:nowrap;text-align:right;padding-right:2px;
+  font-variant-numeric:tabular-nums;color:var(--dim2);font-size:12px;font-weight:500}
+/* 国内/国际分组标题行：同平台多区域时插在 tbody 里，浅底 + 上边线做视觉切块 */
+tr.realm-group>th{text-align:left;padding:7px 10px;
+  background:var(--panel2);color:var(--dim);font-size:11.5px;font-weight:700;
+  letter-spacing:.3px;border-top:1px solid var(--line2);border-bottom:1px solid var(--line)}
+tbody>tr.realm-group:first-child>th{border-top:none}
 .auto-group{display:flex;align-items:flex-start;gap:10px;margin-bottom:6px}
 .auto-group-label{font-size:11px;font-weight:600;color:var(--dim2);min-width:52px;padding-top:7px;flex-shrink:0;letter-spacing:.5px}
 
@@ -1990,20 +1998,55 @@ function renderExpiring(rows, platforms=[]){
   if(!rows.length){el.innerHTML='<div class="empty">暂无已知过期信息（不是已确认没有到期项）</div>';return;}
   el.innerHTML=`<div class="tblwrap" tabindex="0" role="region" aria-label="临期积分包"><table><caption class="sr-only">临期积分包及消耗速度估算</caption><thead><tr>
     <th scope="col">平台</th><th scope="col">账号</th><th scope="col">积分包</th><th scope="col" class="num">剩余</th><th scope="col">到期时间</th><th scope="col">距过期</th><th scope="col">按当前速度可用</th>
-  </tr></thead><tbody>`+rows.map(r=>{
-    const d=r.days_left;
-    const cls=d===null||d===undefined?'gray':(d<=7?'red':(d<=14?'orange':'green'));
-    const label=d===null||d===undefined?'—':(d<=0?'已过期':(d<1?Math.round(d*24)+' 小时':Math.ceil(d)+' 天'));
-    // burn_days 是上游按近期消耗速度外推的「还能用几天」，与到期日无关：
-    // 余额撑得比有效期久时，积分会在到期日清零，所以单独一列。
-    const bd=r.burn_days;
-    const burn=(bd===null||bd===undefined)?'<span class="pill gray">—</span>'
-      :`<span class="pill ${bd<=7?'red':(bd<=14?'orange':'gray')}">${bd<1?Math.round(bd*24)+' 小时':Math.ceil(bd)+' 天'}</span>`;
-    return `<tr><td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
-      <td>${esc(r.account||'—')}</td><td>${esc(r.name||'')}</td>
-      <td class="num">${fmt(r.remain)}</td><td class="mono">${esc(r.expire||'')}</td>
-      <td><span class="pill ${cls}">${label}</span></td><td>${burn}</td></tr>`;
-  }).join('')+`</tbody></table></div>`;
+  </tr></thead><tbody>`+(()=>{
+    const rowHtml=r=>{
+      const d=r.days_left;
+      const cls=d===null||d===undefined?'gray':(d<=7?'red':(d<=14?'orange':'green'));
+      const label=d===null||d===undefined?'—':(d<=0?'已过期':(d<1?Math.round(d*24)+' 小时':Math.ceil(d)+' 天'));
+      // burn_days 是上游按近期消耗速度外推的「还能用几天」，与到期日无关：
+      // 余额撑得比有效期久时，积分会在到期日清零，所以单独一列。
+      const bd=r.burn_days;
+      const burn=(bd===null||bd===undefined)?'<span class="pill gray">—</span>'
+        :`<span class="pill ${bd<=7?'red':(bd<=14?'orange':'gray')}">${bd<1?Math.round(bd*24)+' 小时':Math.ceil(bd)+' 天'}</span>`;
+      return `<tr><td><span class="pill indigo">${esc(PLATFORM_LABEL[r.platform]||r.platform)}</span></td>
+        <td>${esc(r.account||'—')}</td><td>${esc(r.name||'')}</td>
+        <td class="num">${fmt(r.remain)}</td><td class="mono">${esc(r.expire||'')}</td>
+        <td><span class="pill ${cls}">${label}</span></td><td>${burn}</td></tr>`;
+    };
+    // 按平台分组、组内仍按到期时间升序：全局按到期排会把 WB 与 Trae 的行
+    // 交错成「WB→Trae→WB×3→Trae→…」，同平台的信息反而要跳着读。分组后
+    // 每个平台一块，块内最早的到期在最上面（紧迫度仍然一眼可见）。
+    // 平台块顺序按「该平台最早到期」排，最紧急的平台排在最前。
+    const byPlatform=new Map();
+    for(const r of rows){
+      const key=r.platform||'';
+      if(!byPlatform.has(key)) byPlatform.set(key,[]);
+      byPlatform.get(key).push(r);
+    }
+    const groups=[...byPlatform.entries()].map(([platform,items])=>{
+      const sorted=items.slice().sort((a,b)=>String(a.expire||'').localeCompare(String(b.expire||'')));
+      const minDays=sorted.reduce((acc,r)=>{
+        const d=r.days_left;
+        return (d===null||d===undefined)?acc:(acc===null||d<acc?d:acc);
+      },null);
+      return {platform,items:sorted,minDays};
+    }).sort((a,b)=>{
+      if(a.minDays===null&&b.minDays===null) return 0;
+      if(a.minDays===null) return 1;
+      if(b.minDays===null) return -1;
+      return a.minDays-b.minDays;
+    });
+    const multi=groups.length>1;
+    return groups.map(g=>{
+      const head=multi
+        ? `<tr class="realm-group"><th scope="colgroup" colspan="7">${esc(PLATFORM_LABEL[g.platform]||g.platform||'未知平台')}
+             · ${g.items.length} 个临期包
+             · 合计 ${fmt(g.items.reduce((sum,r)=>sum+(knownNumber(r.remain)||0),0))} 分
+           </th></tr>`
+        : '';
+      return head+g.items.map(rowHtml).join('');
+    }).join('');
+  })()+`</tbody></table></div>`;
 }
 
 function knownNumber(value){
@@ -2078,7 +2121,18 @@ function renderPlatforms(platforms){
     });
     if(filtersActive&&!accs.length&&!p.error) return '';
     matches+=accs.length;
-    const rows=accs.map(a=>{
+    // 国内/国际分组：同平台的两种区域账号混在一张表里时，靠「区域」列自己看很
+    // 容易串行（实测 WorkBuddy 的引擎顺序是 cn,intl,intl,intl,cn）。这里按区域
+    // 切块、每块插一行分组标题（含该区账号数与余额合计），序号在平台内连续，
+    // 这样既能一眼数清总数，也能按区对照。只有一个区域的平台不插标题——那只是
+    // 噪音。区块顺序固定 cn → intl → 未标注，不依赖引擎返回顺序。
+    const REALM_ORDER=['cn','intl',null];
+    const groups=REALM_ORDER.map(realm=>({realm,items:accs.filter(a=>(a.realm||null)===realm)}))
+      .filter(g=>g.items.length);
+    const multiRealm=groups.length>1;
+    let seq=0;
+    const rowHtml=a=>{
+      const no=++seq;
       const unknown=knownNumber(a.remain)===null;
       const pct=!unknown&&a.size?Math.min(100,a.remain/a.size*100):0;
       // 签到徽章按平台语义区分：wb 国际版没有每日签到，每日收益是活跃对话打卡
@@ -2127,13 +2181,23 @@ function renderPlatforms(platforms){
         ||a.last_error
         ||(a.account_status==='expired'?'凭证已过期，请重新登录':''),
         capNote, disabledNote].filter(Boolean).join('；');
-      return `<tr><td class="name-cell">${esc(a.name)} ${warn}<div class="sub-cell">${esc(a.sub||'')}</div>${issue?`<div class="account-issue">${esc(issue)}</div>`:''}</td>
+      return `<tr><td class="num seq-cell">${no}</td><td class="name-cell">${esc(a.name)} ${warn}<div class="sub-cell">${esc(a.sub||'')}</div>${issue?`<div class="account-issue">${esc(issue)}</div>`:''}</td>
         <td>${realmPill(a)}</td>
         <td class="num">${creditCell}</td>
         <td>${barCell}</td>
         <td>${ck}${a.streak?`<div class="sub-cell">连签 ${esc(a.streak)} 天</div>`:''}${(a.realm==='intl'&&punched)?(a.daily_chat_verified!==true
           ?`<div class="sub-cell">奖励到账状态未知</div>`
           :`<div class="sub-cell">打卡于 ${esc(String(a.last_daily_chat||'').slice(11,16))}</div>`):''}${(a.realm==='intl'&&!punched&&a.daily_chat_error)?`<div class="sub-cell" title="${esc(a.daily_chat_error)}">${esc(String(a.daily_chat_error).slice(0,46))}${String(a.daily_chat_error).length>46?'…':''}</div>`:''}</td><td>${cq}</td><td>${st}</td></tr>`;
+    };
+    // 多区域时插分组标题行；序号跨组连续（平台内 1..N），不按组重排。
+    const rows=groups.map(g=>{
+      const head=multiRealm
+        ? `<tr class="realm-group"><th scope="colgroup" colspan="8">${REALM_LABEL[g.realm]||'未标注区域'}
+             · ${g.items.length} 个账号
+             · 合计 ${(()=>{const b=balanceSummary(g.items);return b.value===null?'余额未知':fmt(b.value)+' 分';})()}
+           </th></tr>`
+        : '';
+      return head+g.items.map(rowHtml).join('');
     }).join('');
     const balance=balanceSummary(full), rem=balance.value;
     const allUnknown=rem===null;
@@ -2154,7 +2218,7 @@ function renderPlatforms(platforms){
           ? '<span class="pill gray" title="千问办公每日积分由上游自动发放，没有签到动作">无需签到</span>'
           : `<button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>`}
       </div>
-      ${rows?`<div class="tblwrap"><table><caption class="sr-only">${esc(PLATFORM_LABEL[p.name]||p.name)} 账号列表</caption><thead><tr><th scope="col">账号</th><th scope="col">区域</th><th scope="col" class="num">积分</th><th scope="col">余量</th><th scope="col">签到</th><th scope="col">并发</th><th scope="col">状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      ${rows?`<div class="tblwrap"><table><caption class="sr-only">${esc(PLATFORM_LABEL[p.name]||p.name)} 账号列表</caption><thead><tr><th scope="col" class="num seq-cell">#</th><th scope="col">账号</th><th scope="col">区域</th><th scope="col" class="num">积分</th><th scope="col">余量</th><th scope="col">签到</th><th scope="col">并发</th><th scope="col">状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
         :`<div class="empty">${p.error?esc(p.error):(rf?'该平台暂无'+REALM_LABEL[rf]+'账号':'该平台暂无账号')}</div>`}
     </div>`;
   }).join('')||'<div class="empty">没有匹配的账号</div>';

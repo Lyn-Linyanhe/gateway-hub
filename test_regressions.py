@@ -2446,6 +2446,188 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(job["steps"][0]["status"], "failed")
             self.assertTrue(job["steps"][0]["retryable"])
 
+    def test_dashboard_account_rows_grouped_by_realm(self):
+        """账号页按区域分组：组内标题行 + 平台内连续序号 + 单区域不插标题。
+
+        实测引擎返回顺序是 cn,intl,intl,intl,cn（WorkBuddy），不分组时国内号被
+        夹在国际号中间，靠「区域」列自己看容易串行。这里用合成 DOM 抽出
+        renderPlatforms 跑一遍，钉死分组顺序、序号连续性、合计口径与单区域降级。
+        """
+        import subprocess
+        script = r'''
+const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
+const html=fs.readFileSync(process.argv[2],'utf8');
+
+// 按函数名精确截取（大括号配平）：正则非贪婪会在模板字符串里提前截断。
+function extractFn(name){
+  const start=html.indexOf('function '+name+'(');
+  assert.ok(start>=0, name+' not found');
+  let i=html.indexOf('{',start), depth=0, end=-1;
+  for(;i<html.length;i++){
+    const c=html[i];
+    if(c==='{') depth++;
+    else if(c==='}'){ depth--; if(depth===0){ end=i+1; break; } }
+  }
+  assert.ok(end>0, name+' unbalanced');
+  return html.slice(start,end);
+}
+
+const stubs=`
+const REALM_LABEL={cn:'国内版',intl:'国际版'};
+const PLATFORM_LABEL={workbuddy:'WorkBuddy'};
+let ACC_PLATFORMS=[];
+function knownNumber(v){return (v===null||v===undefined||v===''||typeof v==='boolean'||!Number.isFinite(Number(v)))?null:Number(v);}
+function fmt(n){return Math.round(n).toLocaleString();}
+function esc(s){return String(s===null||s===undefined?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function realmPill(a){
+  if(a.realm==='cn') return '<span class="rt cn">国内版</span>';
+  if(a.realm==='intl') return '<span class="rt intl">国际版</span>';
+  return '<span class="rt">-</span>';
+}
+function intlPunched(a){
+  const today=new Date().toISOString().slice(0,10);
+  return !!(a.last_daily_chat && String(a.last_daily_chat).slice(0,10)===today);
+}
+function safeHistoryText(s){return String(s===null||s===undefined?'':s);}
+function balanceSummary(accounts){
+  const active=accounts.filter(a=>a.enabled);
+  const known=active.map(a=>knownNumber(a.remain)).filter(v=>v!==null);
+  return {value:known.length?known.reduce((a,b)=>a+b,0):null,known:known.length,total:active.length};
+}
+var __store={};
+const document={
+  getElementById:(id)=>({
+    value:'',
+    get textContent(){return '';},
+    set textContent(v){__store['txt:'+id]=v;},
+    get innerHTML(){return __store[id]||'';},
+    set innerHTML(v){__store[id]=v;},
+  }),
+  querySelectorAll:()=>[],
+};
+`;
+const ctx={console,Math,Number,String,JSON,Date,Object,Array};
+vm.createContext(ctx);
+vm.runInContext(stubs+'\n'+extractFn('renderPlatforms'),ctx);
+const store=vm.runInContext('__store',ctx);
+const render=(platforms)=>{ctx.renderPlatforms(platforms);return store['platforms']||'';};
+
+const today=new Date().toISOString();
+// 真实形状：引擎顺序 cn,intl,intl,intl,cn
+const mixed=render([{name:'workbuddy',health:true,inflight:0,base_url:'http://127.0.0.1:8788',
+  observed_at:'2026-11-26T14:00:00',data_state:'ok',balance_state:'ok',accounts:[
+  {name:'493ef753',realm:'cn',remain:1333.84,size:null,enabled:true,checked_in:true,can_checkin:false},
+  {name:'384462',realm:'intl',remain:120,size:null,enabled:true,checked_in:null,last_daily_chat:today},
+  {name:'linyanhe6@gmail.com',realm:'intl',remain:120,size:null,enabled:true,checked_in:null,last_daily_chat:today},
+  {name:'c8509c44',realm:'intl',remain:120,size:null,enabled:true,checked_in:null,last_daily_chat:today},
+  {name:'十二月',realm:'cn',remain:203.87,size:null,enabled:true,checked_in:false,can_checkin:true},
+]}]);
+
+// 序号在平台内连续（跨组不重排），从 1 开始
+const seqs=[...mixed.matchAll(/<td class="num seq-cell">(\d+)<\/td>/g)].map(m=>m[1]);
+assert.equal(seqs.join(','),'1,2,3,4,5','序号应平台内连续');
+assert.ok(/<th scope="col" class="num seq-cell">#<\/th>/.test(mixed),'表头应有序号列');
+// 两个分组标题，且国内在前
+assert.equal((mixed.match(/class="realm-group"/g)||[]).length,2,'多区域应有 2 个分组标题');
+assert.ok(mixed.indexOf('493ef753')<mixed.indexOf('384462'),'国内组应排在国际组之前');
+// 标题行含账号数与合计（合计走 fmt 取整，与平台卡片口径一致）
+assert.ok(/国内版[\s\S]{0,120}?2 个账号/.test(mixed),'国内标题应含账号数');
+assert.ok(/国际版[\s\S]{0,120}?3 个账号/.test(mixed),'国际标题应含账号数');
+assert.ok(/合计 1,538 分/.test(mixed),'国内合计应取整显示 1,538');
+assert.ok(/合计 360 分/.test(mixed),'国际合计应为 360');
+// 序号不能退化成 0/NaN
+assert.ok(!/seq-cell">(0|NaN)/.test(mixed),'序号不应为 0 或 NaN');
+
+// 单区域平台不插分组标题（只有一种区域时那行纯属噪音）
+const single=render([{name:'workbuddy',health:true,inflight:0,base_url:'x',observed_at:'',
+  data_state:'ok',balance_state:'ok',accounts:[
+  {name:'a',realm:'cn',remain:10,size:null,enabled:true,checked_in:true},
+  {name:'b',realm:'cn',remain:20,size:null,enabled:true,checked_in:true},
+]}]);
+assert.equal((single.match(/class="realm-group"/g)||[]).length,0,'单区域不应插分组标题');
+assert.equal([...single.matchAll(/seq-cell">(\d+)</g)].map(m=>m[1]).join(','),'1,2','单区域仍要有序号');
+
+console.log('dashboard accounts: realm grouping, continuous seq, single-realm fallback passed');
+'''
+        result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
+                                text=True, encoding='utf-8', capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dashboard_expiring_grouped_by_platform(self):
+        """总览「积分到期」按平台分组：同平台的行不再被别的平台打断。
+
+        全局按到期时间排序会把 WB 与 Trae 的行交错成
+        「WB→Trae→WB×3→Trae→…」，同平台信息要跳着读。分组后每平台一块，
+        块内仍按到期升序（紧迫度不丢），块顺序按该平台最早到期排。
+        """
+        import subprocess
+        script = r'''
+const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
+const html=fs.readFileSync(process.argv[2],'utf8');
+function extractFn(name){
+  const start=html.indexOf('function '+name+'(');
+  assert.ok(start>=0, name+' not found');
+  let i=html.indexOf('{',start), depth=0, end=-1;
+  for(;i<html.length;i++){
+    const c=html[i];
+    if(c==='{') depth++;
+    else if(c==='}'){ depth--; if(depth===0){ end=i+1; break; } }
+  }
+  assert.ok(end>0, name+' unbalanced');
+  return html.slice(start,end);
+}
+const stubs=`
+const PLATFORM_LABEL={workbuddy:'WorkBuddy',trae:'Trae',raccoon:'小浣熊'};
+function knownNumber(v){return (v===null||v===undefined||v===''||typeof v==='boolean'||!Number.isFinite(Number(v)))?null:Number(v);}
+function fmt(n){return Math.round(n).toLocaleString();}
+function esc(s){return String(s===null||s===undefined?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+var __store={};
+const document={getElementById:(id)=>({value:'',get textContent(){return '';},set textContent(v){__store['txt:'+id]=v;},get innerHTML(){return __store[id]||'';},set innerHTML(v){__store[id]=v;}}),querySelectorAll:()=>[]};
+`;
+const ctx={console,Math,Number,String,JSON,Date,Object,Array};
+vm.createContext(ctx);
+vm.runInContext(stubs+'\n'+extractFn('renderExpiring'),ctx);
+const store=vm.runInContext('__store',ctx);
+
+// 真实交错形状：WB 12-13 → Trae 12-22 → WB 12-23 → Trae 12-23 → WB 12-25 → Trae 12-27
+const rows=[
+  {platform:'workbuddy',account:'493ef753',name:'CodeBuddy个人版拉新权益包',remain:82.07,expire:'2026-12-13 14:20:07',days_left:17.1},
+  {platform:'trae',account:'十***',name:'签到奖励',remain:92.38,expire:'2026-12-22 00:29',days_left:25.5},
+  {platform:'workbuddy',account:'384462',name:'Bonus Pack',remain:30,expire:'2026-12-23 01:52:24',days_left:26.6},
+  {platform:'trae',account:'十***',name:'签到奖励',remain:100,expire:'2026-12-23 09:03',days_left:26.8},
+  {platform:'workbuddy',account:'十二月',name:'裂变包',remain:100,expire:'2026-12-25 21:20:55',days_left:29.4},
+  {platform:'trae',account:'十***',name:'签到奖励',remain:100,expire:'2026-12-27 12:44',days_left:31.0},
+];
+ctx.renderExpiring(rows,[]);
+const out=store['expiring-list']||'';
+
+assert.equal((out.match(/class="realm-group"/g)||[]).length,2,'两个平台应各有一个分组标题');
+assert.ok(/WorkBuddy[\s\S]{0,60}?3 个临期包/.test(out),'WB 标题应含包数');
+assert.ok(/Trae[\s\S]{0,60}?3 个临期包/.test(out),'Trae 标题应含包数');
+// 同平台三行连续，中间不能夹别的平台
+const wbIdx=[...out.matchAll(/CodeBuddy个人版拉新权益包|Bonus Pack|裂变包/g)].map(m=>m.index);
+const trIdx=[...out.matchAll(/签到奖励/g)].map(m=>m.index);
+assert.equal(wbIdx.length,3);
+assert.ok(Math.max(...wbIdx)<Math.min(...trIdx),'WB 三行应连续，不被 Trae 打断');
+// 组内仍按到期升序
+const d1=out.indexOf('2026-12-13'), d2=out.indexOf('2026-12-23 01:52'), d3=out.indexOf('2026-12-25');
+assert.ok(d1>0&&d1<d2&&d2<d3,'WB 组内应按到期升序');
+// 更紧急的平台排在前（WB 最早 12-13 < Trae 最早 12-22）
+assert.ok(out.indexOf('WorkBuddy')<out.indexOf('Trae'),'更紧急的平台应排在前面');
+assert.ok(/合计 212 分/.test(out),'WB 合计 = 82.07+30+100 → 取整 212');
+
+// 单平台不插分组标题
+store['expiring-list']='';
+ctx.renderExpiring([rows[0],rows[2]],[]);
+const single=store['expiring-list']||'';
+assert.equal((single.match(/class="realm-group"/g)||[]).length,0,'单平台不应插分组标题');
+
+console.log('dashboard expiring: platform grouping, in-group expiry order, single-platform fallback passed');
+'''
+        result = subprocess.run(['node', '-', str(ROOT / 'dashboard.html')], input=script,
+                                text=True, encoding='utf-8', capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_dashboard_offline(self):
         import subprocess
         # Run the actual inline script with a synthetic DOM, transport and clock.
