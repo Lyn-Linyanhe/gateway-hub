@@ -60,6 +60,7 @@ class GatewayTests(unittest.TestCase):
              "TRAE_WALLET_HISTORY": "", "TRAE_SPEND_HISTORY": "",
              "RACCOON_BILLING_LINKS": "",
              "PLATFORM_BALANCE_UNIT": constant(ROOT / "router.py", "PLATFORM_BALANCE_UNIT"),
+             "ESTIMATE_EXCLUDED": constant(ROOT / "router.py", "ESTIMATE_EXCLUDED"),
              "_estimate_context": type("EstimateContext", (), {})(),
              "os": __import__('os'), "HERE": str(ROOT),
              "_config_lock": threading.RLock(),
@@ -656,6 +657,7 @@ class GatewayTests(unittest.TestCase):
                           '_estimate_lock': threading.Lock(),
                           '_estimate_cache': {'ts': 0.0, 'data': None},
                           'CONFIG': {'hidden_models': []},
+                          'ESTIMATE_EXCLUDED': constant(ROOT / "router.py", "ESTIMATE_EXCLUDED"),
                           'active_upstreams': lambda: [{'name': 'trae'}],
                           'public_catalog': lambda: [
                               {'platform': 'trae', 'public': 'Flash',
@@ -2916,13 +2918,14 @@ const reply=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:null,known:0,total:1,models:[{model:'qwen4-max',rate_per_mtok:null,rate_source:'unknown',est_tokens:null,note:'余额待测，暂不估算',samples:0}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/待测/);
  assert.match(el('overview-estimate').innerHTML,/已知 0\/1/);
- assert.doesNotMatch(el('overview-estimate').innerHTML,/0 分/);
+ // 余额为 null 时不能渲染成「0 分」（卡片版把数值与单位分成两个 span）
+ assert.doesNotMatch(el('overview-estimate').innerHTML,/<span class="est-bal">0<\/span>/);
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:0,known:1,total:1,models:[{model:'qwen4-max',rate_per_mtok:51.02,rate_source:'anchored',est_tokens:0,note:'短样本相对价 × 钱包实测均价锚定',samples:3,sample_tokens:1000000,sample_hours:24}]}]}};renderEstimate()");
- assert.match(el('overview-estimate').innerHTML,/0 分/);
- assert.match(el('overview-estimate').innerHTML,/51\.02 分\/Mtok/);
+ assert.match(el('overview-estimate').innerHTML,/<span class="est-bal">0<\/span>/);
+ assert.match(el('overview-estimate').innerHTML,/51\.02/);
+ assert.match(el('overview-estimate').innerHTML,/Mtok/);
  run("EST_CACHE={ts:Date.now(),data:{platforms:[{name:'qwenwork',balance:100,known:1,total:1,models:[{model:'qwen4-max',rate_per_mtok:51.02,rate_source:'anchored',est_tokens:1960015,note:'短样本相对价 × 钱包实测均价锚定',samples:3,sample_tokens:1000000,sample_hours:24}]}]}};renderEstimate()");
  assert.match(el('overview-estimate').innerHTML,/1\.96M/);
- assert.match(el('overview-estimate').innerHTML,/锚定/);
  assert.doesNotMatch(el('overview-estimate').innerHTML,/全未命中下限|乐观/);
  // Manual refresh must force the estimate; the 30s auto refresh must keep the 5-minute cache.
  let estimateCalls=[];

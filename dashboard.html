@@ -145,6 +145,32 @@ td.num,th.num{text-align:right}
 .bar>i.low{background:var(--orange)}
 .name-cell{font-weight:600}
 .sub-cell{font-size:11px;color:var(--dim2)}
+/* ── 额度预估：卡片列表（不用表格，避免 13 行溢出 max-height 出现内嵌滚动条）── */
+.est-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.est-card{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--panel2)}
+.est-card-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+  padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--line)}
+.est-plat{font-size:13.5px;font-weight:700;color:var(--fg)}
+.est-bal{font-size:19px;font-weight:800;letter-spacing:-.3px;font-variant-numeric:tabular-nums}
+.est-bal.dim{color:var(--dim2);font-size:15px;font-weight:600}
+.est-unit{font-size:11px;color:var(--dim2);font-weight:500}
+.est-meta{font-size:11px;color:var(--dim2)}
+.est-err{font-size:11.5px;color:var(--orange);margin-bottom:8px}
+.est-model{padding:8px 0;border-bottom:1px dashed var(--line)}
+.est-model:last-of-type{border-bottom:none}
+.est-model-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.est-model-name{font-size:12.5px;font-weight:600;overflow-wrap:anywhere}
+.est-rate{font-size:12px;color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.est-model-foot{display:flex;gap:10px;flex-wrap:wrap;margin-top:3px}
+.est-tokens{font-size:12px;font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums}
+.est-empty{font-size:12px;color:var(--dim2);padding:6px 0}
+.est-folded{margin-top:8px}
+.est-folded>summary{font-size:11.5px;color:var(--dim);cursor:pointer;
+  padding:5px 8px;border-radius:8px;background:var(--panel);border:1px solid var(--line)}
+.est-folded>summary:hover{color:var(--fg)}
+.est-folded-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding:0 2px}
+.est-folded-list>span{font-size:11px;color:var(--dim2);background:var(--panel);
+  border:1px solid var(--line);border-radius:6px;padding:3px 7px}
 /* 账号序号列：窄、等宽、弱化，只为「数得清」服务，不抢账号名的注意力 */
 th.seq-cell,td.seq-cell{width:1%;white-space:nowrap;text-align:right;padding-right:2px;
   font-variant-numeric:tabular-nums;color:var(--dim2);font-size:12px;font-weight:500}
@@ -331,11 +357,7 @@ a,.nav.active,.pill.indigo{color:var(--accent-text)}
         <summary>查看计算口径</summary>
         <p>WorkBuddy、Qoder、小浣熊按同模型实扣积分除以 token 数估算，小浣熊使用唯一关联的账单。千问办公以钱包实测均价校准模型样本，Trae 以累计实扣增量除以同期 token 数，再按官方倍率分配到各模型。平台积分单位各异。</p>
       </details>
-      <div class="tblwrap" tabindex="0" role="region" aria-label="额度预估表">
-        <table><caption class="sr-only">额度可用量预估</caption><thead><tr>
-          <th scope="col">平台</th><th scope="col" class="num">余额</th><th scope="col">模型</th><th scope="col">实测单价</th><th scope="col" class="num">预计 token 数量</th>
-        </tr></thead><tbody id="overview-estimate"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody></table>
-      </div>
+      <div id="overview-estimate" class="est-list"><div class="empty">加载中…</div></div>
       <div class="sub" id="overview-estimate-note" style="margin-top:8px"></div>
     </section>
     <section class="card" id="overview-recent" aria-labelledby="overview-recent-title">
@@ -2589,35 +2611,59 @@ function renderEstimate(){
   if(!tb) return;
   const d=EST_CACHE.data;
   if(!d||!Array.isArray(d.platforms)){
-    tb.innerHTML='<tr><td colspan="5" class="empty">预估加载中…</td></tr>';
+    tb.innerHTML='<div class="empty">预估加载中…</div>';
     return;
   }
+  // 卡片列表而不是表格：每平台一张卡，无内嵌滚动条（表格版 13 行必然溢出
+  // max-height，逼出双层滚动）。样本不足的模型折叠成一行计数，避免「待测」
+  // 占满屏幕——它们是同一件事的重复。
   let html='';
   for(const p of d.platforms){
     const errors=[p.error, p.usage_error?`用量读取失败：${p.usage_error}`:''].filter(Boolean);
-    const label=`<span class="pill indigo">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>`
-      +errors.map(error=>`<div class="sub-cell">${esc(error)}</div>`).join('');
     const known=p.known??p.enabled??0, total=p.total??p.enabled??0;
-    const coverage=`<div class="sub-cell">已知 ${known}/${total} 个启用账号</div>`;
     const bal=p.balance!=null
-      ? `${fmt(p.balance)} ${esc(p.balance_unit||'分')}${coverage}`
-      : `待测${coverage}`;
+      ? `<span class="est-bal">${fmt(p.balance)}</span> <span class="est-unit">${esc(p.balance_unit||'分')}</span>`
+      : '<span class="est-bal dim">待测</span>';
     const models=(p.models||[]);
-    if(!models.length){
-      html+=`<tr><td>${label}</td><td class="num">${bal}</td><td class="sub-cell">暂无模型</td><td>—</td><td class="num">—</td></tr>`;
-      continue;
-    }
-    models.forEach((m,i)=>{
+    // 只把有实测单价的模型铺开；其余折叠。
+    const priced=models.filter(m=>m.rate_per_mtok!=null);
+    const unpriced=models.filter(m=>m.rate_per_mtok==null);
+    const modelRows=priced.map(m=>{
       const scope=m.balance_scope
-        ?`<div class="sub-cell">${esc(m.balance_scope)}${m.model_balance!=null?` · 可用 ${fmt(m.model_balance)} ${esc(p.balance_unit||'分')}`:' · 余额待测'}</div>`:'';
-      const rate=m.rate_per_mtok!=null?`${Number(m.rate_per_mtok).toFixed(2)} ${esc(p.balance_unit||'分')}/Mtok`:'待测';
-      const detail=`<div class="sub-cell">${esc(m.note||'样本估算')}${m.samples?` · ${m.samples} 条样本`:''}${m.sample_tokens?` · ${fmtTok(m.sample_tokens)} tok`:''}${m.sample_hours!=null?` · 覆盖 ${m.sample_hours}h`:''}</div>`;
-      html+=`<tr>${i===0
-        ? `<td rowspan="${models.length}" style="vertical-align:top">${label}</td><td rowspan="${models.length}" class="num" style="vertical-align:top">${bal}</td>`
-        : ''}<td class="mono">${esc(m.model)}${scope}</td><td>${rate}${detail}</td><td class="num" style="font-weight:700">${m.est_tokens!=null?fmtTok(m.est_tokens):'待测'}</td></tr>`;
-    });
+        ?`<span class="est-meta">${esc(m.balance_scope)}${m.model_balance!=null?` · 可用 ${fmt(m.model_balance)}`:' · 余额待测'}</span>`:'';
+      const detail=[m.samples?`${m.samples} 条样本`:null,
+                    m.sample_tokens?`${fmtTok(m.sample_tokens)} tok`:null,
+                    m.sample_hours!=null?`覆盖 ${m.sample_hours}h`:null]
+                   .filter(Boolean).join(' · ');
+      return `<div class="est-model">
+        <div class="est-model-head">
+          <span class="mono est-model-name">${esc(m.model)}</span>
+          <span class="est-rate">${Number(m.rate_per_mtok).toFixed(2)} <span class="est-unit">${esc(p.balance_unit||'分')}/Mtok</span></span>
+        </div>
+        <div class="est-model-foot">
+          <span class="est-tokens">≈ ${m.est_tokens!=null?fmtTok(m.est_tokens):'—'} tokens</span>
+          ${detail?`<span class="est-meta">${esc(detail)}</span>`:''}
+          ${scope}
+        </div>
+      </div>`;
+    }).join('');
+    const folded=unpriced.length
+      ? `<details class="est-folded"><summary>另有 ${unpriced.length} 个模型样本不足，暂不预估</summary>
+           <div class="est-folded-list">${unpriced.map(m=>`<span class="mono">${esc(m.model)}</span>`).join('')}</div>
+         </details>`
+      : '';
+    const body=modelRows||'<div class="est-empty">暂无可预估的模型（样本不足）</div>';
+    html+=`<div class="est-card">
+      <div class="est-card-head">
+        <span class="est-plat">${esc(PLATFORM_LABEL[p.name]||p.name)}</span>
+        ${bal}
+        <span class="est-meta">已知 ${known}/${total} 个启用账号</span>
+      </div>
+      ${errors.map(e=>`<div class="est-err">${esc(e)}</div>`).join('')}
+      ${body}${folded}
+    </div>`;
   }
-  tb.innerHTML=html||'<tr><td colspan="5" class="empty">暂无数据</td></tr>';
+  tb.innerHTML=html||'<div class="empty">暂无数据</div>';
   const noteEl=document.getElementById('overview-estimate-note');
   if(noteEl){
     const stamp=d.generated_at
