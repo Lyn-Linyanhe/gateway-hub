@@ -2781,8 +2781,16 @@ def normalize_codearts(a):
     size = (snap["size"] if snap and snap.get("size") else None)
     sub = "码道 · token " + str(a.get("token_remaining") or "?")
     if snap:
-        sub += " · 余额同步于 " + time.strftime(
-            "%m-%d %H:%M", time.localtime(snap["synced_at"])) if snap.get("synced_at") else ""
+        bits = []
+        if snap.get("synced_at"):
+            bits.append("余额同步于 " + time.strftime("%m-%d %H:%M",
+                                                     time.localtime(snap["synced_at"])))
+        if snap.get("end_date"):
+            bits.append("到期 " + snap["end_date"])
+        if snap.get("stale"):
+            bits.append("数据陈旧，请重新同步")
+        if bits:
+            sub += " · " + " · ".join(bits)
     return {
         "uid": uid,
         "name": a.get("nickname") or a.get("user_name") or (uid[:8] if uid else "?"),
@@ -3099,7 +3107,7 @@ def platform_status(up):
                       "qoder": "credits.expires_at",
                       "raccoon": "points audit",
                       "trae": "entitlement packs",
-                      "codearts": "engine 不提供积分余额/到期",
+                      "codearts": "browser credits snapshot（浏览器同步）",
                       "qwenwork": "qwenwork_reset_at configuration"}
     out = {"name": name, "base_url": up["base_url"], "health": False, "accounts": [],
            "inflight": _inflight.get(name, 0), "error": "",
@@ -3393,6 +3401,21 @@ def platform_status(up):
                         (a.get("account") or {}).get("username") or a.get("uid"),
                         pack.get("display_desc") or _trae_pack_name(base) or "权益包",
                         remain, ts))
+        elif name == "codearts":
+            # 积分到期来自浏览器快照：end_date 是整体到期日，expiring 是临期额度。
+            # 只有 expiring > 0 才进「积分到期」表——把「临期 0」渲染成一行是噪音。
+            snap = _codearts_credits_snapshot()
+            if snap and snap.get("expiring"):
+                try:
+                    end_ts = time.mktime(time.strptime(str(snap.get("end_date")),
+                                                       "%Y-%m-%d"))
+                except (TypeError, ValueError):
+                    end_ts = None
+                if end_ts:
+                    acct = next((a.get("nickname") or a.get("name") for a in items
+                                 if isinstance(a, dict)), "codearts")
+                    expiring.append(_expiry_row(
+                        acct, "码道积分（即将到期）", snap["expiring"], end_ts))
         elif name == "qwenwork":
             # 千问办公企业配额按月重置（客户端显示「配额下次重置时间」），
             # 上游 resources 不透出 valid_to，日期由 config qwenwork_reset_at 提供
@@ -3422,6 +3445,9 @@ def platform_status(up):
         if name != "raccoon":
             if name == "qwenwork" and not str(CONFIG.get("qwenwork_reset_at") or "").strip():
                 out["expiry_state"] = "unsupported"
+            elif name == "codearts":
+                # 有浏览器快照就知道到期日（end_date），即使当前没有临期额度。
+                out["expiry_state"] = "known" if _codearts_credits_snapshot() else "unknown"
             else:
                 out["expiry_state"] = "known" if expiring else "unknown"
     except Exception as exc:
@@ -3551,6 +3577,132 @@ def _oversized_function_names(payload, limit=CODECARTS_FUNCTION_NAME_LIMIT):
             seen.add(name)
             unique.append(name)
     return unique
+
+
+CODEARTS_USAGE_FILE = os.path.join(HERE, "codearts_usage.jsonl")
+_codearts_usage_lock = threading.Lock()
+#: 本地保留的最近条数；超出后按行裁剪（引擎的 /admin/api/recent 只有 100 条且重启即清）。
+CODEARTS_USAGE_KEEP = 5000
+
+
+def _codearts_usage_from_payload(obj):
+    """从聊天响应 JSON 里取 usage；没有/为 0 返回 None（不能拿 0 冒充未知）。"""
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    if not isinstance(usage, dict):
+        return None
+
+    def num(key):
+        return _known_num(usage.get(key)) or 0
+
+    total = num("total_tokens") or (num("prompt_tokens") + num("completion_tokens"))
+    if total <= 0:
+        return None
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else 0
+    return {"prompt_tokens": int(num("prompt_tokens")),
+            "completion_tokens": int(num("completion_tokens")),
+            "total_tokens": int(total),
+            "cached_tokens": int(_known_num(cached) or 0)}
+
+
+def _record_codearts_usage(model, usage, stream, elapsed_ms=None):
+    """把一次 codearts 请求的 token 用量追加到本地账本。
+
+    引擎的 /admin/api/recent 只给 body_bytes、不给 token 计数，而上游响应本身
+    带 usage（已实测）。网关在转发时顺手把 usage 抄一份，用量页才有 token。
+    """
+    if not usage:
+        return
+    row = {"at": time.time(), "model": str(model or ""), "stream": bool(stream),
+           "prompt_tokens": usage.get("prompt_tokens", 0),
+           "completion_tokens": usage.get("completion_tokens", 0),
+           "total_tokens": usage.get("total_tokens", 0),
+           "cached_tokens": usage.get("cached_tokens", 0)}
+    if elapsed_ms is not None:
+        row["elapsed_ms"] = int(elapsed_ms)
+    line = json.dumps(row, ensure_ascii=False)
+    with _codearts_usage_lock:
+        try:
+            with open(CODEARTS_USAGE_FILE, "a", encoding="utf-8") as handle:
+                handle.write(line + chr(10))
+            try:
+                if os.path.getsize(CODEARTS_USAGE_FILE) > 2 * 1024 * 1024:
+                    with open(CODEARTS_USAGE_FILE, encoding="utf-8") as handle:
+                        lines = handle.readlines()[-CODEARTS_USAGE_KEEP:]
+                    with open(CODEARTS_USAGE_FILE + ".tmp", "w", encoding="utf-8") as handle:
+                        handle.writelines(lines)
+                    os.replace(CODEARTS_USAGE_FILE + ".tmp", CODEARTS_USAGE_FILE)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+
+def _read_codearts_usage(limit=1000):
+    """读本地账本（最新的在后）。坏行跳过，不让一处损坏毁掉整页。"""
+    try:
+        with open(CODEARTS_USAGE_FILE, encoding="utf-8") as handle:
+            lines = handle.readlines()[-max(1, int(limit)):]
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and _known_num(row.get("at")) is not None:
+            rows.append(row)
+    return rows
+
+
+def _merge_codearts_usage(rows, recorded, window=20.0):
+    """把网关账本里的 token 合并进引擎事件行。
+
+    引擎事件提供状态/耗时/错误分类，网关账本提供 token。按「同模型且时间差
+    ≤ window 秒」一对一配对；引擎重启后事件清空，但账本还在，未配对的记录
+    补成独立行（outcome=ok），这样用量页不会因为引擎重启丢掉历史。
+    """
+    used = set()
+    for row in rows:
+        at = _known_num(row.get("at")) or 0
+        model = str(row.get("model") or "")
+        best = None
+        best_delta = None
+        for idx, rec in enumerate(recorded):
+            if idx in used:
+                continue
+            if str(rec.get("model") or "") != model:
+                continue
+            delta = abs((_known_num(rec.get("at")) or 0) - at)
+            if delta <= window and (best_delta is None or delta < best_delta):
+                best, best_delta = idx, delta
+        if best is None:
+            continue
+        used.add(best)
+        rec = recorded[best]
+        row["prompt_tokens"] = int(_known_num(rec.get("prompt_tokens")) or 0)
+        row["completion_tokens"] = int(_known_num(rec.get("completion_tokens")) or 0)
+        row["total_tokens"] = int(_known_num(rec.get("total_tokens")) or 0)
+        row["cached_tokens"] = int(_known_num(rec.get("cached_tokens")) or 0)
+    for idx, rec in enumerate(recorded):
+        if idx in used:
+            continue
+        rows.append({
+            "at": _known_num(rec.get("at")) or 0,
+            "model": str(rec.get("model") or ""),
+            "account": "",
+            "stream": rec.get("stream"),
+            "prompt_tokens": int(_known_num(rec.get("prompt_tokens")) or 0),
+            "completion_tokens": int(_known_num(rec.get("completion_tokens")) or 0),
+            "total_tokens": int(_known_num(rec.get("total_tokens")) or 0),
+            "cached_tokens": int(_known_num(rec.get("cached_tokens")) or 0),
+            "elapsed_ms": rec.get("elapsed_ms"),
+            "ttft_ms": None,
+            "outcome": "ok",
+        })
+    rows.sort(key=lambda row: row.get("at") or 0, reverse=True)
+    return rows
 
 
 def _codearts_usage_rows(events):
@@ -4922,6 +5074,13 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.dumps(req, ensure_ascii=False).encode("utf-8")
         t_payload = time.time()
         stream = bool(req.get("stream"))
+        if stream and up["name"] == "codearts":
+            # 上游默认不在 SSE 里带 usage；显式要求后会在 [DONE] 前补一个
+            # 仅含 usage 的帧。网关记账后会把该帧从客户端流里滤掉。
+            options = req.get("stream_options")
+            options = dict(options) if isinstance(options, dict) else {}
+            options["include_usage"] = True
+            req["stream_options"] = options
         log(f"{path} model={model} -> {up['name']}/{upstream_model} stream={stream}")
 
         client_h = dict(self.headers.items())
@@ -5010,14 +5169,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._relay_stream(status, resp_headers, result, client_facing, up,
                                           t0=t0, t_head=time.time(), label=model,
                                           t_parse=t_parse, t_payload=t_payload,
-                                          t_route=t_route)
+                                          t_route=t_route,
+                                          usage_model=(upstream_model
+                                                       if up["name"] == "codearts" else None))
+            if up["name"] == "codearts" and status < 400:
+                try:
+                    obj = json.loads(result.decode("utf-8"))
+                    usage = _codearts_usage_from_payload(obj)
+                    if usage:
+                        _record_codearts_usage(upstream_model, usage, False,
+                                               (time.time() - t0) * 1000)
+                except (ValueError, UnicodeDecodeError):
+                    pass
             return self._relay_json(status, resp_headers, result, client_facing)
 
     # ---- 转发实现 ----
 
     def _relay_stream(self, status, headers, chunks, client_facing, up,
                       t0=None, t_head=None, label="", t_parse=None, t_payload=None,
-                      t_route=None):
+                      t_route=None, usage_model=None):
         self.send_response(status)
         ctype = headers.get("Content-Type", "text/event-stream")
         self.send_header("Content-Type", ctype)
@@ -5029,10 +5199,39 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.end_headers()
         first_data_at = None
+        usage_found = None
+        tail = b""
         try:
             for chunk in _rewrite_sse_chunks(chunks, client_facing):
                 if first_data_at is None and b"data:" in chunk:
                     first_data_at = time.time()
+                if usage_model:
+                    # 逐块扫 SSE：usage 常在最后一个 data 帧（[DONE] 之前）。
+                    # 只解析完整行，跨块的不完整行留给下一块。
+                    data = tail + chunk
+                    lines = data.split(bytes([10]))
+                    tail = lines.pop()
+                    drop_chunk = False
+                    for line in lines:
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if not payload or payload == b"[DONE]":
+                            continue
+                        try:
+                            obj = json.loads(payload.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        found = _codearts_usage_from_payload(obj)
+                        if found:
+                            usage_found = found
+                            # 只有 usage、没有 choices 的帧是我们主动要的记账帧，
+                            # 客户端没请求过 include_usage，不能让它看到。
+                            if obj.get("choices") == []:
+                                drop_chunk = True
+                    if drop_chunk:
+                        continue
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (ConnectionError, TimeoutError, HTTPException) as exc:
@@ -5041,6 +5240,9 @@ class Handler(BaseHTTPRequestHandler):
             close = getattr(chunks, "close", None)
             if close:
                 close()
+        if usage_model and usage_found:
+            _record_codearts_usage(usage_model, usage_found, True,
+                                   (time.time() - t0) * 1000 if t0 else None)
         log(f"stream 完成 -> {client_facing}")
         if t0:
             total_ms = int((time.time() - t0) * 1000)
@@ -6015,8 +6217,11 @@ class Handler(BaseHTTPRequestHandler):
                     data = engine_request(up, "GET", f"/admin/api/recent?limit={limit}",
                                           auth="bearer", timeout=30)
                     events = (data.get("items") if isinstance(data, dict) else data) or []
-                    realm_coverage["all"] = {"ok": True, "rows": len(events)}
                     items = _codearts_usage_rows(events)
+                    # 引擎只给 body_bytes，token 计数来自网关转发时抄下的账本；
+                    # 未配对的账本行补成独立行，引擎重启不会丢历史。
+                    items = _merge_codearts_usage(items, _read_codearts_usage(limit))
+                    realm_coverage["all"] = {"ok": True, "rows": len(items)}
                 else:
                     try:  # uid -> 昵称映射，让日志显示人名而不是一串 uuid；
                         # realm=all 才是全池（默认视图漏国际账号）

@@ -41,3 +41,6 @@ codearts_credits.json
 
 # ZCode 本地会话计划（每台机器各自生成，不入库）
 .zcode/
+
+# CodeArts token 用量账本（网关转发时记录，运行时数据）
+codearts_usage.jsonl

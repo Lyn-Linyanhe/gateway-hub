@@ -75,7 +75,8 @@ class GatewayTests(unittest.TestCase):
             "_read_wallet_history", "_estimate_public_model", "_qwen_sample",
             "_row_multiplier", "normalize_wb", "normalize_qoder", "_wb_account_realms",
             "_wb_pool_fetch", "_wb_dual_prefer", "normalize_raccoon", "_shanghai_today",
-            "_raccoon_checkin_result", "_iso_epoch", "_codearts_usage_rows", "normalize_trae",
+            "_raccoon_checkin_result", "_iso_epoch", "_codearts_usage_rows",
+            "_merge_codearts_usage", "_read_codearts_usage", "normalize_trae",
             "_disabled_platforms", "platform_enabled", "active_upstreams", "_upstream_by_name",
             "_launch_spec", "_raccoon_billing_rows", "_read_raccoon_billing_links",
             "_attach_raccoon_bills", "_record_raccoon_billing_link",
@@ -1229,6 +1230,62 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(row['credits_end_date'], '2026-12-27')
         self.assertFalse(row['credits_stale'])
         self.assertEqual(row['credits_expiring'], 0.0)
+        self.assertIn('到期 2026-12-27', row['sub'])       # 到期日要透到账号行
+        self.assertIn('余额同步于', row['sub'])
+
+    def test_codearts_normalize_flags_stale_snapshot(self):
+        """快照超过 24h：账号行必须提示「数据陈旧」，不能把旧余额当实时值。"""
+        now = time.time()
+        snap = {"remain": 100.0, "size": 200.0, "used": 100.0, "expiring": 0.0,
+                "end_date": "2026-12-27", "synced_at": now - 30 * 3600,
+                "stale": True, "basic": {}, "bonus": {}}
+        scope = isolated(ROOT / 'router.py',
+                         {'normalize_codearts', '_shanghai_today', '_iso_epoch'},
+                         {'datetime': datetime, 'time': time, 'os': __import__('os'),
+                          'json': json,
+                          '_codearts_credits_snapshot': lambda: snap})
+        row = scope['normalize_codearts']({"uid": "u1", "nickname": "acct",
+                                           "credits": 0, "token_remaining": "1h"})
+        self.assertIn('数据陈旧', row['sub'])
+        self.assertTrue(row['credits_stale'])
+
+    def test_codearts_usage_extract_and_merge(self):
+        """codearts 响应里的 usage → 账本行；再按时间/模型合并回引擎事件。"""
+        scope = isolated(ROOT / 'router.py',
+                         {'_codearts_usage_from_payload', '_merge_codearts_usage'},
+                         {'_known_num': lambda v: (float(v) if isinstance(v, (int, float))
+                                                   and not isinstance(v, bool) else None)})
+        extract = scope['_codearts_usage_from_payload']
+        # 正常 usage
+        got = extract({"usage": {"prompt_tokens": 32, "completion_tokens": 38,
+                                 "total_tokens": 70,
+                                 "prompt_tokens_details": {"cached_tokens": 8}}})
+        self.assertEqual(got, {"prompt_tokens": 32, "completion_tokens": 38,
+                               "total_tokens": 70, "cached_tokens": 8})
+        # 缺 total 时用 prompt+completion 兜底
+        got = extract({"usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+        self.assertEqual(got["total_tokens"], 15)
+        # 没有 usage / 全 0 → None（不能拿 0 冒充已知）
+        self.assertIsNone(extract({}))
+        self.assertIsNone(extract({"usage": {"prompt_tokens": 0, "completion_tokens": 0}}))
+
+        merge = scope['_merge_codearts_usage']
+        base = 1000.0
+        rows = [{"at": base, "model": "m1", "total_tokens": 0, "outcome": "ok"},
+                {"at": base + 60, "model": "m2", "total_tokens": 0, "outcome": "ok"}]
+        recorded = [
+            {"at": base + 2, "model": "m1", "prompt_tokens": 10, "completion_tokens": 5,
+             "total_tokens": 15, "cached_tokens": 0},
+            {"at": base + 500, "model": "m3", "prompt_tokens": 1, "completion_tokens": 2,
+             "total_tokens": 3, "cached_tokens": 0},   # 引擎事件里没有 → 补成独立行
+        ]
+        merged = merge([dict(r) for r in rows], recorded)
+        self.assertEqual(len(merged), 3)
+        by_model = {r["model"]: r for r in merged}
+        self.assertEqual(by_model["m1"]["total_tokens"], 15)   # 20s 窗口内按时间配对
+        self.assertEqual(by_model["m2"]["total_tokens"], 0)    # 没配到就保持未知
+        self.assertEqual(by_model["m3"]["total_tokens"], 3)
+        self.assertEqual(merged[0]["model"], "m3")             # 按时间倒序
 
     def test_codearts_credits_snapshot_marks_stale_and_rejects_garbage(self):
         """快照超过 24h 标 stale；文件缺失/损坏/无 remain 一律返回 None。"""
@@ -2704,6 +2761,8 @@ class GatewayTests(unittest.TestCase):
         self.ns.update(active_upstreams=lambda: [
                            {'name': 'codearts', 'base_url': 'http://127.0.0.1:7866'}],
                        engine_request=fake,
+                       # 测试不能读真实运行账本（本机会有生产流量），显式给空
+                       _read_codearts_usage=lambda limit=1000: [],
                        _num=lambda n: float(n or 0),
                        _known_num=lambda n: (float(n) if isinstance(n, (int, float))
                                              and not isinstance(n, bool) else None))
