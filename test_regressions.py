@@ -1141,6 +1141,104 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(out['accounts'][0]['remain'], 5)
         self.assertEqual(out['expiring'], [])       # 只是缺临期行
 
+    def test_codearts_normalize_keeps_balance_unknown(self):
+        """引擎不查余额：credits=0 是占位，归一后必须留 None 而不是 0。"""
+        scope = isolated(ROOT / 'router.py',
+                         {'normalize_codearts', '_shanghai_today', '_iso_epoch'},
+                         {'datetime': datetime})
+        norm, today = scope['normalize_codearts'], scope['_shanghai_today']()
+        row = norm({"uid": "8063", "name": "acct", "nickname": "用户abc",
+                    "disabled": False, "cooling": False, "cool_until": "",
+                    "cool_kind": "", "credits": 0, "token_remaining": "23h0m0s",
+                    "checkin": {"ok": True, "checked_at": today + "T09:00:00+08:00"},
+                    "active_concurrent": 1, "max_concurrent": 3})
+        self.assertIsNone(row['remain'])          # 不能显示成「已用完」
+        self.assertIsNone(row['size'])
+        self.assertTrue(row['enabled'])
+        self.assertTrue(row['checked_in'])
+        self.assertEqual(row['inflight'], 1)
+        self.assertEqual(row['concurrency_limit'], 3)
+        self.assertIn("23h0m0s", row['sub'])
+        # 冷却中的账号要把 RFC3339 冷却截止转成 epoch 秒
+        cooled = norm({"uid": "u2", "nickname": "n2", "disabled": False,
+                       "cooling": True, "cool_until": "2026-11-27T00:00:00+08:00",
+                       "cool_kind": "soft", "token_remaining": "1h"})
+        self.assertGreater(cooled['cooldown_until'], 0)
+        self.assertEqual(cooled['cooldown_kind'], 'soft')
+        # 禁用账号即使有 checkin 记录也不参与调度
+        self.assertFalse(norm({"uid": "u3", "disabled": True})['enabled'])
+
+    def test_codearts_status_uses_healthz_and_admin_overview(self):
+        import urllib.request
+        seen = {}
+
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'ok'   # codearts2api /healthz 是纯文本
+
+        def fake_urlopen(req, timeout):
+            seen['health_url'] = req.full_url
+            return Resp()
+
+        def fake_engine(up, method, path, body=None, auth=None, timeout=None):
+            seen['engine'] = (method, path, auth)
+            return {"accounts": [{"uid": "u1", "name": "acct", "nickname": "acct",
+                                  "disabled": False, "cooling": False,
+                                  "token_remaining": "5h0m0s", "credits": 0}]}
+
+        scope = isolated(ROOT / 'router.py',
+                         {'platform_status', 'normalize_codearts', '_shanghai_today',
+                          '_known_num', '_num', '_epoch_seconds', '_expiry_row',
+                          '_iso_epoch', '_trae_pack_name'},
+                         {'urllib': __import__('urllib.request'),
+                          'datetime': datetime,
+                          'CONFIG': {'upstreams': [{'name': 'codearts',
+                                                    'base_url': 'http://127.0.0.1:7866'}]},
+                          '_inflight': {}, 'NORMALIZERS': {},
+                          'normalize_buddy': lambda a: a,
+                          '_urlopen': fake_urlopen,
+                          'engine_request': fake_engine})
+        scope['NORMALIZERS']['codearts'] = scope['normalize_codearts']
+        out = scope['platform_status']({'name': 'codearts',
+                                        'base_url': 'http://127.0.0.1:7866'})
+        self.assertTrue(out['health'])
+        self.assertTrue(seen['health_url'].endswith('/healthz'))   # 不是 /health
+        self.assertEqual(seen['engine'], ('GET', '/admin/api/overview', 'bearer'))
+        self.assertEqual(len(out['accounts']), 1)
+        self.assertIsNone(out['accounts'][0]['remain'])
+        self.assertEqual(out['expiring'], [])
+
+    def test_codearts_upstream_health_probes_healthz(self):
+        import urllib.request
+        seen = {}
+
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'ok'
+
+        def fake_urlopen(req, timeout):
+            seen['url'] = req.full_url
+            return Resp()
+
+        scope = isolated(ROOT / 'router.py', {'_upstream_health'},
+                         {'urllib': __import__('urllib.request'),
+                          '_urlopen': fake_urlopen})
+        self.assertTrue(scope['_upstream_health'](
+            {'name': 'codearts', 'base_url': 'http://127.0.0.1:7866'}))
+        self.assertTrue(seen['url'].endswith('/healthz'))
+
+    def test_codearts_checkin_and_automation_specs_registered(self):
+        paths = constant(ROOT / 'router.py', 'CHECKIN_PATHS')
+        self.assertEqual(paths.get('codearts'), ('/admin/api/checkin', 'bearer'))
+        specs = constant(ROOT / 'router.py', '_AUTOMATION_STEP_SPECS')
+        ids = [s[0] for s in specs]
+        self.assertIn('codearts.checkin', ids)
+        step = next(s for s in specs if s[0] == 'codearts.checkin')
+        self.assertEqual(step[2], 'checkin')
+        self.assertEqual(step[3], 'codearts')
+
     def test_trae_expiring_lists_packs_with_remaining_credits(self):
         import urllib.request
         class Resp:

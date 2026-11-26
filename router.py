@@ -1033,7 +1033,12 @@ def _upstream_health(up, timeout=3):
         health_path = "/healthz" if up.get("name") in ("raccoon", "codearts") else "/health"
         req = urllib.request.Request(up["base_url"].rstrip("/") + health_path)
         with _urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8", "replace").strip()
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            # codearts2api 的 /healthz 是纯文本 "ok"，不是 JSON。
+            return raw.lower() == "ok"
         if not isinstance(body, dict):
             return True
         if "ok" in body:
@@ -2734,9 +2739,17 @@ def platform_status(up):
         health_path = "/healthz" if name in ("raccoon", "codearts") else "/health"
         req = urllib.request.Request(up["base_url"].rstrip("/") + health_path)
         with _urlopen(req, timeout=5) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        # 各引擎 health 形状不同：hub 系 {"ok": true}，Buddy2api {"status": "ok"}。
-        if "ok" in body:
+            raw = resp.read().decode("utf-8", "replace").strip()
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            # codearts2api 的 /healthz 是纯文本 "ok"，不是 JSON。
+            body = raw
+        # 各引擎 health 形状不同：hub 系 {"ok": true}，Buddy2api {"status": "ok"}，
+        # codearts2api 纯文本 "ok"。
+        if isinstance(body, str):
+            out["health"] = body.lower() == "ok"
+        elif "ok" in body:
             out["health"] = bool(body.get("ok"))
         elif "status" in body:
             out["health"] = body.get("status") == "ok"
