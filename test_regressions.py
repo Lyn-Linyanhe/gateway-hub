@@ -1037,8 +1037,11 @@ class GatewayTests(unittest.TestCase):
 
         def fake(up, method, path, body=None, auth=None, timeout=None):
             if path.endswith("/panel/api/points"):
+                # remain 是总余额（含不会过期的奖励分），expire_points 才是
+                # 最早那批每日积分的额度。临期行必须用后者。
                 return {"accounts": [{"uid": "u1", "audit": {
-                    "remain": 9421, "expire": expire, "days_left": 374.7}}]}
+                    "remain": 9421, "expire": expire, "expire_points": 300,
+                    "days_left": 374.7}}]}
             return {"accounts": [{"uid": "u1", "nickname": "nick", "credits": 9421,
                                   "realm": "cn", "expires_at": 1797606605000}]}
 
@@ -1063,9 +1066,46 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(out['expiring']), 1)
         row = out['expiring'][0]
         self.assertEqual(row['account'], 'nick')
-        self.assertEqual(row['remain'], 9421.0)
+        self.assertEqual(row['remain'], 300.0)    # 最早到期批次，不是总余额 9421
         self.assertEqual(row['days_left'], 6.4)   # 积分到期，不是 374 天
         self.assertEqual(row['burn_days'], 374.7)
+        self.assertIn('每日积分', row['name'])
+
+    def test_raccoon_expiring_skips_when_engine_lacks_expire_points(self):
+        """老引擎的 audit 没有 expire_points：宁可不显示临期行，也不拿总余额冒充。"""
+        import urllib.request
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b'{"status":"ok"}'
+        expire = int(time.time() + 2.4 * 86400)
+
+        def fake(up, method, path, body=None, auth=None, timeout=None):
+            if path.endswith("/panel/api/points"):
+                return {"accounts": [{"uid": "u1", "audit": {
+                    "remain": 5972, "expire": expire, "days_left": 140.8}}]}
+            return {"accounts": [{"uid": "u1", "nickname": "nick", "credits": 5972}]}
+
+        scope = isolated(ROOT / 'router.py',
+                         {'platform_status', 'normalize_raccoon', '_shanghai_today',
+                          '_known_num', '_epoch_seconds', '_expiry_row',
+                          '_raccoon_points_audit'},
+                         {'urllib': __import__('urllib.request'),
+                          'CONFIG': {'upstreams': [{'name': 'raccoon',
+                                                    'base_url': 'http://127.0.0.1:7867'}]},
+                          '_inflight': {}, 'NORMALIZERS': {},
+                          'normalize_buddy': lambda a: a,
+                          '_urlopen': lambda req, timeout: Resp(),
+                          '_raccoon_points_lock': threading.Lock(),
+                          '_raccoon_points_cache': {'ts': 0.0, 'by_uid': {}, 'fail_ts': 0.0},
+                          'RACCOON_POINTS_TTL': 300.0,
+                          'RACCOON_POINTS_FAIL_TTL': 60.0,
+                          'engine_request': fake})
+        scope['NORMALIZERS']['raccoon'] = scope['normalize_raccoon']
+        out = scope['platform_status']({'name': 'raccoon',
+                                        'base_url': 'http://127.0.0.1:7867'})
+        self.assertEqual(out['expiring'], [])      # 不显示，而不是显示 5972
+        self.assertEqual(out['accounts'][0]['remain'], 5972)  # 余额照常展示
 
     def test_raccoon_expiring_survives_points_endpoint_failure(self):
         import urllib.request

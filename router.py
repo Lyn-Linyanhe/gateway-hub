@@ -2881,6 +2881,12 @@ def platform_status(up):
         elif name == "raccoon":
             # audit.expire 是积分有效期（秒）；audit.days_left 是「按当前燃烧
             # 速度还能用几天」，两者语义不同，分开给前端。
+            #
+            # 金额必须用 audit.expire_points（最早那批每日积分的额度），不能
+            # 用 audit.remain：remain 是账号总余额，混着不会过期的奖励/充值
+            # 积分。拿 remain 配 expire 展示会报出「5972 分 2 天后全没」的假
+            # 警报——实际只有最早一批（通常 300 分）会作废。老引擎不返回该
+            # 字段，此时跳过临期行（宁可不显示，也不报错的数）。
             for a in items:
                 if not isinstance(a, dict):
                     continue
@@ -2888,11 +2894,11 @@ def platform_status(up):
                 ts = _epoch_seconds(audit.get("expire"))
                 if not ts:
                     continue
-                remain = _known_num(audit.get("remain"))
+                remain = _known_num(audit.get("expire_points"))
                 if remain is None or remain <= 0:
                     continue
                 expiring.append(_expiry_row(
-                    a.get("nickname") or a.get("uid"), "积分（每日 + 奖励 + 充值）",
+                    a.get("nickname") or a.get("uid"), "每日积分（最早到期批次）",
                     remain, ts, audit.get("days_left")))
         elif name == "trae":
             # 每个权益包独立到期；is_hide 是上游标记为不展示的包，跳过。
