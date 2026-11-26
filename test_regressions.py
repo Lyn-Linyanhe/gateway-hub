@@ -56,12 +56,14 @@ class GatewayTests(unittest.TestCase):
             "_media_supports_tag", "_trae_consumption_rate", "_trae_spend_rate",
             "_trae_consumed_amount",
             "_media_link_signature", "_media_download_allowed",
-            "_media_multipart_reject"},
+            "_media_multipart_reject", "_oversized_function_names"},
             {"QWEN_WALLET_HISTORY": "", "RACCOON_WALLET_HISTORY": "",
              "TRAE_WALLET_HISTORY": "", "TRAE_SPEND_HISTORY": "",
              "RACCOON_BILLING_LINKS": "",
              "PLATFORM_BALANCE_UNIT": constant(ROOT / "router.py", "PLATFORM_BALANCE_UNIT"),
              "ESTIMATE_EXCLUDED": constant(ROOT / "router.py", "ESTIMATE_EXCLUDED"),
+             "CODECARTS_FUNCTION_NAME_LIMIT":
+                 constant(ROOT / "router.py", "CODECARTS_FUNCTION_NAME_LIMIT"),
              "_estimate_context": type("EstimateContext", (), {})(),
              "os": __import__('os'), "HERE": str(ROOT),
              "_config_lock": threading.RLock(),
@@ -2666,6 +2668,58 @@ class GatewayTests(unittest.TestCase):
         out = scope['_codearts_keepalive_once']()
         self.assertFalse(out['ok'])
         self.assertIn('OSError', out['error'])
+
+    def test_codearts_rejects_oversized_function_names(self):
+        """codearts 的 function name ≤64 字符限制要在网关侧拦下。
+
+        上游超限报 502（InferHub.001001017.413），引擎会把这次 502 当成账号
+        异常、冷却 10 分钟——客户端带着 70+ 字符的 MCP 工具名时，每发一次就
+        把唯一账号锁死一次，表现就是「codearts 用不了、反复冷却」。
+        """
+        from unittest.mock import Mock
+
+        limit = self.ns["CODECARTS_FUNCTION_NAME_LIMIT"]
+        self.assertEqual(limit, 64)
+        over = "mcp__plugin_android-emulator_android-emulator__android_build_and_run"
+        self.assertGreater(len(over), limit)
+
+        names = self.ns["_oversized_function_names"]
+        # 三种出现位置都要能抓到
+        self.assertEqual(names({"tools": [{"type": "function", "function": {"name": over}}]}), [over])
+        self.assertEqual(names({"tools": [{"name": over}]}), [over])          # 扁平形状
+        self.assertEqual(names({"messages": [{"role": "assistant",
+                                              "tool_calls": [{"function": {"name": over}}]}]}), [over])
+        self.assertEqual(names({"messages": [{"role": "assistant",
+                                              "function_call": {"name": over}}]}), [over])
+        # 恰好 64 通过；65 拒绝；重复只报一次
+        exact = "a" * limit
+        self.assertEqual(names({"tools": [{"function": {"name": exact}}]}), [])
+        dup = "a" * (limit + 1)
+        self.assertEqual(names({"tools": [{"function": {"name": dup}},
+                                          {"function": {"name": dup}}]}), [dup])
+        # 畸形载荷不炸
+        for bad in (None, {}, {"tools": "x", "messages": {}}, {"messages": [None, 1]}):
+            self.assertEqual(names(bad), [])
+
+        # do_POST 守卫：codearts + 超长名 → 400，且带上名字与限制值
+        handler = object.__new__(self.ns["Handler"])
+        handler.path = "/v1/chat/completions"
+        handler.headers = {}
+        handler.close_connection = False
+        handler._authorized = lambda: True
+        handler._read_post_object = lambda: {
+            "model": "codearts/deepseek-v4.1-flash-1017",
+            "tools": [{"type": "function", "function": {"name": over}}],
+            "messages": [{"role": "user", "content": "hi"}]}
+        handler._deny = Mock()
+        upstream = {"name": "codearts", "base_url": "http://127.0.0.1:7866"}
+        self.ns["resolve_model"] = lambda m: (upstream, m.split("/", 1)[-1], m, "")
+        handler.do_POST()
+        self.assertEqual(handler._deny.call_args.args[0], 400)
+        message = handler._deny.call_args.args[1]
+        self.assertIn("64", message)
+        self.assertIn(over, message)
+        self.assertIn("冷却", message)
 
     def test_automation_job_concurrent_reuse_and_retry_boundary(self):
         from concurrent.futures import ThreadPoolExecutor

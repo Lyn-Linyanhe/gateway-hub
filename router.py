@@ -3368,6 +3368,60 @@ def _iso_epoch(value):
         return 0.0
 
 
+#: CodeArts 上游对 function name 的硬限制（超限报 InferHub.001001017.413）。
+CODECARTS_FUNCTION_NAME_LIMIT = 64
+
+
+def _oversized_function_names(payload, limit=CODECARTS_FUNCTION_NAME_LIMIT):
+    """列出请求里超过 name 长度上限的 function / tool 名（去重保序）。
+
+    覆盖三处：`tools[].function.name`（也容忍 `tools[].name` 的扁平形状）、
+    `messages[].tool_calls[].function.name`、`messages[].function_call.name`。
+
+    为什么要在网关侧拦：CodeArts 对 function name 硬限 64 字符，超了直接回
+    502（InferHub.001001017.413），而引擎把这个 502 当成账号异常、冷却 10
+    分钟。MCP 工具名普遍是 `mcp__plugin_<server>__<tool>` 形状，70+ 字符很常见
+    ——不拦的话，客户端每发一次就把唯一账号锁死 10 分钟，看起来像「引擎用不了」。
+    """
+    if not isinstance(payload, dict):
+        return []
+    found = []
+
+    def note(name):
+        if isinstance(name, str) and len(name) > limit:
+            found.append(name)
+
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            note(fn.get("name"))
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            calls = msg.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                        note(call["function"].get("name"))
+            legacy = msg.get("function_call")
+            if isinstance(legacy, dict):
+                note(legacy.get("name"))
+
+    seen = set()
+    unique = []
+    for name in found:
+        if name not in seen:
+            seen.add(name)
+            unique.append(name)
+    return unique
+
+
 def _codearts_usage_rows(events):
     """codearts2api /admin/api/recent 条目 → 用量页行。
 
@@ -4704,6 +4758,22 @@ class Handler(BaseHTTPRequestHandler):
         up, upstream_model, client_facing, reason = resolve_model(model)
         if up is None:
             return self._deny(400, reason)
+
+        # codearts 上游对 function name 硬限 64 字符（InferHub.001001017.413），
+        # 超了直接 502，而引擎会把这次 502 当成账号异常、冷却 10 分钟——客户端
+        # 只要带着长名字的 MCP 工具（mcp__plugin_xxx__yyy 常见 70+ 字符），就再也
+        # 用不了 codearts，而且每次重试都会把账号重新打进冷却。转发前拦下，
+        # 由我们明确告诉调用方原因，不让上游与账号健康背这个锅。
+        if up["name"] == "codearts":
+            oversized = _oversized_function_names(req)
+            if oversized:
+                shown = "、".join("%s(%d)" % (n, len(n)) for n in oversized[:5])
+                more = "…" if len(oversized) > 5 else ""
+                return self._deny(400, (
+                    "codearts 上游限制 function name ≤ %d 字符，以下工具名超长：%s%s。"
+                    "请停用对应的 MCP 插件，或改用其他平台的模型；"
+                    "直接转发会被上游判为 502 并让账号冷却 10 分钟。"
+                ) % (CODECARTS_FUNCTION_NAME_LIMIT, shown, more))
 
         # 小浣熊账单不暴露模型或请求 ID：只对新 Chat Completions 生成随机标题标记，
         # 并在成功响应带回 X-Request-Id 后记录关联。Responses 路径的上游转换不保留
