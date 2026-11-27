@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-BASE = Path("E:/fascinating")
+BASE = Path(__file__).resolve().parent.parent
 
 #: 每个引擎的探测方式。kind 决定版本从哪里读：
 #:   const     —— 源码里的 VERSION 常量（regex 抓）
