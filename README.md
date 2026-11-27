@@ -94,8 +94,10 @@ Model:    平台/模型，例如 raccoon/sn-qwen4-max
 cloudflared tunnel login
 cloudflared tunnel create gateway-hub
 cloudflared tunnel route dns gateway-hub gw.example.com
-cloudflared tunnel run gateway-hub
+cloudflared tunnel --config %USERPROFILE%\.cloudflared\config.yml --protocol http2 --edge-ip-version 6 run gateway-hub
 ```
+
+> 如果运营商阻断了 IPv4 出站 7844（国内常见），必须加 `--edge-ip-version 6 --protocol http2` 走 IPv6；本机已实测 IPv4 7844 超时、IPv6 正常。登录自启可放一个 `.cmd` 到 `shell:startup`，先跑 `start-all.bat`、再跑上面的 cloudflared 命令。
 
 `%USERPROFILE%\.cloudflared\config.yml` 的最小配置：
 
