@@ -161,7 +161,9 @@ def _safe_archive_name(name):
         raise ValueError("release archive contains path traversal")
     if any(part.lower() in {"accounts", "auths", ".git"} for part in path.parts):
         raise ValueError("release archive contains runtime state")
-    if path.name.lower() in {"config.json", "router.log"} or path.name.lower().endswith(".jsonl"):
+    if path.name.lower() in {"config.json", "router.log", "api_keys.json",
+                             "api_key_usage.json"} \
+            or path.name.lower().endswith(".jsonl"):
         raise ValueError("release archive contains runtime state")
     return path
 

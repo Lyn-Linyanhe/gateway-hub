@@ -239,6 +239,8 @@ tbody>tr.realm-group:first-child>th{border-top:none}
 .modal h3{font-size:16px;margin-bottom:6px}
 .modal p{font-size:12px;color:var(--dim);margin-bottom:14px}
 .modal input{width:100%;min-height:34px;border:1px solid var(--line2);border-radius:10px;padding:0 12px;background:var(--panel);margin-bottom:12px}
+.modal textarea{width:100%;border:1px solid var(--line2);border-radius:10px;padding:8px 12px;background:var(--panel);margin-bottom:12px;resize:vertical;font:inherit;color:var(--fg)}
+.modal textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .modal input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .modal .err{color:var(--red);font-size:12px;margin-bottom:10px;display:none}
 :root{--dim2:#5e6676;--accent-text:#4f46bc;--focus:#5546cf;--status-red:#b4232d;--status-green:#13733a}
@@ -325,6 +327,7 @@ a,.nav.active,.pill.indigo{color:var(--accent-text)}
   <button class="nav" data-view="media"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 15l-5-5L5 20"/></svg>媒体</button>
   <div class="navlabel">统计</div>
   <button class="nav" data-view="usage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 20h18M6 16v-5M11 16V8M16 16v-8M21 16v-3"/></svg>用量</button>
+  <button class="nav" data-view="keys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l3 3M14 9l2 2"/></svg>API Keys</button>
   <div class="navlabel">运维</div>
   <button class="nav" data-view="auto"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>自动化</button>
   <button class="nav" data-view="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.2a1.7 1.7 0 00-1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.2a1.7 1.7 0 001.5-1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3h.1a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.2a1.7 1.7 0 001 1.5h.1a1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9v.1a1.7 1.7 0 001.5 1h.2a2 2 0 110 4h-.2a1.7 1.7 0 00-1.5 1z"/></svg>设置</button>
@@ -748,6 +751,25 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
     </div>
   </div>
 
+  <div id="view-keys" class="view">
+    <div class="pagerow">
+      <div>
+        <h1 class="pagetitle" tabindex="-1">API Keys</h1>
+        <div class="pagesub">给朋友分配独立用户 Key；按每日 token、每日请求、并发和模型范围限额。管理员 Key 不在此页管理。</div>
+      </div>
+      <div class="grow"></div>
+      <button class="btn mini" id="btn-key-create">新建 Key</button>
+    </div>
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        <span class="sub">客户端 Base URL 用 <span class="mono">&lt;你的公网域名&gt;/v1</span>；用户 Key 只能调 <span class="mono">/v1/*</span>。</span>
+        <span style="flex:1"></span>
+        <button class="btn sec mini" id="btn-keys-refresh">刷新</button>
+      </div>
+      <div id="keys-list"><div class="empty">加载中…</div></div>
+    </div>
+  </div>
+
   <div id="view-auto" class="view">
     <h1 class="pagetitle" tabindex="-1">自动化</h1><div class="pagesub">签到、成长任务、每日活跃与凭证保活的手动执行入口；定时调度仍在各引擎内自动运行。</div>
     <div class="card">
@@ -818,7 +840,7 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
         <button class="btn sec mini" id="btn-reveal-key">显示</button>
         <button class="btn sec mini" id="btn-copy-key">复制</button>
       </div>
-      <div class="sub">改 Key：编辑 config.json 的 api_key 后重启 router；客户端模型名统一用 <span class="mono">平台/模型</span>（如 workbuddy/glm-5.3-flash）。</div>
+      <div class="sub">这是<b>管理员 Key</b>：可调模型，也可进控制台。给朋友用的 Key 请到「API Keys」页另建用户 Key（只能调 /v1/*）。改管理员 Key：编辑 config.json 的 api_key 后重启 router；客户端模型名统一用 <span class="mono">平台/模型</span>（如 workbuddy/glm-5.3-flash）。</div>
     </div>
     <div class="card">
       <h3>路由偏好 <span class="sub">网关自身行为；引擎级设置请进对应引擎看板</span></h3>
@@ -896,6 +918,36 @@ Authorization: Bearer &lt;GATEWAY_KEY&gt;</pre>
       <button class="btn" id="action-submit" value="confirm">确认</button>
     </div>
   </form>
+</dialog>
+<dialog class="modal hidden" id="key-dialog" aria-labelledby="key-dialog-title">
+  <form id="key-form">
+    <h3 id="key-dialog-title">新建 API Key</h3>
+    <p id="key-dialog-sub">用户 Key 只能访问 /v1/*；留空的上限表示不限。</p>
+    <label for="key-name">名称</label>
+    <input id="key-name" type="text" maxlength="40" placeholder="例如：朋友 A" autocomplete="off" required>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div><label for="key-daily-tokens">每日 Token 上限</label><input id="key-daily-tokens" type="number" min="0" step="1000" value="1000000"></div>
+      <div><label for="key-daily-requests">每日请求上限</label><input id="key-daily-requests" type="number" min="0" step="1" value="1000"></div>
+      <div><label for="key-concurrency">并发上限</label><input id="key-concurrency" type="number" min="0" step="1" value="2"></div>
+      <div><label for="key-rpm">每分钟请求</label><input id="key-rpm" type="number" min="0" step="1" value="60"></div>
+    </div>
+    <label for="key-models">允许模型 <span class="sub">逗号/换行分隔，留空=全部</span></label>
+    <textarea id="key-models" rows="3" placeholder="例如：workbuddy/*, codearts/*"></textarea>
+    <div class="err" id="key-err" role="alert"></div>
+    <div class="toolbar" style="justify-content:flex-end;margin-bottom:0">
+      <button class="btn sec" id="key-cancel" type="button">取消</button>
+      <button class="btn" id="key-save" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+<dialog class="modal hidden" id="key-secret-dialog" aria-labelledby="key-secret-title">
+  <h3 id="key-secret-title">API Key 已生成</h3>
+  <p>完整 Key 只显示这一次；关闭后无法再查看，只能重置。</p>
+  <div class="toolbar" style="margin-bottom:12px">
+    <span class="mono" id="key-secret" style="word-break:break-all;flex:1"></span>
+    <button class="btn sec mini" id="key-secret-copy" type="button">复制</button>
+  </div>
+  <button class="btn" id="key-secret-close" type="button" style="width:100%;justify-content:center">我已保存</button>
 </dialog>
 <div class="toast hidden" id="toast" aria-hidden="true"><span id="toast-text"></span></div>
 <div class="sr-only" id="toast-announcement" role="status" aria-atomic="true"></div>
@@ -1175,6 +1227,7 @@ function requestPolicy(p,opt){
     try{if(JSON.parse(opt.body||'{}').method==='GET') return {read:true,views:[]};}catch(e){}
   }
   const views=p.startsWith('/api/models/')?['models','media','overview','usage']
+    :p.startsWith('/api/keys')?['keys','overview','usage']
     :p==='/api/gwconfig'?['settings','models','overview']
     :['accounts','overview','auto','usage'];
   return {read:false,views};
@@ -1263,7 +1316,7 @@ document.getElementById('gate-form').onsubmit=event=>{event.preventDefault();try
 document.getElementById('gate').addEventListener('cancel',event=>event.preventDefault());
 
 /* ── 视图切换 ── */
-const LOADERS={overview:loadOverview, accounts:loadStatus, add:null, models:loadModels, media:loadMedia, usage:loadUsage, auto:autoView, settings:loadSettings, logs:loadLogs};
+const LOADERS={overview:loadOverview, accounts:loadStatus, add:null, models:loadModels, media:loadMedia, usage:loadUsage, keys:loadKeys, auto:autoView, settings:loadSettings, logs:loadLogs};
 const VIEW_LOADED=new Map(), VIEW_PENDING=new Map(), VIEW_STATE=new Map();
 let navigationVersion=0;
 function renderViewState(view){
@@ -3826,6 +3879,155 @@ function renderRecent(d){
 }
 document.getElementById('btn-refresh-top').onclick=()=>refreshView('overview',true);
 
+/* ── API Keys（用户 Key） ── */
+let KEYS_DATA=[], KEYS_DEFAULTS=null, KEY_EDIT_ID='';
+function findKey(id){return KEYS_DATA.find(k=>String(k.id)===String(id))||null;}
+function keyPct(used,limit){limit=Number(limit)||0;return limit>0?Math.min(100,Number(used||0)/limit*100):0;}
+function renderKeys(){
+  const host=document.getElementById('keys-list');
+  if(!host) return;
+  if(!KEYS_DATA.length){host.innerHTML='<div class="empty">还没有用户 Key。点右上角「新建 Key」。</div>';return;}
+  const rows=KEYS_DATA.map((k,i)=>{
+    const u=k.usage||{},lim=k.limits||{};
+    const tokens=Number(u.tokens_day||0),tokenLimit=Number(lim.daily_tokens||0);
+    const requests=Number(u.requests_day||0),requestLimit=Number(lim.daily_requests||0);
+    const pct=keyPct(tokens,tokenLimit);
+    const models=(lim.allowed_models||[]).length?esc((lim.allowed_models||[]).join(', ')):'全部';
+    const used=u.last_used_at?new Date(u.last_used_at*1000).toLocaleString():'—';
+    return `<tr>
+      <td class="num seq-cell">${i+1}</td>
+      <td class="name-cell">${esc(k.name||'未命名')}<div class="sub-cell mono">${esc(k.prefix||'')}</div></td>
+      <td><span class="pill ${k.enabled?'green':'gray'}">${k.enabled?'启用':'停用'}</span></td>
+      <td>${tokenLimit?`<span class="bar"><i class="${pct>90?'low':''}" style="width:${pct}%"></i></span>${fmtTok(tokens)} / ${fmtTok(tokenLimit)}`:`${fmtTok(tokens)} / 不限`}</td>
+      <td class="num">${requestLimit?`${fmt(requests)} / ${fmt(requestLimit)}`:`${fmt(requests)} / 不限`}</td>
+      <td class="num">${Number(lim.concurrency||0)||'不限'}</td>
+      <td>${models}</td>
+      <td class="sub-cell">${esc(used)}</td>
+      <td><div class="toolbar" style="margin:0;gap:4px">
+        <button class="btn sec mini" data-key-edit="${esc(k.id)}">编辑</button>
+        <button class="btn sec mini" data-key-toggle="${esc(k.id)}">${k.enabled?'停用':'启用'}</button>
+        <button class="btn sec mini" data-key-rotate="${esc(k.id)}">重置</button>
+        <button class="btn sec mini" data-key-delete="${esc(k.id)}">删除</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+  host.innerHTML=`<div class="tblwrap"><table><caption class="sr-only">API Key 列表</caption><thead><tr>
+    <th scope="col" class="num seq-cell">#</th><th scope="col">名称 / Key</th><th scope="col">状态</th>
+    <th scope="col">今日 Token</th><th scope="col" class="num">今日请求</th><th scope="col" class="num">并发</th>
+    <th scope="col">模型</th><th scope="col">最近使用</th><th scope="col">操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  host.querySelectorAll('[data-key-edit]').forEach(b=>b.onclick=()=>openKeyDialog(b.dataset.keyEdit));
+  host.querySelectorAll('[data-key-toggle]').forEach(b=>b.onclick=()=>toggleKey(b.dataset.keyToggle));
+  host.querySelectorAll('[data-key-rotate]').forEach(b=>b.onclick=()=>rotateKey(b.dataset.keyRotate));
+  host.querySelectorAll('[data-key-delete]').forEach(b=>b.onclick=()=>deleteKey(b.dataset.keyDelete));
+}
+async function loadKeys(force=false){
+  try{
+    const d=await api('/api/keys'+(force?'?force=1':''));
+    KEYS_DATA=d.keys||[];
+    if(d.defaults) KEYS_DEFAULTS=d.defaults;
+    renderKeys();
+    return true;
+  }catch(e){
+    if(e.status!==401) toast('读取 API Keys 失败: '+e.message);
+    return viewFailure('keys',e);
+  }
+}
+function openKeyDialog(id){
+  const edit=!!id, k=edit?findKey(id):null;
+  if(edit&&!k) return;
+  KEY_EDIT_ID=edit?String(id):'';
+  document.getElementById('key-dialog-title').textContent=edit?'编辑 API Key':'新建 API Key';
+  document.getElementById('key-dialog-sub').textContent=edit
+    ?'修改名称或限额；不会改变 Key 本身。'
+    :'完整 Key 只在创建后显示一次。';
+  const lim=(k&&k.limits)||KEYS_DEFAULTS||{daily_tokens:1000000,daily_requests:1000,concurrency:2,rpm:60,allowed_models:[]};
+  document.getElementById('key-name').value=(k&&k.name)||'';
+  document.getElementById('key-daily-tokens').value=lim.daily_tokens??1000000;
+  document.getElementById('key-daily-requests').value=lim.daily_requests??1000;
+  document.getElementById('key-concurrency').value=lim.concurrency??2;
+  document.getElementById('key-rpm').value=lim.rpm??60;
+  document.getElementById('key-models').value=(lim.allowed_models||[]).join(', ');
+  const err=document.getElementById('key-err');
+  err.style.display='none';err.textContent='';
+  const dlg=document.getElementById('key-dialog');
+  dlg.classList.remove('hidden');
+  if(typeof dlg.showModal==='function') dlg.showModal(); else dlg.open=true;
+  document.getElementById('key-name').focus();
+}
+function closeKeyDialog(){
+  const d=document.getElementById('key-dialog');
+  if(d.open&&typeof d.close==='function') d.close();
+  d.classList.add('hidden');
+}
+function showKeySecret(secret){
+  document.getElementById('key-secret').textContent=secret||'';
+  const d=document.getElementById('key-secret-dialog');
+  d.classList.remove('hidden');
+  if(typeof d.showModal==='function') d.showModal(); else d.open=true;
+}
+async function saveKey(event){
+  if(event) event.preventDefault();
+  const name=document.getElementById('key-name').value.trim();
+  const err=document.getElementById('key-err');
+  if(!name){err.textContent='名称不能为空';err.style.display='block';return;}
+  const body={name:name,
+    daily_tokens:Math.max(0,Number(document.getElementById('key-daily-tokens').value)||0),
+    daily_requests:Math.max(0,Number(document.getElementById('key-daily-requests').value)||0),
+    concurrency:Math.max(0,Number(document.getElementById('key-concurrency').value)||0),
+    rpm:Math.max(0,Number(document.getElementById('key-rpm').value)||0),
+    allowed_models:document.getElementById('key-models').value.split(/[,，\n]/).map(x=>x.trim()).filter(Boolean)};
+  const btn=document.getElementById('key-save');
+  try{
+    btn.disabled=true;
+    const url=KEY_EDIT_ID?`/api/keys/${encodeURIComponent(KEY_EDIT_ID)}/update`:'/api/keys';
+    const r=await api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){
+      const created=!KEY_EDIT_ID;
+      closeKeyDialog();
+      toast(created?'API Key 已创建':'API Key 已更新');
+      if(r.secret) showKeySecret(r.secret);
+      await refreshView('keys',true);
+    }else err.textContent=errMsg(r)||'保存失败',err.style.display='block';
+  }catch(e){
+    if(e.status!==401){err.textContent=e.message;err.style.display='block';}
+  }finally{btn.disabled=false;}
+}
+async function toggleKey(id){
+  const k=findKey(id);if(!k) return;
+  try{
+    const r=await api(`/api/keys/${encodeURIComponent(id)}/update`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!k.enabled})});
+    if(r.ok){toast(k.enabled?'已停用':'已启用');await refreshView('keys',true);}else toast('操作失败: '+errMsg(r));
+  }catch(e){if(e.status!==401) toast('操作失败: '+e.message);}
+}
+async function rotateKey(id){
+  const k=findKey(id);if(!k) return;
+  const ok=await confirmAction('重置 API Key',`将立即作废「${k.name}」的旧 Key，并生成一个新的。`, '重置', [k.prefix||'']);
+  if(!ok) return;
+  try{
+    const r=await api(`/api/keys/${encodeURIComponent(id)}/rotate`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(r.ok){showKeySecret(r.secret);await refreshView('keys',true);}else toast('重置失败: '+errMsg(r));
+  }catch(e){if(e.status!==401) toast('重置失败: '+e.message);}
+}
+async function deleteKey(id){
+  const k=findKey(id);if(!k) return;
+  const ok=await confirmAction('删除 API Key',`删除「${k.name}」后，使用该 Key 的客户端会立即失效，且不可恢复。`,'删除',[k.prefix||'']);
+  if(!ok) return;
+  try{
+    const r=await api(`/api/keys/${encodeURIComponent(id)}/delete`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(r.ok){toast('API Key 已删除');await refreshView('keys',true);}else toast('删除失败: '+errMsg(r));
+  }catch(e){if(e.status!==401) toast('删除失败: '+e.message);}
+}
+document.getElementById('btn-key-create').onclick=()=>openKeyDialog();
+document.getElementById('btn-keys-refresh').onclick=()=>refreshView('keys',true);
+document.getElementById('key-form').onsubmit=saveKey;
+document.getElementById('key-cancel').onclick=closeKeyDialog;
+document.getElementById('key-secret-close').onclick=()=>{
+  const d=document.getElementById('key-secret-dialog');
+  if(d.open&&typeof d.close==='function') d.close();
+  d.classList.add('hidden');
+};
+document.getElementById('key-secret-copy').onclick=()=>copyText(document.getElementById('key-secret').textContent,document.getElementById('key-secret-copy'));
+
 /* ── 启动 ── */
 function gateHidden(){return document.getElementById('gate').classList.contains('hidden');}
 (async function init(){
@@ -3850,6 +4052,7 @@ setInterval(()=>{
   // 30s 轮询只做常规刷新：force 会连预估一起强制重算，代价高，留给手动「刷新数据」。
   if(active==='view-auto'){ if(!RUNNING.size) refreshView('auto'); return; }
   if(active==='view-usage'){ refreshView('usage'); return; }
+  if(active==='view-keys'){ refreshView('keys'); return; }
   if(active==='view-logs'){ refreshView('logs'); return; }
   if(active==='view-media'){ refreshView('media'); return; } // 不兜底刷总览
   if(active==='view-models') return; // 目录有 15s 缓存语义，静置即可

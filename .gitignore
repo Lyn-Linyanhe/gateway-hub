@@ -2,6 +2,8 @@
 config.json
 config.json.tmp
 config.json.bak*
+api_keys.json
+api_key_usage.json
 *.log
 qwenwork_tracker.json
 qwenwork_wallet_history.jsonl

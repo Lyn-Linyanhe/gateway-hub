@@ -8,7 +8,9 @@
 - 一个对外 API Key；模型名支持 `平台/模型` 精确指定，裸模型名在全网关唯一时可直接用。
 """
 
+import collections
 import contextlib
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -70,6 +72,406 @@ def _platform_inflight(name):
     finally:
         with _inflight_lock:
             _inflight[name] = max(0, _inflight.get(name, 0) - 1)
+
+
+# ---------------------------------------------------------------------------
+# 多用户 API Key：定义、鉴权辅助、限额与用量
+# ---------------------------------------------------------------------------
+
+API_KEYS_FILE = os.path.join(HERE, "api_keys.json")
+API_KEY_USAGE_FILE = os.path.join(HERE, "api_key_usage.json")
+API_KEY_USAGE_LOG = os.path.join(HERE, "api_key_usage.jsonl")
+API_KEY_USAGE_LOG_KEEP = 5000
+API_KEY_DEFAULT_LIMITS = {
+    "daily_tokens": 1000000,
+    "daily_requests": 1000,
+    "concurrency": 2,
+    "rpm": 60,
+    "allowed_models": [],
+}
+
+_api_keys_lock = threading.RLock()
+_api_keys_cache = {"mtime": None, "state": {"version": 1, "keys": []}}
+_api_key_usage_lock = threading.RLock()
+_api_key_usage_log_lock = threading.Lock()
+_api_key_usage_cache = None
+_api_key_windows = {}
+_api_key_active = {}
+
+
+def _api_key_default_limits():
+    return {"daily_tokens": API_KEY_DEFAULT_LIMITS["daily_tokens"],
+            "daily_requests": API_KEY_DEFAULT_LIMITS["daily_requests"],
+            "concurrency": API_KEY_DEFAULT_LIMITS["concurrency"],
+            "rpm": API_KEY_DEFAULT_LIMITS["rpm"],
+            "allowed_models": list(API_KEY_DEFAULT_LIMITS["allowed_models"])}
+
+
+def _api_key_hash(raw):
+    return hashlib.sha256(str(raw or "").encode("utf-8")).hexdigest()
+
+
+def _api_keys_state():
+    with _api_keys_lock:
+        try:
+            mtime = os.stat(API_KEYS_FILE).st_mtime_ns
+        except OSError:
+            mtime = None
+        if _api_keys_cache["mtime"] == mtime:
+            return _api_keys_cache["state"]
+        state = {"version": 1, "keys": []}
+        if mtime is not None:
+            try:
+                with open(API_KEYS_FILE, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                rows = data.get("keys") if isinstance(data, dict) else None
+                if isinstance(rows, list):
+                    state["keys"] = [row for row in rows
+                                     if isinstance(row, dict) and row.get("id") and row.get("hash")]
+            except (OSError, ValueError, RecursionError) as exc:
+                log("api_keys.json 读取失败，按空表处理: %s: %s" %
+                    (type(exc).__name__, exc))
+        _api_keys_cache["mtime"] = mtime
+        _api_keys_cache["state"] = state
+        return state
+
+
+def _save_api_keys(state):
+    with _api_keys_lock:
+        tmp = API_KEYS_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, API_KEYS_FILE)
+            _api_keys_cache["mtime"] = os.stat(API_KEYS_FILE).st_mtime_ns
+            _api_keys_cache["state"] = state
+        except OSError as exc:
+            log("api_keys.json 写入失败: %s: %s" % (type(exc).__name__, exc))
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+
+def _api_key_find(raw):
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    digest = _api_key_hash(raw)
+    with _api_keys_lock:
+        for row in _api_keys_state()["keys"]:
+            if hmac.compare_digest(str(row.get("hash") or "").encode(), digest.encode()):
+                return row
+    return None
+
+
+def _api_key_usage_state():
+    global _api_key_usage_cache
+    today = time.strftime("%Y-%m-%d")
+    month = time.strftime("%Y-%m")
+    with _api_key_usage_lock:
+        if _api_key_usage_cache is None:
+            state = {"day": today, "month": month, "keys": {}}
+            try:
+                with open(API_KEY_USAGE_FILE, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict) and isinstance(data.get("keys"), dict):
+                    state = {"day": str(data.get("day") or today),
+                             "month": str(data.get("month") or month),
+                             "keys": data["keys"]}
+            except (OSError, ValueError, RecursionError):
+                pass
+            _api_key_usage_cache = state
+        state = _api_key_usage_cache
+        if state.get("month") != month:
+            state = {"day": today, "month": month, "keys": {}}
+            _api_key_usage_cache = state
+        elif state.get("day") != today:
+            state["day"] = today
+            for row in state["keys"].values():
+                if isinstance(row, dict):
+                    row["tokens_day"] = 0
+                    row["requests_day"] = 0
+        return state
+
+
+def _save_api_key_usage(state):
+    tmp = API_KEY_USAGE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False)
+        os.replace(tmp, API_KEY_USAGE_FILE)
+    except OSError:
+        pass
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _api_key_usage_row(key_id):
+    with _api_key_usage_lock:
+        row = (_api_key_usage_state().get("keys") or {}).get(str(key_id)) or {}
+
+        def num(name):
+            try:
+                return int(row.get(name) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {"tokens_day": num("tokens_day"), "tokens_month": num("tokens_month"),
+                "requests_day": num("requests_day"), "requests_month": num("requests_month"),
+                "last_used_at": row.get("last_used_at"),
+                "last_model": row.get("last_model") or "",
+                "last_path": row.get("last_path") or "",
+                "last_status": num("last_status")}
+
+
+def _api_key_usage_add(key_id, requests=0, tokens=0, model="", path="", status=0,
+                       prompt=0, completion=0, stream=None, ip=""):
+    key_id = str(key_id or "")
+    if not key_id:
+        return
+    with _api_key_usage_lock:
+        state = _api_key_usage_state()
+        row = state["keys"].get(key_id)
+        if not isinstance(row, dict):
+            row = state["keys"][key_id] = {}
+        row["requests_day"] = int(row.get("requests_day") or 0) + int(requests or 0)
+        row["requests_month"] = int(row.get("requests_month") or 0) + int(requests or 0)
+        row["tokens_day"] = int(row.get("tokens_day") or 0) + int(tokens or 0)
+        row["tokens_month"] = int(row.get("tokens_month") or 0) + int(tokens or 0)
+        if requests or tokens or model or path:
+            row["last_used_at"] = time.time()
+            row["last_model"] = str(model or "")[:200]
+            row["last_path"] = str(path or "")[:200]
+            row["last_status"] = int(status or 0)
+        _save_api_key_usage(state)
+
+
+def _api_key_usage_log(key_id, key_name, path, platform, model, stream, status,
+                       usage=None, ip=""):
+    usage = usage if isinstance(usage, dict) else {}
+    row = {"ts": round(time.time(), 1), "key_id": str(key_id or ""),
+           "key_name": str(key_name or "")[:80], "ip": str(ip or "")[:64],
+           "path": str(path or "")[:200], "platform": str(platform or ""),
+           "model": str(model or "")[:200], "stream": stream,
+           "status": int(status or 0),
+           "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+           "completion_tokens": int(usage.get("completion_tokens") or 0),
+           "total_tokens": int(usage.get("total_tokens") or 0)}
+    line = json.dumps(row, ensure_ascii=False)
+    with _api_key_usage_log_lock:
+        try:
+            with open(API_KEY_USAGE_LOG, "a", encoding="utf-8") as handle:
+                handle.write(line + chr(10))
+            try:
+                if os.path.getsize(API_KEY_USAGE_LOG) > 2 * 1024 * 1024:
+                    with open(API_KEY_USAGE_LOG, encoding="utf-8") as handle:
+                        lines = handle.readlines()[-API_KEY_USAGE_LOG_KEEP:]
+                    with open(API_KEY_USAGE_LOG + ".tmp", "w", encoding="utf-8") as handle:
+                        handle.writelines(lines)
+                    os.replace(API_KEY_USAGE_LOG + ".tmp", API_KEY_USAGE_LOG)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+
+def _api_key_note_usage(key_id, key_name, path, platform, model, stream, status,
+                        usage=None, ip=""):
+    usage = usage if isinstance(usage, dict) else {}
+    _api_key_usage_add(key_id, tokens=int(usage.get("total_tokens") or 0),
+                       model=model, path=path, status=status,
+                       prompt=int(usage.get("prompt_tokens") or 0),
+                       completion=int(usage.get("completion_tokens") or 0),
+                       stream=stream, ip=ip)
+    _api_key_usage_log(key_id, key_name, path, platform, model, stream, status,
+                       usage=usage, ip=ip)
+
+
+def _api_key_seconds_to_midnight():
+    now = datetime.now()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - now).total_seconds()))
+
+
+def _api_key_admit(record):
+    if not isinstance(record, dict) or not record.get("enabled", True):
+        return False, 403, "API Key 已停用", None
+    key_id = str(record.get("id") or "")
+    limits = record.get("limits") if isinstance(record.get("limits"), dict) else {}
+
+    def limit(name):
+        try:
+            return max(0, int(limits.get(name) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    daily_tokens = limit("daily_tokens")
+    daily_requests = limit("daily_requests")
+    rpm = limit("rpm")
+    concurrency = limit("concurrency")
+    now = time.time()
+    with _api_key_usage_lock:
+        usage = _api_key_usage_state()["keys"].get(key_id) or {}
+        try:
+            tokens_day = int(usage.get("tokens_day") or 0)
+            requests_day = int(usage.get("requests_day") or 0)
+        except (TypeError, ValueError):
+            tokens_day = requests_day = 0
+        if daily_tokens and tokens_day >= daily_tokens:
+            return False, 429, "今日 token 额度已用完", _api_key_seconds_to_midnight()
+        if daily_requests and requests_day >= daily_requests:
+            return False, 429, "今日请求额度已用完", _api_key_seconds_to_midnight()
+        window = _api_key_windows.setdefault(key_id, collections.deque())
+        while window and now - window[0] >= 60:
+            window.popleft()
+        if rpm and len(window) >= rpm:
+            retry = max(1, int(60 - (now - window[0])))
+            return False, 429, "每分钟请求数超限", retry
+        active = _api_key_active.get(key_id, 0)
+        if concurrency and active >= concurrency:
+            return False, 429, "并发数超限", 1
+        window.append(now)
+        _api_key_active[key_id] = active + 1
+        _api_key_usage_add(key_id, requests=1)
+    return True, 200, "", None
+
+
+def _api_key_release(key_id):
+    key_id = str(key_id or "")
+    if not key_id:
+        return
+    with _api_key_usage_lock:
+        _api_key_active[key_id] = max(0, _api_key_active.get(key_id, 0) - 1)
+
+
+def _api_key_public(record):
+    limits = record.get("limits") if isinstance(record.get("limits"), dict) else {}
+    out_limits = _api_key_default_limits()
+    out_limits.update({
+        "daily_tokens": int(limits.get("daily_tokens") or 0),
+        "daily_requests": int(limits.get("daily_requests") or 0),
+        "concurrency": int(limits.get("concurrency") or 0),
+        "rpm": int(limits.get("rpm") or 0),
+        "allowed_models": [str(x) for x in (limits.get("allowed_models") or [])
+                           if str(x).strip()],
+    })
+    return {"id": str(record.get("id") or ""),
+            "name": str(record.get("name") or ""),
+            "prefix": str(record.get("prefix") or ""),
+            "enabled": bool(record.get("enabled", True)),
+            "created_at": record.get("created_at"),
+            "limits": out_limits,
+            "usage": _api_key_usage_row(record.get("id"))}
+
+
+def _api_key_model_allowed(record, requested, platform="", upstream_model=""):
+    limits = (record.get("limits")
+              if isinstance(record, dict) and isinstance(record.get("limits"), dict) else {})
+    patterns = [str(x) for x in (limits.get("allowed_models") or []) if str(x).strip()]
+    if not patterns:
+        return True
+    candidates = {str(requested or ""), str(upstream_model or "")}
+    if platform:
+        candidates.add("%s/%s" % (platform, requested or ""))
+        candidates.add("%s/%s" % (platform, upstream_model or ""))
+    return any(candidate and fnmatch.fnmatchcase(candidate, pattern)
+               for pattern in patterns for candidate in candidates)
+
+
+def _api_key_path_allowed(path):
+    path = str(path or "")
+    return (path.startswith("/v1/")
+            or path in ("/images/generations", "/images/edits", "/videos"))
+
+
+def _api_key_parse_limits(body, base=None):
+    limits = _api_key_default_limits()
+    if isinstance(base, dict):
+        limits.update({
+            "daily_tokens": int(base.get("daily_tokens") or 0),
+            "daily_requests": int(base.get("daily_requests") or 0),
+            "concurrency": int(base.get("concurrency") or 0),
+            "rpm": int(base.get("rpm") or 0),
+            "allowed_models": [str(x) for x in (base.get("allowed_models") or [])
+                               if str(x).strip()],
+        })
+    for name in ("daily_tokens", "daily_requests", "concurrency", "rpm"):
+        if name not in body:
+            continue
+        value = body.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, "%s 必须是非负整数" % name
+        limits[name] = value
+    if "allowed_models" in body:
+        raw = body.get("allowed_models")
+        if isinstance(raw, str):
+            parts = [x.strip() for x in re.split(r"[,，\n]", raw) if x.strip()]
+        elif isinstance(raw, list):
+            parts = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            return None, "allowed_models 必须是数组或逗号分隔字符串"
+        if len(parts) > 50:
+            return None, "allowed_models 最多 50 条"
+        limits["allowed_models"] = parts
+    return limits, ""
+
+
+def _api_key_new_record(name, limits):
+    raw = "sk-gw-" + secrets.token_urlsafe(32)
+    return raw, {"id": "k_" + secrets.token_hex(6), "name": name,
+                 "prefix": raw[:12] + "…" + raw[-4:],
+                 "hash": _api_key_hash(raw), "enabled": True,
+                 "created_at": time.time(), "limits": limits}
+
+
+def _usage_from_payload(obj):
+    """从 OpenAI / Anthropic 响应或 SSE 帧里取 usage；没有或为 0 返回 None。"""
+    if not isinstance(obj, dict):
+        return None
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        message = obj.get("message")
+        if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+            usage = message["usage"]
+        else:
+            return None
+
+    def num(*names):
+        for name in names:
+            try:
+                value = int(float(usage.get(name) or 0))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 0
+
+    prompt = num("prompt_tokens", "input_tokens")
+    completion = num("completion_tokens", "output_tokens")
+    total = num("total_tokens") or (prompt + completion)
+    if total <= 0:
+        return None
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": total,
+            "cached_tokens": num("cached_tokens", "cache_read_input_tokens")}
+
+
+def _merge_usage(acc, found):
+    if not found:
+        return acc
+    if not acc:
+        return dict(found)
+    for name in ("prompt_tokens", "completion_tokens", "cached_tokens"):
+        acc[name] = max(int(acc.get(name) or 0), int(found.get(name) or 0))
+    acc["total_tokens"] = acc["prompt_tokens"] + acc["completion_tokens"]
+    return acc
 
 
 def log(msg):
@@ -4825,8 +5227,14 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 鉴权 ----
 
     def _authorized(self):
+        self.auth_role = ""
+        self.auth_key = None
+        self.auth_key_id = ""
+        self.auth_key_name = ""
+        self.auth_error = ""
         want = (CONFIG.get("api_key") or "").strip()
         if not want:
+            self.auth_role = "admin"
             return True
         got = self.headers.get("Authorization", "")
         api_key = self.headers.get("x-api-key", "")
@@ -4834,9 +5242,52 @@ class Handler(BaseHTTPRequestHandler):
         parts = str(got).strip().split(None, 1)
         if len(parts) == 2 and parts[0].lower() == "bearer":
             bearer_key = parts[1].strip()
-        return (secrets.compare_digest(bearer_key.encode(), want.encode())
-                or secrets.compare_digest(str(got).strip().encode(), want.encode())
-                or secrets.compare_digest(str(api_key).strip().encode(), want.encode()))
+        candidates = []
+        for candidate in (bearer_key, str(got).strip(), str(api_key).strip()):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            if secrets.compare_digest(candidate.encode(), want.encode()):
+                self.auth_role = "admin"
+                return True
+        for candidate in candidates:
+            record = _api_key_find(candidate)
+            if not record:
+                continue
+            if not record.get("enabled", True):
+                self.auth_error = "API Key 已停用"
+                return False
+            self.auth_role = "user"
+            self.auth_key = record
+            self.auth_key_id = str(record.get("id") or "")
+            self.auth_key_name = str(record.get("name") or "")
+            return True
+        return False
+
+    def _client_ip(self):
+        """Cloudflare Tunnel 下真实客户端 IP 在 CF-Connecting-IP；仅用于日志。"""
+        try:
+            cf = str(self.headers.get("CF-Connecting-IP") or "").strip()
+        except Exception:
+            cf = ""
+        return (cf or self.address_string())[:64]
+
+    def _key_request_begin(self, path):
+        """用户 Key 的入口限额；返回 (ok, key_id)。管理员直接放行。"""
+        if getattr(self, "auth_role", "") != "user":
+            return True, None
+        if not _api_key_path_allowed(path):
+            self.close_connection = True
+            self._deny(403, "用户 Key 只能访问 /v1/* 接口，不能访问控制台",
+                       "permission_error")
+            return False, None
+        ok, code, message, retry_after = _api_key_admit(self.auth_key)
+        if not ok:
+            self.close_connection = True
+            headers = {"Retry-After": str(retry_after)} if retry_after else None
+            self._deny(code, message, "rate_limit_error", headers=headers)
+            return False, None
+        return True, self.auth_key_id
 
     def setup(self):
         super().setup()
@@ -4920,22 +5371,25 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("chunk 数据未完整接收")
             out.extend(chunk)
 
-    def _deny(self, code, message, err_type="invalid_request_error"):
+    def _deny(self, code, message, err_type="invalid_request_error", headers=None):
         request_path, _ = _request_target(getattr(self, "path", ""))
         if request_path == "/v1/messages":
             anthropic_type = "authentication_error" if code == 401 else err_type
             self._send_json(code, {"type": "error", "error": {
-                "type": anthropic_type, "message": message}})
+                "type": anthropic_type, "message": message}}, headers=headers)
             return
-        self._send_json(code, {"error": {"message": message, "type": err_type}})
+        self._send_json(code, {"error": {"message": message, "type": err_type}},
+                        headers=headers)
 
-    def _send_json(self, code, obj, model=None):
+    def _send_json(self, code, obj, model=None, headers=None):
         if model is not None:
             obj["model"] = model
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(str(name), str(value))
         self.end_headers()
         self.wfile.write(payload)
 
@@ -4973,11 +5427,15 @@ class Handler(BaseHTTPRequestHandler):
         if _media_download_allowed(normalized_target):
             return self._media_video_get()
         if not self._authorized():
-            return self._deny(401, "API Key 缺失或不正确")
+            return self._deny(401, getattr(self, "auth_error", "") or "API Key 缺失或不正确")
+        if getattr(self, "auth_role", "") == "user" and path.startswith("/api/"):
+            return self._deny(403, "用户 Key 只能访问 /v1/* 接口，不能访问控制台", "permission_error")
         if path in ("/v1/models", "/models"):
             return self._models()
         if path in ("/v1/media/models", "/media/models"):
             return self._media_models()
+        if path == "/api/keys":
+            return self._api_keys_list()
         if path == "/api/media/models":
             return self._api_media_models()
         if path == "/v1/media/tasks":
@@ -5039,7 +5497,16 @@ class Handler(BaseHTTPRequestHandler):
         self._target = path + ("?" + query if query else "")
         if not self._authorized():
             self.close_connection = True
-            return self._deny(401, "API Key 缺失或不正确")
+            return self._deny(401, getattr(self, "auth_error", "") or "API Key 缺失或不正确")
+        ok, slot = self._key_request_begin(path)
+        if not ok:
+            return
+        try:
+            return self._do_post(path, query, t0)
+        finally:
+            _api_key_release(slot)
+
+    def _do_post(self, path, query, t0):
         if _media_multipart_reject(path, self.headers.get("Content-Type")):
             self.close_connection = True  # 请求体未读取，不得在同一连接解析成下一次请求
             return self._deny(400, "媒体接口只接受 JSON 请求体：不支持 multipart 文件上传，"
@@ -5047,6 +5514,19 @@ class Handler(BaseHTTPRequestHandler):
         self._post_body = self._read_post_object()
         if self._post_body is None:
             return
+        if path == "/api/keys":
+            return self._api_keys_create()
+        if path.startswith("/api/keys/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[1] == "keys":
+                action, key_id = parts[3], parts[2]
+                if action == "update":
+                    return self._api_keys_update(key_id)
+                if action == "rotate":
+                    return self._api_keys_rotate(key_id)
+                if action == "delete":
+                    return self._api_keys_delete(key_id)
+            return self._deny(404, "API Key 操作路径无效")
         if path.startswith("/api/checkin/"):
             return self._api_checkin(path.rsplit("/", 1)[-1])
         if path == "/api/automation/jobs":
@@ -5100,6 +5580,10 @@ class Handler(BaseHTTPRequestHandler):
         up, upstream_model, client_facing, reason = resolve_model(model)
         if up is None:
             return self._deny(400, reason)
+        if (getattr(self, "auth_role", "") == "user"
+                and not _api_key_model_allowed(self.auth_key, model, up["name"], upstream_model)):
+            return self._deny(403, "该 API Key 无权使用模型 `%s`" % model,
+                              "permission_error")
 
         # codearts 上游对 function name 硬限 64 字符（InferHub.001001017.413），
         # 超了直接 502，而引擎会把这次 502 当成账号异常、冷却 10 分钟——客户端
@@ -5230,7 +5714,11 @@ class Handler(BaseHTTPRequestHandler):
                                           t_parse=t_parse, t_payload=t_payload,
                                           t_route=t_route,
                                           usage_model=(upstream_model
-                                                       if up["name"] == "codearts" else None))
+                                                       if up["name"] == "codearts" else None),
+                                          usage_key_id=getattr(self, "auth_key_id", ""),
+                                          usage_key_name=getattr(self, "auth_key_name", ""),
+                                          usage_path=path, usage_platform=up["name"],
+                                          usage_client_model=model)
             if up["name"] == "codearts" and status < 400:
                 try:
                     obj = json.loads(result.decode("utf-8"))
@@ -5240,13 +5728,25 @@ class Handler(BaseHTTPRequestHandler):
                                                (time.time() - t0) * 1000)
                 except (ValueError, UnicodeDecodeError):
                     pass
+            if getattr(self, "auth_key_id", ""):
+                usage_for_key = None
+                if status < 400:
+                    try:
+                        usage_for_key = _usage_from_payload(json.loads(result.decode("utf-8")))
+                    except (ValueError, UnicodeDecodeError):
+                        usage_for_key = None
+                _api_key_note_usage(self.auth_key_id, self.auth_key_name, path,
+                                    up["name"], model, False, status,
+                                    usage=usage_for_key, ip=self._client_ip())
             return self._relay_json(status, resp_headers, result, client_facing)
 
     # ---- 转发实现 ----
 
     def _relay_stream(self, status, headers, chunks, client_facing, up,
                       t0=None, t_head=None, label="", t_parse=None, t_payload=None,
-                      t_route=None, usage_model=None):
+                      t_route=None, usage_model=None, usage_key_id="",
+                      usage_key_name="", usage_path="", usage_platform="",
+                      usage_client_model=""):
         self.send_response(status)
         ctype = headers.get("Content-Type", "text/event-stream")
         self.send_header("Content-Type", ctype)
@@ -5264,7 +5764,7 @@ class Handler(BaseHTTPRequestHandler):
             for chunk in _rewrite_sse_chunks(chunks, client_facing):
                 if first_data_at is None and b"data:" in chunk:
                     first_data_at = time.time()
-                if usage_model:
+                if usage_model or usage_key_id:
                     # 逐块扫 SSE：usage 常在最后一个 data 帧（[DONE] 之前）。
                     # 只解析完整行，跨块的不完整行留给下一块。
                     data = tail + chunk
@@ -5282,12 +5782,12 @@ class Handler(BaseHTTPRequestHandler):
                             obj = json.loads(payload.decode("utf-8"))
                         except (ValueError, UnicodeDecodeError):
                             continue
-                        found = _codearts_usage_from_payload(obj)
+                        found = _usage_from_payload(obj)
                         if found:
-                            usage_found = found
-                            # 只有 usage、没有 choices 的帧是我们主动要的记账帧，
-                            # 客户端没请求过 include_usage，不能让它看到。
-                            if obj.get("choices") == []:
+                            usage_found = _merge_usage(usage_found, found)
+                            # 只有 usage、没有 choices 的帧是 codearts 主动要的
+                            # 记账帧，客户端没请求过 include_usage，不能让它看到。
+                            if usage_model and obj.get("choices") == []:
                                 drop_chunk = True
                     if drop_chunk:
                         continue
@@ -5302,6 +5802,10 @@ class Handler(BaseHTTPRequestHandler):
         if usage_model and usage_found:
             _record_codearts_usage(usage_model, usage_found, True,
                                    (time.time() - t0) * 1000 if t0 else None)
+        if usage_key_id:
+            _api_key_note_usage(usage_key_id, usage_key_name, usage_path,
+                                usage_platform, usage_client_model, True, status,
+                                usage=usage_found, ip=self._client_ip())
         log(f"stream 完成 -> {client_facing}")
         if t0:
             total_ms = int((time.time() - t0) * 1000)
@@ -5383,6 +5887,10 @@ class Handler(BaseHTTPRequestHandler):
             if realm and realm not in supported_realms:
                 continue
             if tag and not realm and not supported_realms:
+                continue
+            if (getattr(self, "auth_role", "") == "user"
+                    and not _api_key_model_allowed(self.auth_key, f"{platform}/{m['id']}",
+                                                   platform, m["id"])):
                 continue
             data.append({
                 "id": f"{platform}/{m['id']}",
@@ -5536,6 +6044,11 @@ class Handler(BaseHTTPRequestHandler):
             up, upstream_model, client_facing, reason = resolve_media_model(model, tag)
             if up is None:
                 return self._deny(400, reason)
+            if (getattr(self, "auth_role", "") == "user"
+                    and not _api_key_model_allowed(self.auth_key, model,
+                                                   up["name"], upstream_model)):
+                return self._deny(403, "该 API Key 无权使用模型 `%s`" % model,
+                                  "permission_error")
             req["model"] = upstream_model
             if up["name"] == "raccoon" and not path.startswith("/v1/videos"):
                 # xhx2api 会把 n 统一转成字符串再转发，而上游生图接口只收 int；
@@ -5992,6 +6505,96 @@ class Handler(BaseHTTPRequestHandler):
                                   "error": f"{type(exc).__name__}: {exc}"})
 
     # ---- 网关自身开关（区别于引擎 settings） ----
+
+    # ---- 多用户 API Key 管理（仅管理员） ----
+
+    def _api_keys_list(self):
+        with _api_keys_lock:
+            records = list(_api_keys_state()["keys"])
+        keys = [_api_key_public(record) for record in records]
+        keys.sort(key=lambda row: row.get("created_at") or 0, reverse=True)
+        self._send_json(200, {"ok": True, "keys": keys,
+                              "today": time.strftime("%Y-%m-%d"),
+                              "defaults": _api_key_default_limits()})
+
+    def _api_keys_create(self):
+        body = self._post_body or {}
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return self._deny(400, "name 不能为空")
+        if len(name) > 40:
+            return self._deny(400, "name 最多 40 个字符")
+        limits, error = _api_key_parse_limits(body)
+        if error:
+            return self._deny(400, error)
+        raw, record = _api_key_new_record(name, limits)
+        with _api_keys_lock:
+            state = _api_keys_state()
+            state["keys"].append(record)
+            _save_api_keys(state)
+        log("apikey 创建: %s (%s)" % (name, record["id"]))
+        self._send_json(200, {"ok": True, "secret": raw,
+                              "key": _api_key_public(record)})
+
+    def _api_key_record(self, key_id):
+        with _api_keys_lock:
+            state = _api_keys_state()
+            for record in state["keys"]:
+                if str(record.get("id") or "") == str(key_id or ""):
+                    return state, record
+        return None, None
+
+    def _api_keys_update(self, key_id):
+        state, record = self._api_key_record(key_id)
+        if record is None:
+            return self._deny(404, "API Key 不存在")
+        body = self._post_body or {}
+        with _api_keys_lock:
+            if "name" in body:
+                name = str(body.get("name") or "").strip()
+                if not name or len(name) > 40:
+                    return self._deny(400, "name 必须为 1-40 个字符")
+                record["name"] = name
+            if "enabled" in body:
+                if not isinstance(body.get("enabled"), bool):
+                    return self._deny(400, "enabled 必须是布尔值")
+                record["enabled"] = body["enabled"]
+            limits, error = _api_key_parse_limits(body, record.get("limits"))
+            if error:
+                return self._deny(400, error)
+            record["limits"] = limits
+            _save_api_keys(state)
+        self._send_json(200, {"ok": True, "key": _api_key_public(record)})
+
+    def _api_keys_rotate(self, key_id):
+        state, record = self._api_key_record(key_id)
+        if record is None:
+            return self._deny(404, "API Key 不存在")
+        raw, replacement = _api_key_new_record(record.get("name") or "",
+                                               record.get("limits") or {})
+        with _api_keys_lock:
+            record["hash"] = replacement["hash"]
+            record["prefix"] = replacement["prefix"]
+            _save_api_keys(state)
+        log("apikey 重置: %s (%s)" % (record.get("name") or "", key_id))
+        self._send_json(200, {"ok": True, "secret": raw,
+                              "key": _api_key_public(record)})
+
+    def _api_keys_delete(self, key_id):
+        state, record = self._api_key_record(key_id)
+        if record is None:
+            return self._deny(404, "API Key 不存在")
+        with _api_keys_lock:
+            state["keys"] = [row for row in state["keys"]
+                             if str(row.get("id") or "") != str(key_id)]
+            _save_api_keys(state)
+        with _api_key_usage_lock:
+            usage_state = _api_key_usage_state()
+            usage_state["keys"].pop(str(key_id), None)
+            _save_api_key_usage(usage_state)
+        _api_key_active.pop(str(key_id), None)
+        log("apikey 删除: %s (%s)" % (record.get("name") or "", key_id))
+        self._send_json(200, {"ok": True})
 
     def _api_gwconfig(self):
         """GET /api/gwconfig 读、POST /api/gwconfig 写（白名单字段）。
@@ -6573,6 +7176,10 @@ class Handler(BaseHTTPRequestHandler):
             # 归属哪个平台；裸名调用仍兼容（resolve_model 唯一性放行）
             entry = {"id": f"{x['platform']}/{x['public']}", "object": "model",
                      "owned_by": x["platform"]}
+            if (getattr(self, "auth_role", "") == "user"
+                    and not _api_key_model_allowed(self.auth_key, entry["id"],
+                                                   x["platform"], x["public"])):
+                continue
             # 能力字段（vision/tools/reasoning）：OpenAI 官方 /v1/models 没有，
             # 但多数客户端会读；客户端不认识的字段直接忽略，无副作用。
             caps = _model_caps(x)
@@ -6870,7 +7477,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 
 def main():

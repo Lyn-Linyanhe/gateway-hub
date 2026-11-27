@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-暂无后续变更。
+### 多用户 API Key
+
+- 新增用户 Key（`sk-gw-...`）：管理员 Key 仍是 `config.json` 的 `api_key`，用户 Key 只能调用 `/v1/*`，访问 `/api/*` 返回 403。
+- 每个用户 Key 可单独设置每日 token 上限、每日请求上限、并发上限、每分钟请求上限与允许模型（支持 `workbuddy/*` 这类通配符）。
+- 每日 token 用量按上游返回的 usage 统计，兼容 OpenAI / Anthropic 字段；上游不返回 usage 的请求只计请求数，由每日请求上限兜底。
+- 控制台新增「API Keys」页：列表、新建、编辑、启停、重置、删除；完整 Key 仅在创建/重置时显示一次，存储只保留 SHA-256 哈希。
+- 新增 `api_keys.json`、`api_key_usage.json`、`api_key_usage.jsonl` 运行时文件，均已加入 `.gitignore`；自更新发布包拒绝包含这些文件。
 
 ## v1.12.0 · 2026-11-19
 

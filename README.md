@@ -75,6 +75,46 @@ Model:    平台/模型，例如 raccoon/sn-qwen4-max
 
 通过 `/v1/models` 获取当前可见模型，不应把文档示例当作上游始终可用的模型清单。
 
+### 5. 给他人分配用户 Key
+
+在控制台「API Keys」页新建用户 Key（`sk-gw-...`）。每个 Key 可单独设置：
+
+- 每日 token 上限（按上游返回的 usage 统计，兼容 OpenAI / Anthropic 字段）
+- 每日请求上限（上游不返回 usage 时兜底）
+- 并发上限、每分钟请求上限
+- 允许模型（支持 `workbuddy/*`、`codearts/*` 等通配符；留空=全部）
+
+用户 Key 只能调用 `/v1/*`，不能访问 `/api/*` 控制台接口；管理员 Key 仍是 `config.json` 的 `api_key`。完整用户 Key 只在创建/重置时显示一次，网关只保存 SHA-256 哈希。
+
+## 公网访问（Cloudflare Tunnel）
+
+不买服务器也能把本机网关发布到自己的域名：本机继续运行 gateway 和全部引擎，`cloudflared` 把 `http://127.0.0.1:8787` 接到 Cloudflare，再绑定一个子域名。
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create gateway-hub
+cloudflared tunnel route dns gateway-hub gw.example.com
+cloudflared tunnel run gateway-hub
+```
+
+`%USERPROFILE%\.cloudflared\config.yml` 的最小配置：
+
+```yaml
+tunnel: gateway-hub
+credentials-file: C:\Users\<你>\.cloudflared\<tunnel-uuid>.json
+ingress:
+  - hostname: gw.example.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404
+```
+
+注意：
+
+- 网关仍只绑定 `127.0.0.1`，不需要开防火墙或端口转发。
+- 这台电脑必须保持开机联网；睡眠/关机时公网 URL 不可用。
+- Cloudflare 免费代理对 SSE 流式正常；非流式请求超过约 100 秒可能返回 524，长生成建议客户端开启 `stream: true`。
+- 公网只暴露 `/v1/*` 的用户 Key 不够，管理员 Key 也要用强随机值；控制台 HTML 本身是公开的，但所有 `/api/*` 数据和操作都需要管理员 Key。
+
 ## 平台启停与上游启动
 
 在看板**设置 → 平台开关与进程**中操作：
@@ -186,6 +226,7 @@ WorkBuddy/Qoder/小浣熊共用同模型「Σ实扣 ÷ Σtoken」的加权算法
 | `GET /v1/models` | 当前可见聊天模型；带平台前缀 |
 | `POST /v1/chat/completions`、`/v1/responses`、`/v1/messages` | 转发对应平台接口 |
 | `GET /api/status` | 账号池、积分、健康及临期记录 |
+| `GET /api/keys`、`POST /api/keys/{id}/update`、`/rotate`、`/delete` | 用户 Key 管理（仅管理员 Key） |
 | `GET /api/catalog` | 模型规格、倍率、可见性 |
 | `GET /api/usage?limit=500` | 合并用量明细；未知字段保留为空 |
 | `GET /api/estimate` | 额度可用量预估与样本依据 |

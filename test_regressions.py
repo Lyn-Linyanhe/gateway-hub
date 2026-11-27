@@ -87,10 +87,29 @@ class GatewayTests(unittest.TestCase):
             "_trae_consumed_amount",
             "_media_link_signature", "_media_download_allowed",
             "_media_multipart_reject", "_oversized_function_names",
-            "_parse_token_remaining"},
+            "_parse_token_remaining",
+            "_api_key_hash", "_api_key_default_limits", "_api_keys_state",
+            "_save_api_keys", "_api_key_find", "_api_key_usage_state",
+            "_save_api_key_usage", "_api_key_usage_row", "_api_key_usage_add",
+            "_api_key_usage_log", "_api_key_note_usage", "_api_key_seconds_to_midnight",
+            "_api_key_admit", "_api_key_release", "_api_key_public",
+            "_api_key_model_allowed", "_api_key_path_allowed", "_api_key_parse_limits",
+            "_api_key_new_record", "_usage_from_payload", "_merge_usage"},
             {"QWEN_WALLET_HISTORY": "", "RACCOON_WALLET_HISTORY": "",
              "TRAE_WALLET_HISTORY": "", "TRAE_SPEND_HISTORY": "",
              "RACCOON_BILLING_LINKS": "",
+             "API_KEYS_FILE": "", "API_KEY_USAGE_FILE": "", "API_KEY_USAGE_LOG": "",
+             "API_KEY_USAGE_LOG_KEEP": constant(ROOT / "router.py", "API_KEY_USAGE_LOG_KEEP"),
+             "API_KEY_DEFAULT_LIMITS": constant(ROOT / "router.py", "API_KEY_DEFAULT_LIMITS"),
+             "_api_keys_lock": threading.RLock(),
+             "_api_keys_cache": {"mtime": None, "state": {"version": 1, "keys": []}},
+             "_api_key_usage_lock": threading.RLock(),
+             "_api_key_usage_log_lock": threading.Lock(),
+             "_api_key_usage_cache": None,
+             "_api_key_windows": {},
+             "_api_key_active": {},
+             "collections": __import__("collections"),
+             "fnmatch": __import__("fnmatch"),
              "PLATFORM_BALANCE_UNIT": constant(ROOT / "router.py", "PLATFORM_BALANCE_UNIT"),
              "ESTIMATE_EXCLUDED": constant(ROOT / "router.py", "ESTIMATE_EXCLUDED"),
              "CODECARTS_FUNCTION_NAME_LIMIT":
@@ -102,6 +121,7 @@ class GatewayTests(unittest.TestCase):
              "hashlib": __import__('hashlib'),
              "hmac": __import__('hmac'), "_media_link_secret": b'offline-test-only',
              "datetime": datetime,
+             "timedelta": timedelta,
              "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
              "MEDIA_POST_PATHS": constant(ROOT / "router.py", "MEDIA_POST_PATHS")})
 
@@ -215,6 +235,147 @@ class GatewayTests(unittest.TestCase):
         obj=object.__new__(self.ns['Handler'])
         obj.headers={'x-api-key':'synthetic-only'}
         self.assertTrue(obj._authorized())
+
+    def test_api_key_create_list_redacts_secret(self):
+        import tempfile
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            self.ns["API_KEYS_FILE"] = os.path.join(tmp, "api_keys.json")
+            self.ns["API_KEY_USAGE_FILE"] = os.path.join(tmp, "api_key_usage.json")
+            self.ns["API_KEY_USAGE_LOG"] = os.path.join(tmp, "api_key_usage.jsonl")
+            handler = object.__new__(self.ns['Handler'])
+            handler._post_body = {"name": "朋友A", "daily_tokens": 1000,
+                                  "concurrency": 1, "allowed_models": ["workbuddy/*"]}
+            handler._send_json = Mock()
+            handler._deny = Mock()
+            handler._api_keys_create()
+            self.assertEqual(handler._deny.call_count, 0)
+            code, payload = handler._send_json.call_args.args[:2]
+            self.assertEqual(code, 200)
+            secret = payload["secret"]
+            self.assertTrue(secret.startswith("sk-gw-"))
+            self.assertEqual(payload["key"]["limits"]["daily_tokens"], 1000)
+            stored = Path(self.ns["API_KEYS_FILE"]).read_text(encoding="utf-8")
+            self.assertNotIn(secret, stored)
+            self.assertIn("hash", stored)
+            handler._api_keys_list()
+            listed = handler._send_json.call_args.args[1]
+            self.assertEqual(len(listed["keys"]), 1)
+            self.assertNotIn("hash", listed["keys"][0])
+            self.assertNotIn(secret, json.dumps(listed))
+
+    def test_api_key_role_split_and_admin_path_block(self):
+        import email.message
+        import tempfile
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            self.ns["API_KEYS_FILE"] = os.path.join(tmp, "api_keys.json")
+            self.ns["API_KEY_USAGE_FILE"] = os.path.join(tmp, "api_key_usage.json")
+            self.ns["API_KEY_USAGE_LOG"] = os.path.join(tmp, "api_key_usage.jsonl")
+            raw, record = self.ns["_api_key_new_record"](
+                "friend", self.ns["_api_key_default_limits"]())
+            state = self.ns["_api_keys_state"]()
+            state["keys"].append(record)
+            self.ns["_save_api_keys"](state)
+            self.ns["CONFIG"] = {"api_key": "admin-key"}
+            admin = object.__new__(self.ns['Handler'])
+            admin.headers = email.message.Message()
+            admin.headers["Authorization"] = "Bearer admin-key"
+            self.assertTrue(admin._authorized())
+            self.assertEqual(admin.auth_role, "admin")
+            user = object.__new__(self.ns['Handler'])
+            user.headers = email.message.Message()
+            user.headers["Authorization"] = "Bearer " + raw
+            self.assertTrue(user._authorized())
+            self.assertEqual(user.auth_role, "user")
+            self.assertEqual(user.auth_key_id, record["id"])
+            blocked = object.__new__(self.ns['Handler'])
+            blocked.auth_role = "user"
+            blocked.auth_key = record
+            blocked._deny = Mock()
+            blocked.close_connection = False
+            ok, slot = blocked._key_request_begin("/api/status")
+            self.assertFalse(ok)
+            self.assertIsNone(slot)
+            self.assertEqual(blocked._deny.call_args.args[0], 403)
+
+    def test_api_key_limits_rpm_concurrency_daily_tokens(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.ns["API_KEYS_FILE"] = os.path.join(tmp, "api_keys.json")
+            self.ns["API_KEY_USAGE_FILE"] = os.path.join(tmp, "api_key_usage.json")
+            self.ns["API_KEY_USAGE_LOG"] = os.path.join(tmp, "api_key_usage.jsonl")
+            self.ns["_api_key_windows"].clear()
+            self.ns["_api_key_active"].clear()
+            rpm_record = {"id": "k_rpm", "name": "rpm", "enabled": True,
+                          "limits": {"daily_tokens": 0, "daily_requests": 0,
+                                     "concurrency": 0, "rpm": 2, "allowed_models": []}}
+            self.assertTrue(self.ns["_api_key_admit"](rpm_record)[0])
+            self.assertTrue(self.ns["_api_key_admit"](rpm_record)[0])
+            ok, code, message, retry = self.ns["_api_key_admit"](rpm_record)
+            self.assertFalse(ok)
+            self.assertEqual(code, 429)
+            self.assertIn("每分钟", message)
+            self.assertGreaterEqual(retry, 1)
+            self.ns["_api_key_windows"].clear()
+            self.ns["_api_key_active"].clear()
+            conc_record = {"id": "k_conc", "name": "conc", "enabled": True,
+                           "limits": {"daily_tokens": 0, "daily_requests": 0,
+                                      "concurrency": 1, "rpm": 0, "allowed_models": []}}
+            self.assertTrue(self.ns["_api_key_admit"](conc_record)[0])
+            ok, code, message, _ = self.ns["_api_key_admit"](conc_record)
+            self.assertFalse(ok)
+            self.assertEqual(code, 429)
+            self.assertIn("并发", message)
+            self.ns["_api_key_release"]("k_conc")
+            token_record = {"id": "k_tok", "name": "tok", "enabled": True,
+                            "limits": {"daily_tokens": 100, "daily_requests": 0,
+                                       "concurrency": 0, "rpm": 0, "allowed_models": []}}
+            self.ns["_api_key_usage_add"]("k_tok", tokens=100)
+            ok, code, message, _ = self.ns["_api_key_admit"](token_record)
+            self.assertFalse(ok)
+            self.assertEqual(code, 429)
+            self.assertIn("token", message)
+
+    def test_usage_from_payload_openai_and_anthropic(self):
+        usage = self.ns["_usage_from_payload"]
+        self.assertEqual(usage({"usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                                          "total_tokens": 15}}),
+                         {"prompt_tokens": 10, "completion_tokens": 5,
+                          "total_tokens": 15, "cached_tokens": 0})
+        self.assertEqual(usage({"usage": {"input_tokens": 12, "output_tokens": 3}}),
+                         {"prompt_tokens": 12, "completion_tokens": 3,
+                          "total_tokens": 15, "cached_tokens": 0})
+        self.assertEqual(usage({"message": {"usage": {"input_tokens": 7,
+                                                      "output_tokens": 2}}}),
+                         {"prompt_tokens": 7, "completion_tokens": 2,
+                          "total_tokens": 9, "cached_tokens": 0})
+        self.assertIsNone(usage({}))
+        merged = self.ns["_merge_usage"]({"prompt_tokens": 10, "completion_tokens": 0,
+                                          "total_tokens": 10, "cached_tokens": 0},
+                                         {"prompt_tokens": 0, "completion_tokens": 5,
+                                          "total_tokens": 5, "cached_tokens": 0})
+        self.assertEqual(merged["total_tokens"], 15)
+
+    def test_api_key_model_allowlist(self):
+        allow = self.ns["_api_key_model_allowed"]
+        record = {"limits": {"allowed_models": ["workbuddy/*"]}}
+        self.assertTrue(allow(record, "workbuddy/glm-5.3", "workbuddy", "glm-5.3"))
+        self.assertFalse(allow(record, "codearts/x", "codearts", "x"))
+        self.assertTrue(allow({"limits": {"allowed_models": []}}, "anything", "codearts", "x"))
+
+    def test_api_key_usage_rolls_over_day(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.ns["API_KEY_USAGE_FILE"] = os.path.join(tmp, "api_key_usage.json")
+            self.ns["_api_key_usage_cache"] = {
+                "day": "2000-01-01", "month": time.strftime("%Y-%m"),
+                "keys": {"k": {"tokens_day": 99, "requests_day": 2,
+                               "tokens_month": 99, "requests_month": 2}}}
+            state = self.ns["_api_key_usage_state"]()
+            self.assertEqual(state["keys"]["k"]["tokens_day"], 0)
+            self.assertEqual(state["keys"]["k"]["requests_day"], 0)
+            self.assertEqual(state["keys"]["k"]["tokens_month"], 99)
 
     def test_realm_membership(self):
         self.ns.update(_wb_realm_meta=lambda:{'m':{'realms':['cn','intl'],'pro':['intl']}},
@@ -3115,6 +3276,47 @@ assert.equal((single.match(/class="realm-group"/g)||[]).length,0,'单区域不�
 assert.equal([...single.matchAll(/seq-cell">(\d+)</g)].map(m=>m[1]).join(','),'1,2','单区域仍要有序号');
 
 console.log('dashboard accounts: realm grouping, continuous seq, single-realm fallback passed');
+'''
+        script = "const html=" + json.dumps(_DASHBOARD_HTML) + ";" + chr(10) + script
+        result = subprocess.run(['node', '-'], input=script,
+                                text=True, encoding='utf-8', capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dashboard_api_keys_render_masks_secret(self):
+        """API Keys 列表只渲染前缀，不在 DOM 里出现完整 Key。"""
+        import subprocess
+        script = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+function extractFn(name){
+  const start=html.indexOf('function '+name+'(');
+  assert.ok(start>=0, name+' not found');
+  let i=html.indexOf('{',start), depth=0, end=-1;
+  for(;i<html.length;i++){
+    const c=html[i];
+    if(c==='{') depth++;
+    else if(c==='}'){ depth--; if(depth===0){ end=i+1; break; } }
+  }
+  assert.ok(end>0, name+' unbalanced');
+  return html.slice(start,end);
+}
+const host={innerHTML:'',querySelectorAll:()=>[]};
+const context=vm.createContext({
+  console,Number,String,Math,Date,JSON,Array,Object,
+  document:{getElementById:id=>id==='keys-list'?host:null},
+  fmt:n=>Math.round(n).toLocaleString(),
+  fmtTok:n=>String(n),
+  esc:s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])),
+  KEYS_DATA:[{id:'k_1',name:'朋友A',prefix:'sk-gw-abcdef…wxyz',enabled:true,
+    limits:{daily_tokens:1000,daily_requests:100,concurrency:2,rpm:60,allowed_models:['workbuddy/*']},
+    usage:{tokens_day:250,requests_day:3,last_used_at:0}}]
+});
+vm.runInContext(extractFn('keyPct')+'\n'+extractFn('renderKeys'),context);
+vm.runInContext('renderKeys()',context);
+assert.ok(host.innerHTML.includes('朋友A'));
+assert.ok(host.innerHTML.includes('sk-gw-abcdef'));
+assert.ok(host.innerHTML.includes('workbuddy/*'));
+assert.ok(!host.innerHTML.includes('sk-gw-full-secret'));
+console.log('dashboard api keys render passed');
 '''
         script = "const html=" + json.dumps(_DASHBOARD_HTML) + ";" + chr(10) + script
         result = subprocess.run(['node', '-'], input=script,
