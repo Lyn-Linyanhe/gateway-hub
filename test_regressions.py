@@ -1249,6 +1249,19 @@ class GatewayTests(unittest.TestCase):
         self.assertIn('数据陈旧', row['sub'])
         self.assertTrue(row['credits_stale'])
 
+    def test_codearts_credits_sync_cfg(self):
+        """同步间隔：默认 30 分钟、0 关闭、非法值回退、下限 5 分钟。"""
+        scope = isolated(ROOT / 'router.py', {'_codearts_credits_sync_cfg'},
+                         {'CONFIG': {}, 'CODECARTS_CREDITS_SYNC_MINUTES': 30})
+        cfg = scope['_codearts_credits_sync_cfg']
+        self.assertEqual(cfg(), 1800.0)
+        scope['CONFIG'] = {'codearts_credits_sync_minutes': 0}
+        self.assertEqual(cfg(), 0)
+        scope['CONFIG'] = {'codearts_credits_sync_minutes': 1}
+        self.assertEqual(cfg(), 300.0)      # 下限 5 分钟
+        scope['CONFIG'] = {'codearts_credits_sync_minutes': 'bad'}
+        self.assertEqual(cfg(), 1800.0)
+
     def test_codearts_usage_extract_and_merge(self):
         """codearts 响应里的 usage → 账本行；再按时间/模型合并回引擎事件。"""
         scope = isolated(ROOT / 'router.py',

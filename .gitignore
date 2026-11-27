@@ -44,3 +44,6 @@ codearts_credits.json
 
 # CodeArts token 用量账本（网关转发时记录，运行时数据）
 codearts_usage.jsonl
+
+# CodeArts 余额历史（自动同步时追加，运行时数据）
+codearts_wallet_history.jsonl

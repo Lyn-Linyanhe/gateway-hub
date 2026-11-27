@@ -2252,6 +2252,9 @@ function renderPlatforms(platforms){
         <span style="flex:1"></span>
         <span class="sub-cell">${full.length} 账号 · 国内 ${pcn} / 国际 ${pintl}${filtersActive?` · 匹配 ${accs.length}`:''} · ${allUnknown?'余额未知':fmt(rem)+' 分'} · 已知 ${balance.known}/${balance.total} 启用账号</span>
         ${platformDataNote?`<span class="status-line" role="status">${esc(platformDataNote)}</span>`:p.observed_at?`<span class="sub-cell">余额快照时间 ${esc(p.observed_at)} · ${p.data_state||'状态未知'}/${p.balance_state||'余额未知'}</span>`:''}
+        ${p.name==='codearts'
+          ? `<button class="btn mini" data-credits-sync="codearts" ${p.health?'':'disabled'} title="重新向上游查询积分余额（网关每 30 分钟也会自动刷新）">同步余额</button>`
+          : ''}
         ${p.name==='qwenwork'
           ? '<span class="pill gray" title="千问办公每日积分由上游自动发放，没有签到动作">无需签到</span>'
           : `<button class="btn mini" data-checkin="${esc(p.name)}" ${p.health?'':'disabled'}>签到</button>`}
@@ -2262,6 +2265,7 @@ function renderPlatforms(platforms){
   }).join('')||'<div class="empty">没有匹配的账号</div>';
   document.getElementById('acc-results').textContent=`显示 ${matches} / ${allAcc.length} 个账号`;
   document.querySelectorAll('#platforms [data-checkin]').forEach(b=>b.onclick=()=>doCheckin(b.dataset.checkin,b));
+document.querySelectorAll('#platforms [data-credits-sync]').forEach(b=>b.onclick=()=>syncCodeartsCredits(b));
 }
 
 /* ── 用量 ── */
@@ -3152,6 +3156,20 @@ async function doCheckin(name,btn){
   }).finally(()=>runDone(key));
 }
 document.querySelectorAll('[data-checkin]').forEach(b=>b.onclick=()=>doCheckin(b.dataset.checkin,b));
+/* CodeArts 余额同步：余额只能由 WB 的 AK/SK 签名客户端查，网关代理执行。 */
+async function syncCodeartsCredits(btn){
+  await withBtn(btn, async()=>{
+    try{
+      const d=await api('/api/codearts/credits/sync',{method:'POST'});
+      const snap=d.snapshot||{};
+      toast(`CodeArts 余额已刷新：${fmt(snap.remain??0)} / ${fmt(snap.size??0)}`
+        + (snap.end_date?` · 到期 ${snap.end_date}`:''), 4200);
+      await loadStatus();
+    }catch(e){
+      if(e.status!==401) toast('余额同步失败: '+e.message, 6000);
+    }
+  });
+}
 document.getElementById('btn-checkin-all').onclick=function(){return startAutomationJob(this,undefined,true);};
 
 /* 一键补做：同步成长/福利任务完成后提交一次补充巡检。

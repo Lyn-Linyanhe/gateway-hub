@@ -1271,6 +1271,63 @@ def _codearts_keepalive_loop(interval):
         time.sleep(interval)
 
 
+#: CodeArts 积分快照刷新间隔（分钟）；0 关闭。
+#:
+#: 余额只能通过 workbuddy2api-hub 的 AK/SK 签名客户端查（codearts2api 的
+#: credits 恒为 0；浏览器快照只是兜底）。由 codearts_credit_sync.py 执行。
+CODECARTS_CREDITS_SYNC_MINUTES = 30
+CODECARTS_CREDITS_FIRST_DELAY = 20.0
+
+
+def _codearts_credits_sync_cfg():
+    raw = CONFIG.get("codearts_credits_sync_minutes", CODECARTS_CREDITS_SYNC_MINUTES)
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        minutes = float(CODECARTS_CREDITS_SYNC_MINUTES)
+    if minutes <= 0:
+        return 0
+    return max(300.0, minutes * 60.0)   # 下限 5 分钟，别把上游打成刷新风暴
+
+
+def _codearts_credits_sync_once():
+    """跑同步脚本（子进程隔离：WB 模块不导入网关进程）。"""
+    script = os.path.join(HERE, "codearts_credit_sync.py")
+    if not os.path.isfile(script):
+        return {"ok": False, "error": "缺少 codearts_credit_sync.py"}
+    try:
+        out = subprocess.run([sys.executable, "-I", "-B", script], cwd=HERE,
+                             capture_output=True, text=True, timeout=90)
+    except Exception as exc:
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    text = (out.stdout or "").strip()
+    if out.returncode != 0:
+        return {"ok": False,
+                "error": (out.stderr or text or "同步失败")[-400:]}
+    snap = _codearts_credits_snapshot()
+    return {"ok": True, "output": text[-400:], "snapshot": snap}
+
+
+def _codearts_credits_loop(interval):
+    """后台刷新线程：启动 20s 后先试一次，之后按间隔刷新。"""
+    time.sleep(CODECARTS_CREDITS_FIRST_DELAY)
+    while True:
+        try:
+            up = _upstream_by_name("codearts")
+            if up and platform_enabled("codearts"):
+                out = _codearts_credits_sync_once()
+                snap = out.get("snapshot") or {}
+                if out.get("ok") and snap:
+                    log("codearts 积分已同步：%s/%s（同步于 %s）" % (
+                        snap.get("remain"), snap.get("size"),
+                        time.strftime("%H:%M", time.localtime(snap.get("synced_at") or 0))))
+                else:
+                    log("codearts 积分同步失败：%s" % (out.get("error") or "未知原因"))
+        except Exception as exc:
+            log("codearts credits loop error: %s: %s" % (type(exc).__name__, exc))
+        time.sleep(interval)
+
+
 def _automation_public(job):
     with _automation_lock:
         out = json.loads(json.dumps(job, ensure_ascii=False))
@@ -5025,6 +5082,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_gwconfig()
         if path == "/api/gateway-update":
             return self._api_gateway_update_deploy()
+        if path == "/api/codearts/credits/sync":
+            return self._api_codearts_credits_sync()
         if path in ("/api/platforms", "/api/platforms/process"):
             return self._api_platforms()
         if (path in MEDIA_POST_PATHS
@@ -5964,6 +6023,15 @@ class Handler(BaseHTTPRequestHandler):
         log(f"gwconfig 更新: {json.dumps(updates, ensure_ascii=False)}")
         self._send_json(200, {"ok": True, **updates})
 
+    def _api_codearts_credits_sync(self):
+        """手动刷新 CodeArts 余额快照（面板「同步余额」按钮）。"""
+        out = _codearts_credits_sync_once()
+        if not out.get("ok"):
+            return self._send_json(502, {"ok": False, "error": out.get("error")})
+        snap = out.get("snapshot") or {}
+        return self._send_json(200, {"ok": True, "snapshot": snap,
+                                     "output": out.get("output")})
+
     def _api_gateway_update_deploy(self):
         """POST /api/gateway-update：显式确认后一键部署官方正式版 Release。
 
@@ -6829,6 +6897,12 @@ def main():
         threading.Thread(target=_codearts_keepalive_loop, args=(keepalive,),
                          daemon=True).start()
         log("codearts 保活已启用：每 %.0f 分钟续期一次 token" % (keepalive / 60))
+    credits_interval = _codearts_credits_sync_cfg()
+    if credits_interval:
+        threading.Thread(target=_codearts_credits_loop, args=(credits_interval,),
+                         daemon=True).start()
+        log("codearts 积分同步已启用：每 %.0f 分钟刷新余额快照"
+            % (credits_interval / 60))
     try:
         server = Server(("127.0.0.1", port), Handler)
     except OSError as exc:
